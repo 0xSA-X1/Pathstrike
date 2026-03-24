@@ -1,0 +1,43 @@
+# PathStrike Configuration
+# Copy to pathstrike.yaml and fill in your values
+
+bloodhound:
+  # BloodHound Community Edition API endpoint
+  base_url: "http://localhost:8080"
+  # API key pair (Settings → API Keys in BH CE)
+  token_id: "your-api-token-id"
+  token_key: "your-api-token-key-base64"
+
+domain:
+  # Target AD domain
+  name: "internal.local"
+  # Domain Controller IP
+  dc_host: "10.10.10.10"
+  # Domain Controller FQDN (optional, used by some tools)
+  dc_fqdn: "dc01.internal.local"
+
+credentials:
+  # Initial compromised credentials
+  username: "jsmith"
+  # Provide ONE of: password, nt_hash, or ccache_path
+  password: "Summer2024!"
+  # nt_hash: "aad3b435b51404eeaad3b435b51404ee"
+  # ccache_path: "/tmp/krb5cc_jsmith"
+
+target:
+  # Target group (default: DOMAIN ADMINS)
+  group: "DOMAIN ADMINS"
+  # Or specify a custom target node:
+  # custom_target: "DC01.INTERNAL.LOCAL"
+
+execution:
+  # Mode: interactive (step-by-step), auto (full auto), dry_run (no changes)
+  mode: "interactive"
+  # Timeout for individual tool commands (seconds)
+  timeout: 30
+  # Maximum number of paths to discover
+  max_paths: 5
+  # Maximum retries per step on transient failures (time skew, timeout, network)
+  max_retries: 3
+  # Automatically run ntpdate against the DC on Kerberos clock skew errors
+  auto_time_sync: true
