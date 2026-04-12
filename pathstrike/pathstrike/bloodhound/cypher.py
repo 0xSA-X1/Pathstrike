@@ -3,6 +3,9 @@
 BH CE does **not** support parameterised Cypher queries, so all values are
 inlined into the query string.  Values are escaped with :func:`_escape` to
 prevent Cypher injection.
+
+Relationship traversals are filtered to only the edge types that have
+registered handlers, keeping queries fast and results exploitable.
 """
 
 from __future__ import annotations
@@ -13,12 +16,29 @@ def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
+def _edge_type_filter() -> str:
+    """Build a Cypher relationship-type filter from the handler registry.
+
+    Returns a string like ``MemberOf|AdminTo|GenericAll|...`` containing
+    every edge type that has a registered handler.  If the registry is
+    empty (e.g. during testing), falls back to an unfiltered wildcard.
+    """
+    from pathstrike.engine.edge_registry import get_supported_edges
+
+    edges = get_supported_edges()
+    if not edges:
+        return ""
+    return ":" + "|".join(edges)
+
+
 def build_shortest_path_query(
     source_name: str,
     target_group: str,
     domain: str,
 ) -> tuple[str, None]:
     """Build a Cypher shortestPath query from source to target.
+
+    Only traverses relationship types that have registered handlers.
 
     Args:
         source_name: Fully qualified name of the source node (e.g. ``USER@DOMAIN.LOCAL``).
@@ -28,9 +48,10 @@ def build_shortest_path_query(
     Returns:
         Tuple of (cypher_query, None).
     """
+    edge_filter = _edge_type_filter()
     query = (
         f"MATCH p=shortestPath("
-        f"(s {{name: '{_escape(source_name)}'}})-[*1..]->(t {{name: '{_escape(target_group)}'}})"
+        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..]->(t {{name: '{_escape(target_group)}'}})"
         f") RETURN p"
     )
     return query, None
@@ -43,7 +64,8 @@ def build_all_shortest_paths_query(
 ) -> tuple[str, None]:
     """Build a Cypher allShortestPaths query from source to target.
 
-    Returns all equally short paths rather than just one.
+    Returns all equally short paths rather than just one.  Only traverses
+    relationship types that have registered handlers.
 
     Args:
         source_name: Fully qualified name of the source node.
@@ -53,9 +75,10 @@ def build_all_shortest_paths_query(
     Returns:
         Tuple of (cypher_query, None).
     """
+    edge_filter = _edge_type_filter()
     query = (
         f"MATCH p=allShortestPaths("
-        f"(s {{name: '{_escape(source_name)}'}})-[*1..]->(t {{name: '{_escape(target_group)}'}})"
+        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..]->(t {{name: '{_escape(target_group)}'}})"
         f") RETURN p"
     )
     return query, None

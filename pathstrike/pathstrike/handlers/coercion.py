@@ -22,7 +22,7 @@ from pathstrike.models import (
 logger = logging.getLogger("pathstrike.handlers.coercion")
 
 
-@register_handler("CoerceAndRelayTo")
+@register_handler("CoerceAndRelayTo", "CoerceAndRelayNTLMToSMB")
 class CoerceAndRelayHandler(BaseEdgeHandler):
     """Exploit authentication coercion to relay NTLM credentials.
 

