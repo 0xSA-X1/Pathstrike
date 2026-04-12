@@ -53,8 +53,8 @@ ConfigOption = Annotated[
     ),
 ]
 SourceOption = Annotated[
-    str,
-    typer.Option("--source", "-s", help="Source principal (e.g. USER@DOMAIN.LOCAL)"),
+    Optional[str],
+    typer.Option("--source", "-s", help="Source principal (e.g. USER@DOMAIN.LOCAL). Defaults to credentials.username from config."),
 ]
 VerboseOption = Annotated[
     bool,
@@ -101,8 +101,14 @@ def _build_target_name(cfg: PathStrikeConfig) -> str:
     return f"{cfg.target.group}@{cfg.domain.name.upper()}"
 
 
-def _build_source_name(source: str, cfg: PathStrikeConfig) -> str:
-    """Ensure the source name is fully qualified with the domain."""
+def _build_source_name(source: Optional[str], cfg: PathStrikeConfig) -> str:
+    """Ensure the source name is fully qualified with the domain.
+
+    Falls back to ``credentials.username`` from the config when *source* is not
+    provided on the command line.
+    """
+    if source is None:
+        source = cfg.credentials.username
     if "@" in source:
         return source.upper()
     return f"{source.upper()}@{cfg.domain.name.upper()}"
@@ -203,7 +209,7 @@ def _display_paths(paths: list[AttackPath], max_paths: int) -> None:
 
 @app.command()
 def paths(
-    source: SourceOption,
+    source: SourceOption = None,
     config: ConfigOption = None,
     all_paths: Annotated[
         bool,
@@ -248,7 +254,7 @@ def paths(
 
 @app.command()
 def attack(
-    source: SourceOption,
+    source: SourceOption = None,
     config: ConfigOption = None,
     mode: Annotated[
         ExecutionMode,

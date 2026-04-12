@@ -134,15 +134,16 @@ class BloodHoundClient:
 
         Args:
             query: Cypher query string.
-            params: Optional parameterized query variables.
+            params: Optional parameterized query variables (note: BH CE
+                    does not support user-specified parameters, so this
+                    should normally be ``None``).
 
         Returns:
             Raw JSON response from the cypher endpoint.
         """
-        payload = {
-            "query": query,
-            "parameters": params or {},
-        }
+        payload: dict[str, Any] = {"query": query}
+        if params:
+            payload["parameters"] = params
         return await self._request("POST", "/api/v2/graphs/cypher", json_data=payload)
 
     async def get_entity(self, object_id: str) -> dict[str, Any]:
