@@ -80,7 +80,14 @@ def _extract_nodes(data: dict[str, Any]) -> dict[str, NodeInfo]:
     raw_nodes = data.get("nodes", {})
     nodes: dict[str, NodeInfo] = {}
 
-    for node_id, props in raw_nodes.items():
+    for node_id, node_data in raw_nodes.items():
+        # BH CE nests most fields inside a "properties" sub-dict.
+        # Merge top-level keys and properties so lookups work either way.
+        props = {**node_data}
+        inner = node_data.get("properties", {})
+        if isinstance(inner, dict):
+            props.update(inner)
+
         # BH CE uses "label" or "kind" for the node type
         label = props.get("label", props.get("kind", "Unknown"))
         name = props.get("name", "")
@@ -88,7 +95,8 @@ def _extract_nodes(data: dict[str, Any]) -> dict[str, NodeInfo]:
         domain = props.get("domain", "")
 
         # Collect remaining properties
-        reserved_keys = {"label", "kind", "name", "objectId", "objectid", "domain"}
+        reserved_keys = {"label", "kind", "name", "objectId", "objectid",
+                         "domain", "properties"}
         extra_props = {k: v for k, v in props.items() if k not in reserved_keys}
 
         nodes[node_id] = NodeInfo(
@@ -121,7 +129,13 @@ def _extract_edges(
     raw_edges = data.get("edges", [])
     edges: list[EdgeInfo] = []
 
-    for edge in raw_edges:
+    for edge_data in raw_edges:
+        # Merge top-level and nested "properties" like we do for nodes.
+        edge: dict[str, Any] = {**edge_data}
+        inner = edge_data.get("properties", {})
+        if isinstance(inner, dict):
+            edge.update(inner)
+
         source_id = str(edge["source"])
         target_id = str(edge["target"])
 
@@ -134,7 +148,7 @@ def _extract_edges(
 
         edge_type = edge.get("label", edge.get("kind", "Unknown"))
 
-        reserved_keys = {"source", "target", "label", "kind"}
+        reserved_keys = {"source", "target", "label", "kind", "properties"}
         extra_props = {k: v for k, v in edge.items() if k not in reserved_keys}
 
         edges.append(
