@@ -141,6 +141,18 @@ class GPLinkHandler(BaseEdgeHandler):
             or props.get("displayname")
             or edge.source.name.split("@")[0]
         )
+        # Resolve GPO DN via LDAP if not already known
+        if not gpo_dn:
+            gpo_dn = await bloody.resolve_dn(
+                self.config, auth_args, f"(displayName={gpo_name})"
+            )
+            if not gpo_dn:
+                return (
+                    False,
+                    f"Could not resolve DN for GPO '{gpo_name}' via LDAP",
+                    [],
+                )
+
         self._gpo_dn = gpo_dn
 
         if dry_run:

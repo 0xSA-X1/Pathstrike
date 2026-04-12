@@ -229,13 +229,20 @@ class BaseEdgeHandler(ABC):
     # ------------------------------------------------------------------
 
     def _resolve_principal(self, edge: EdgeInfo) -> str:
-        """Extract the sAMAccountName from the source node.
+        """Determine who to authenticate as for this edge.
 
-        Strips the ``@domain`` suffix if present (BloodHound stores
-        ``user@DOMAIN.LOCAL`` in the *name* field).
+        For User/Computer source nodes, returns the sAMAccountName.
+        For non-principal sources (GPO, Domain, OU, Container) the source
+        is an object, not a user — fall back to the configured credential
+        username since that user should already have control from a
+        preceding step.
         """
-        name = edge.source.name
-        return name.split("@")[0] if "@" in name else name
+        node = edge.source
+        if node.label in {"User", "Computer"}:
+            name = node.name
+            return name.split("@")[0] if "@" in name else name
+        # Non-user source: use the config credential (the user driving the chain)
+        return self.config.credentials.username
 
     def _resolve_target(self, edge: EdgeInfo) -> str:
         """Resolve the target identity for use with AD tools.
