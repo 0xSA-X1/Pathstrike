@@ -257,6 +257,14 @@ class WriteOwnerHandler(BaseEdgeHandler):
         target = self._resolve_target(edge)
         auth_args = self._get_auth_args(principal)
 
+        # GPOs / OUs / Containers need DN-based resolution
+        if self._target_needs_dn(edge):
+            dn = await self._resolve_target_dn(edge, auth_args)
+            if dn:
+                target = dn
+            else:
+                return False, f"Could not resolve DN for {edge.target.name} via LDAP", []
+
         if dry_run:
             return (
                 True,

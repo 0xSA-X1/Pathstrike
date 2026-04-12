@@ -155,6 +155,34 @@ def _try_parse_json(text: str) -> dict[str, Any] | list[Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# DN resolution helpers
+# ---------------------------------------------------------------------------
+
+
+async def resolve_dn(
+    config: PathStrikeConfig,
+    auth_args: list[str],
+    ldap_filter: str,
+) -> str | None:
+    """Resolve an LDAP filter to a Distinguished Name via ``bloodyAD get search``.
+
+    Returns the first ``distinguishedName`` found, or ``None``.
+    """
+    result = await run_bloodyad(
+        ["get", "search", "--filter", ldap_filter, "--attr", "distinguishedName"],
+        config,
+        auth_args=auth_args,
+    )
+    if not result["success"]:
+        return None
+    # Parse "distinguishedName: CN=..." from bloodyAD output
+    for line in result["output"].splitlines():
+        if line.strip().lower().startswith("distinguishedname:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Convenience helpers — each wraps a common bloodyAD operation
 # ---------------------------------------------------------------------------
 

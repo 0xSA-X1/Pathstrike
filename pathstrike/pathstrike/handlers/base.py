@@ -241,41 +241,36 @@ class BaseEdgeHandler(ABC):
         """Resolve the target identity for use with AD tools.
 
         For Users, Groups, and Computers the sAMAccountName (the part
-        before ``@``) works.  For GPOs bloodyAD cannot look up by
-        sAMAccountName, so we build the Distinguished Name from the
-        GUID (``CN={GUID},CN=Policies,CN=System,DC=...``).  For OUs,
-        Containers, and Domains we also build an appropriate DN.
+        before ``@``) works.  For other types we return a placeholder
+        that :meth:`_resolve_target_dn` can replace with the real DN.
         """
-        node = edge.target
-        sam_types = {"User", "Group", "Computer"}
-        if node.label in sam_types:
-            name = node.name
-            return name.split("@")[0] if "@" in name else name
+        name = edge.target.name
+        return name.split("@")[0] if "@" in name else name
 
-        # Build domain DN components from the node's domain field.
-        domain = node.domain or self.config.domain.name
-        domain_dn = ",".join(f"DC={part}" for part in domain.split("."))
+    async def _resolve_target_dn(
+        self, edge: EdgeInfo, auth_args: list[str]
+    ) -> str | None:
+        """For non-sAMAccountName objects (GPOs, OUs, …), resolve the DN via LDAP.
+
+        Returns the Distinguished Name, or ``None`` if resolution fails.
+        """
+        from pathstrike.tools import bloodyad_wrapper as bloody
+
+        node = edge.target
+        display_name = node.name.split("@")[0] if "@" in node.name else node.name
 
         if node.label == "GPO":
-            # GPO DN: CN={GUID},CN=Policies,CN=System,DC=...
-            guid = node.object_id
-            return f"CN={{{guid}}},CN=Policies,CN=System,{domain_dn}"
+            ldap_filter = f"(displayName={display_name})"
+        elif node.label in ("OU", "Container"):
+            ldap_filter = f"(name={display_name})"
+        else:
+            return None
 
-        if node.label == "OU":
-            # OU name is e.g. "SERVERS@DOMAIN.LOCAL" -> OU=SERVERS,...
-            ou_name = node.name.split("@")[0] if "@" in node.name else node.name
-            return f"OU={ou_name},{domain_dn}"
+        return await bloody.resolve_dn(self.config, auth_args, ldap_filter)
 
-        if node.label == "Container":
-            cn_name = node.name.split("@")[0] if "@" in node.name else node.name
-            return f"CN={cn_name},{domain_dn}"
-
-        if node.label == "Domain":
-            return domain_dn
-
-        # Fallback: try sAMAccountName style
-        name = node.name
-        return name.split("@")[0] if "@" in name else name
+    def _target_needs_dn(self, edge: EdgeInfo) -> bool:
+        """Return True if the target node type requires DN-based resolution."""
+        return edge.target.label in {"GPO", "OU", "Container"}
 
     # Aliases for compatibility with linter-generated names
     _source_username = _resolve_principal
