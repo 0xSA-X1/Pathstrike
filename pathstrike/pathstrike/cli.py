@@ -559,6 +559,7 @@ def verify(
         "impacket (getST)": "getST.py",
         "certipy": "certipy",
         "netexec": "netexec",
+        "pyGPOAbuse": "pygpoabuse",
         "ntpdate (time sync)": "ntpdate",
     }
 
