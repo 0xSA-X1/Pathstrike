@@ -241,17 +241,41 @@ class BaseEdgeHandler(ABC):
         """Resolve the target identity for use with AD tools.
 
         For Users, Groups, and Computers the sAMAccountName (the part
-        before ``@``) works.  For GPOs, OUs, Containers, and Domains
-        bloodyAD cannot look up by sAMAccountName, so we fall back to
-        the ``objectId`` (SID or GUID) which bloodyAD resolves via LDAP.
+        before ``@``) works.  For GPOs bloodyAD cannot look up by
+        sAMAccountName, so we build the Distinguished Name from the
+        GUID (``CN={GUID},CN=Policies,CN=System,DC=...``).  For OUs,
+        Containers, and Domains we also build an appropriate DN.
         """
         node = edge.target
         sam_types = {"User", "Group", "Computer"}
         if node.label in sam_types:
             name = node.name
             return name.split("@")[0] if "@" in name else name
-        # GPOs, OUs, Containers, Domains — use objectId (GUID/SID)
-        return node.object_id
+
+        # Build domain DN components from the node's domain field.
+        domain = node.domain or self.config.domain.name
+        domain_dn = ",".join(f"DC={part}" for part in domain.split("."))
+
+        if node.label == "GPO":
+            # GPO DN: CN={GUID},CN=Policies,CN=System,DC=...
+            guid = node.object_id
+            return f"CN={{{guid}}},CN=Policies,CN=System,{domain_dn}"
+
+        if node.label == "OU":
+            # OU name is e.g. "SERVERS@DOMAIN.LOCAL" -> OU=SERVERS,...
+            ou_name = node.name.split("@")[0] if "@" in node.name else node.name
+            return f"OU={ou_name},{domain_dn}"
+
+        if node.label == "Container":
+            cn_name = node.name.split("@")[0] if "@" in node.name else node.name
+            return f"CN={cn_name},{domain_dn}"
+
+        if node.label == "Domain":
+            return domain_dn
+
+        # Fallback: try sAMAccountName style
+        name = node.name
+        return name.split("@")[0] if "@" in name else name
 
     # Aliases for compatibility with linter-generated names
     _source_username = _resolve_principal
