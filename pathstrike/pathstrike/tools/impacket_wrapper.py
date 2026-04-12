@@ -513,7 +513,7 @@ async def kerberoast(
     target_str = build_target_string(domain, username, password, nt_hash)
     args = [target_str, *auth_args, "-request"]
     if target_user:
-        args.extend(["-target-user", target_user])
+        args.extend(["-request-user", target_user])
     if dc_ip and "-dc-ip" not in auth_args:
         args.extend(["-dc-ip", dc_ip])
     result = await run_impacket_tool("GetUserSPNs.py", args, timeout=timeout)
