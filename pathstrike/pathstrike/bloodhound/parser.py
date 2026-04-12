@@ -81,6 +81,8 @@ def _extract_nodes(data: dict[str, Any]) -> dict[str, NodeInfo]:
     nodes: dict[str, NodeInfo] = {}
 
     for node_id, node_data in raw_nodes.items():
+        logger.debug("Raw node %s: %s", node_id, node_data)
+
         # BH CE nests most fields inside a "properties" sub-dict.
         # Merge top-level keys and properties so lookups work either way.
         props = {**node_data}
@@ -88,9 +90,13 @@ def _extract_nodes(data: dict[str, Any]) -> dict[str, NodeInfo]:
         if isinstance(inner, dict):
             props.update(inner)
 
-        # BH CE uses "label" or "kind" for the node type
-        label = props.get("label", props.get("kind", "Unknown"))
-        name = props.get("name", "")
+        # BH CE: "kind" is the node type (User, Group, …),
+        #         "label" is the display name (SAMWELL.TARLY@…).
+        kind = props.get("kind", "Unknown")
+        label = props.get("label", kind)
+
+        # "name" lives in properties; fall back to "label" (the display name).
+        name = props.get("name", "") or label
         object_id = props.get("objectId", props.get("objectid", node_id))
         domain = props.get("domain", "")
 
@@ -102,7 +108,7 @@ def _extract_nodes(data: dict[str, Any]) -> dict[str, NodeInfo]:
         nodes[node_id] = NodeInfo(
             object_id=str(object_id),
             name=name,
-            label=label,
+            label=kind,
             domain=domain,
             properties=extra_props,
         )
