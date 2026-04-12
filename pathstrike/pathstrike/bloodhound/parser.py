@@ -37,9 +37,19 @@ def parse_cypher_response(response: dict[str, Any]) -> list[AttackPath]:
     Returns:
         List of parsed AttackPath models (one per path result row).
     """
-    data_rows = response.get("data", [])
-    if not data_rows:
+    raw_data = response.get("data", {})
+    if not raw_data:
         logger.warning("Cypher response contained no data rows")
+        return []
+
+    # BH CE returns "data" as a single dict (nodes + edges) for path queries,
+    # not a list of rows.  Normalise to a list so the rest of the parser works.
+    if isinstance(raw_data, dict):
+        data_rows: list[dict[str, Any]] = [raw_data]
+    elif isinstance(raw_data, list):
+        data_rows = raw_data
+    else:
+        logger.warning("Unexpected data type in cypher response: %s", type(raw_data))
         return []
 
     paths: list[AttackPath] = []
