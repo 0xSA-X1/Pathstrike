@@ -115,7 +115,9 @@ async def run_pygpoabuse(
 
 
 def extract_gpo_guid(gpo_dn: str) -> str | None:
-    """Extract the ``{GUID}`` from a GPO Distinguished Name.
+    """Extract the GUID (without braces) from a GPO Distinguished Name.
+
+    pyGPOAbuse adds braces internally, so we return the bare GUID.
 
     Example::
 
@@ -123,13 +125,16 @@ def extract_gpo_guid(gpo_dn: str) -> str | None:
         ...     "CN={AC8318BF-A5A0-48CC-BFB1-782E3B96789A},"
         ...     "CN=Policies,CN=System,DC=north,DC=sevenkingdoms,DC=local"
         ... )
-        '{AC8318BF-A5A0-48CC-BFB1-782E3B96789A}'
+        'AC8318BF-A5A0-48CC-BFB1-782E3B96789A'
 
     Returns:
-        The GUID string (with braces), or ``None`` if not found.
+        The bare GUID string (no braces), or ``None`` if not found.
     """
     match = _GPO_GUID_RE.search(gpo_dn)
-    return match.group(0) if match else None
+    if not match:
+        return None
+    # Strip the surrounding braces — pyGPOAbuse adds them itself.
+    return match.group(0)[1:-1]
 
 
 # ---------------------------------------------------------------------------
