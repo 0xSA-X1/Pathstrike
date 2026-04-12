@@ -1172,5 +1172,288 @@ def asreproast(
         raise typer.Exit(code=1) from exc
 
 
+@app.command()
+def domains(
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """List all AD domains discovered by BloodHound CE.
+
+    Shows domain names, SIDs, and data collection timestamps.
+    Auto-detects available targets for attack planning.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    async def _run():
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            raw_domains = await client.get_available_domains()
+
+            if not raw_domains:
+                console.print("[yellow]No domains found in BloodHound CE.[/]")
+                return
+
+            table = Table(title="Discovered Domains")
+            table.add_column("Domain", style="green")
+            table.add_column("ID / SID", style="cyan")
+            table.add_column("Type", style="yellow")
+            table.add_column("Collected", style="dim")
+
+            for d in raw_domains:
+                name = d.get("name", d.get("label", "Unknown"))
+                sid = d.get("id", d.get("objectid", ""))
+                dtype = d.get("type", "AD")
+                collected = d.get("collected", d.get("last_collected", ""))
+                table.add_row(name, sid, dtype, str(collected))
+
+            console.print(table)
+            console.print(
+                f"\n[dim]Configure target domain in pathstrike.yaml → domain.name[/]"
+            )
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def recon(
+    target: Annotated[
+        str,
+        typer.Argument(help="Target principal name (e.g. USER@DOMAIN.LOCAL or COMPUTER$@DOMAIN.LOCAL)"),
+    ],
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Enumerate detailed information about a target from BloodHound CE.
+
+    Pulls entity details, group memberships, admin rights, sessions,
+    and other intelligence from the BH CE API.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    async def _run():
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            # Search for the target
+            console.print(f"[bold]Looking up: {target}[/]\n")
+            search_result = await client.get_entity(target.upper())
+
+            data = search_result.get("data", [])
+            if not data:
+                console.print(f"[yellow]No results found for '{target}'[/]")
+                return
+
+            # Display basic info
+            for item in data if isinstance(data, list) else [data]:
+                name = item.get("name", target)
+                otype = item.get("type", item.get("kind", "Unknown"))
+                oid = item.get("objectid", "")
+
+                console.print(f"[bold green]{name}[/] ({otype})")
+                console.print(f"  Object ID: {oid}")
+
+                props = item.get("properties", item)
+                for key in ["description", "displayname", "email",
+                            "enabled", "admincount", "hasspn",
+                            "dontreqpreauth", "pwdlastset",
+                            "lastlogon", "lastlogontimestamp",
+                            "owned", "highvalue"]:
+                    val = props.get(key)
+                    if val is not None:
+                        console.print(f"  {key}: {val}")
+
+                # Fetch detailed info based on type
+                if otype.lower() == "user" and oid:
+                    console.print("\n[bold]Group Memberships:[/]")
+                    try:
+                        memberships = await client.get_user_memberships(oid)
+                        members_data = memberships.get("data", [])
+                        if members_data:
+                            for m in members_data[:20]:
+                                mname = m.get("name", m.get("label", ""))
+                                console.print(f"  - {mname}")
+                        else:
+                            console.print("  [dim]None found[/]")
+                    except Exception:
+                        console.print("  [dim]Could not fetch[/]")
+
+                    console.print("\n[bold]Admin Rights:[/]")
+                    try:
+                        admin = await client.get_user_admin_rights(oid)
+                        admin_data = admin.get("data", [])
+                        if admin_data:
+                            for a in admin_data[:20]:
+                                aname = a.get("name", a.get("label", ""))
+                                console.print(f"  - {aname}")
+                        else:
+                            console.print("  [dim]None found[/]")
+                    except Exception:
+                        console.print("  [dim]Could not fetch[/]")
+
+                    console.print("\n[bold]Sessions:[/]")
+                    try:
+                        sessions = await client.get_user_sessions(oid)
+                        sess_data = sessions.get("data", [])
+                        if sess_data:
+                            for s in sess_data[:20]:
+                                sname = s.get("name", s.get("label", ""))
+                                console.print(f"  - {sname}")
+                        else:
+                            console.print("  [dim]None found[/]")
+                    except Exception:
+                        console.print("  [dim]Could not fetch[/]")
+
+                elif otype.lower() == "computer" and oid:
+                    console.print("\n[bold]Local Admins:[/]")
+                    try:
+                        admins = await client.get_computer_admins(oid)
+                        admin_data = admins.get("data", [])
+                        if admin_data:
+                            for a in admin_data[:20]:
+                                aname = a.get("name", a.get("label", ""))
+                                console.print(f"  - {aname}")
+                        else:
+                            console.print("  [dim]None found[/]")
+                    except Exception:
+                        console.print("  [dim]Could not fetch[/]")
+
+                    console.print("\n[bold]Sessions:[/]")
+                    try:
+                        sessions = await client.get_computer_sessions(oid)
+                        sess_data = sessions.get("data", [])
+                        if sess_data:
+                            for s in sess_data[:20]:
+                                sname = s.get("name", s.get("label", ""))
+                                console.print(f"  - {sname}")
+                        else:
+                            console.print("  [dim]None found[/]")
+                    except Exception:
+                        console.print("  [dim]Could not fetch[/]")
+
+                console.print()
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def auto(
+    config: ConfigOption = None,
+    mode: Annotated[
+        ExecutionMode,
+        typer.Option("--mode", "-m", help="Execution mode"),
+    ] = ExecutionMode.interactive,
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Export results to file"),
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Auto-discover and exploit attack paths using BH CE's analysis engine.
+
+    Queries BloodHound CE's pre-analyzed attack path findings, ranks
+    them by severity, and offers to exploit the highest-value paths
+    automatically.
+
+    This is the zero-configuration mode — no need to specify source
+    or target. BH CE identifies the attack paths for you.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    async def _run() -> bool:
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            # Step 1: Get available domains
+            console.print("[bold]Querying BH CE for available domains...[/]")
+            raw_domains = await client.get_available_domains()
+
+            if not raw_domains:
+                console.print("[red]No domains found in BH CE.[/]")
+                return False
+
+            for d in raw_domains:
+                console.print(
+                    f"  Domain: [green]{d.get('name', 'Unknown')}[/] "
+                    f"(ID: {d.get('id', 'N/A')})"
+                )
+
+            # Step 2: Get attack path findings
+            console.print("\n[bold]Querying BH CE for pre-analyzed attack paths...[/]")
+
+            try:
+                findings = await client.get_attack_path_findings()
+            except Exception as exc:
+                console.print(f"[yellow]Could not fetch attack path findings: {exc}[/]")
+                console.print("[dim]Falling back to Cypher-based path discovery...[/]\n")
+                # Fallback to standard pathfinding
+                source_name = _build_source_name(None, cfg)
+                target_name = _build_target_name(cfg)
+                query, params = build_shortest_path_query(
+                    source_name, target_name, cfg.domain.name,
+                )
+                response = await client.cypher_query(query, params)
+                discovered = parse_cypher_response(response)
+                if not discovered:
+                    console.print("[yellow]No attack paths found.[/]")
+                    return False
+                console.print(f"Found [green]{len(discovered)}[/] path(s) via Cypher.\n")
+                # Execute first path
+                path = discovered[0]
+                cred_store = _seed_credential_store(cfg)
+                rollback_mgr = RollbackManager(cfg)
+                orchestrator = AttackOrchestrator(
+                    config=cfg,
+                    cred_store=cred_store,
+                    rollback_mgr=rollback_mgr,
+                    verbose=verbose,
+                )
+                return await orchestrator.execute_path(path, mode)
+
+            # Display findings
+            finding_data = findings.get("data", [])
+            if not finding_data:
+                console.print("[yellow]No attack path findings from BH CE analysis.[/]")
+                console.print(
+                    "[dim]Run BH CE analysis first, or use 'pathstrike attack' "
+                    "for Cypher-based discovery.[/]"
+                )
+                return False
+
+            table = Table(title="BH CE Attack Path Findings")
+            table.add_column("#", style="bold")
+            table.add_column("Finding", style="green")
+            table.add_column("Severity", style="red")
+            table.add_column("Domain", style="cyan")
+            table.add_column("Principals", style="yellow")
+
+            for i, finding in enumerate(finding_data[:20], 1):
+                table.add_row(
+                    str(i),
+                    str(finding.get("finding_type", finding.get("type", "Unknown"))),
+                    str(finding.get("severity", finding.get("risk", "N/A"))),
+                    str(finding.get("domain_name", finding.get("domain", ""))),
+                    str(finding.get("principal_count", finding.get("impacted_count", "N/A"))),
+                )
+
+            console.print(table)
+            console.print(
+                f"\n[bold]{len(finding_data)} finding(s) total.[/] "
+                "Use [bold]pathstrike attack[/] to exploit specific paths."
+            )
+            return True
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 if __name__ == "__main__":
     app()
