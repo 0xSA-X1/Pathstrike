@@ -560,6 +560,7 @@ def verify(
         "certipy": "certipy",
         "netexec": "netexec",
         "pyGPOAbuse": "pygpoabuse",
+        "impacket (ntlmrelayx)": "ntlmrelayx.py",
         "ntpdate (time sync)": "ntpdate",
     }
 

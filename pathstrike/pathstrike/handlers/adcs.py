@@ -33,6 +33,7 @@ from pathstrike.tools.certipy_wrapper import (
     certipy_find,
     certipy_request,
     certipy_template,
+    run_certipy,
 )
 
 
