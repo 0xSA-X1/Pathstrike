@@ -1,15 +1,14 @@
 """Tests for BloodHound CE HMAC authentication."""
 
-import base64
 import pytest
 from datetime import datetime, timezone
 from pathstrike.bloodhound.hmac_auth import HMACAuth
 
 class TestHMACAuth:
     def setup_method(self):
-        # Use a known test key
+        # Use a known test key (token_key is used as-is, not base64-decoded)
         self.token_id = "test-token-id"
-        self.token_key = base64.b64encode(b"test-secret-key-value").decode()
+        self.token_key = "dGVzdC1zZWNyZXQta2V5LXZhbHVl"
         self.auth = HMACAuth(self.token_id, self.token_key)
 
     def test_sign_request_returns_required_headers(self):

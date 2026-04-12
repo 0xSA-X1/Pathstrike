@@ -16,8 +16,9 @@ class HMACAuth:
         2. DateKey      = HMAC-SHA256(OperationKey, datetime[:13])
         3. Signature    = base64(HMAC-SHA256(DateKey, body))
 
-    The ``token_key`` provided at init is expected to be a base64-encoded string
-    that gets decoded to raw bytes before use.
+    The ``token_key`` provided at init is the API token string as displayed
+    by BH CE.  It is used directly as UTF-8 bytes for the HMAC key (it is
+    **not** base64-decoded first — this matches the official BH CE SDK).
     """
 
     def __init__(self, token_id: str, token_key: str) -> None:
@@ -25,19 +26,10 @@ class HMACAuth:
 
         Args:
             token_id: The API token identifier.
-            token_key: The base64-encoded API token secret.
-
-        Raises:
-            ValueError: If *token_key* is not valid base64.
+            token_key: The API token secret string (used as-is, not decoded).
         """
         self.token_id = token_id
-        try:
-            self._token_key_bytes = base64.b64decode(token_key)
-        except Exception as exc:
-            raise ValueError(
-                f"Invalid BloodHound API token_key — must be a valid base64 string. "
-                f"Generate one in BH CE → Settings → API Keys. ({exc})"
-            ) from exc
+        self._token_key_bytes = token_key.encode("utf-8")
 
     def sign_request(
         self,
