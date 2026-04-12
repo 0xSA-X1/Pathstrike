@@ -238,9 +238,20 @@ class BaseEdgeHandler(ABC):
         return name.split("@")[0] if "@" in name else name
 
     def _resolve_target(self, edge: EdgeInfo) -> str:
-        """Extract the sAMAccountName from the target node."""
-        name = edge.target.name
-        return name.split("@")[0] if "@" in name else name
+        """Resolve the target identity for use with AD tools.
+
+        For Users, Groups, and Computers the sAMAccountName (the part
+        before ``@``) works.  For GPOs, OUs, Containers, and Domains
+        bloodyAD cannot look up by sAMAccountName, so we fall back to
+        the ``objectId`` (SID or GUID) which bloodyAD resolves via LDAP.
+        """
+        node = edge.target
+        sam_types = {"User", "Group", "Computer"}
+        if node.label in sam_types:
+            name = node.name
+            return name.split("@")[0] if "@" in name else name
+        # GPOs, OUs, Containers, Domains — use objectId (GUID/SID)
+        return node.object_id
 
     # Aliases for compatibility with linter-generated names
     _source_username = _resolve_principal
