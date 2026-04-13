@@ -362,7 +362,7 @@ class CampaignOrchestrator:
                     # Skip trust edges pointing back to already-compromised domains
                     if single.target.name.upper() in self.domains_compromised:
                         continue
-                    if single.target.name in self.completed_targets:
+                    if single.target.name.upper() in {t.upper() for t in self.completed_targets}:
                         continue
                     individual.append(single)
 
@@ -491,25 +491,40 @@ class CampaignOrchestrator:
                 logger.info("New identity captured: %s", identity)
 
     def _check_domain_compromise(self, scored: ScoredPath) -> None:
-        """Check if the completed path represents domain compromise."""
-        target = scored.path.target
-        target_name_upper = target.name.split("@")[0].upper()
+        """Check if the completed path represents domain compromise.
 
-        # Check if target is DA, EA, or Domain
+        For composed paths (DA + trust), also marks intermediate domains
+        as compromised when DA/Domain targets are encountered mid-path.
+        """
         da_names = {"DOMAIN ADMINS", "ENTERPRISE ADMINS", "ADMINISTRATORS"}
-        if target_name_upper in da_names:
-            domain = target.domain or target.name.split("@")[-1] if "@" in target.name else ""
-            if domain:
-                self.domains_compromised.add(domain.upper())
-                console.print(
-                    f"  [bold red]Domain compromised:[/] [green]{domain}[/]"
-                )
 
-        if target.label and target.label.lower() == "domain":
-            self.domains_compromised.add(target.name.upper())
-            console.print(
-                f"  [bold red]Domain compromised:[/] [green]{target.name}[/]"
-            )
+        # Check ALL steps in the path — not just the final target
+        for step in scored.path.steps:
+            step_target = step.edge.target
+            step_name = step_target.name.split("@")[0].upper()
+
+            if step_name in da_names:
+                domain = (
+                    step_target.domain
+                    or (step_target.name.split("@")[1] if "@" in step_target.name else "")
+                )
+                if domain:
+                    domain_upper = domain.upper()
+                    if domain_upper not in self.domains_compromised:
+                        self.domains_compromised.add(domain_upper)
+                        self.completed_targets.add(step_target.name)
+                        console.print(
+                            f"  [bold red]Domain compromised:[/] [green]{domain}[/]"
+                        )
+
+            if step_target.label and step_target.label.lower() == "domain":
+                name_upper = step_target.name.upper()
+                if name_upper not in self.domains_compromised:
+                    self.domains_compromised.add(name_upper)
+                    self.completed_targets.add(step_target.name)
+                    console.print(
+                        f"  [bold red]Domain compromised:[/] [green]{step_target.name}[/]"
+                    )
 
     # ------------------------------------------------------------------
     # Selection
