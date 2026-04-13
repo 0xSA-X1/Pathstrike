@@ -319,8 +319,13 @@ class CampaignOrchestrator:
             all_trust = parse_cypher_response(response)
 
             for tp in all_trust:
-                if tp.target.name not in self.completed_targets:
-                    trust_paths.append(tp)
+                target = tp.target.name.upper()
+                # Skip if target is already compromised or in a compromised domain
+                if target in self.completed_targets:
+                    continue
+                if target in self.domains_compromised:
+                    continue
+                trust_paths.append(tp)
         except Exception as exc:
             logger.debug("Trust discovery failed: %s", exc)
 
@@ -354,6 +359,11 @@ class CampaignOrchestrator:
                         source=step.edge.source,
                         target=step.edge.target,
                     )
+                    # Skip trust edges pointing back to already-compromised domains
+                    if single.target.name.upper() in self.domains_compromised:
+                        continue
+                    if single.target.name in self.completed_targets:
+                        continue
                     individual.append(single)
 
             logger.debug("Found %d individual trust edge(s)", len(individual))

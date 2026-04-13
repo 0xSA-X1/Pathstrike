@@ -400,8 +400,8 @@ async def raise_child(
     if target_exec:
         args.extend(["-target-exec", target_exec])
 
-    if dc_ip:
-        args.extend(["-dc-ip", dc_ip])
+    # Note: raiseChild.py does NOT support -dc-ip (unlike other impacket tools).
+    # It resolves the DC via DNS from the domain name.
 
     result = await run_impacket_tool("raiseChild.py", args, timeout=timeout)
 
