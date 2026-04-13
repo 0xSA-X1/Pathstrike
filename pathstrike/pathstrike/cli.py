@@ -255,6 +255,10 @@ def paths(
 @app.command()
 def attack(
     source: SourceOption = None,
+    target: Annotated[
+        Optional[str],
+        typer.Option("--target", "-t", help="Override target (e.g. 'DOMAIN ADMINS@SEVENKINGDOMS.LOCAL' for cross-domain)."),
+    ] = None,
     config: ConfigOption = None,
     mode: Annotated[
         ExecutionMode,
@@ -309,7 +313,7 @@ def attack(
     cfg = _load_config_or_exit(config)
 
     source_name = _build_source_name(source, cfg)
-    target_name = _build_target_name(cfg)
+    target_name = target.upper() if target else _build_target_name(cfg)
 
     # Build retry policy from config, with CLI overrides
     retry_policy = _build_retry_policy(cfg)
@@ -344,8 +348,50 @@ def attack(
 
     async def _run() -> bool:
         async with BloodHoundClient.connect(cfg.bloodhound) as client:
-            response = await client.cypher_query(query, params)
-            discovered = parse_cypher_response(response)
+            try:
+                response = await client.cypher_query(query, params)
+                discovered = parse_cypher_response(response)
+            except Exception:
+                discovered = []
+
+            # If no direct path, check for cross-domain via trust chaining
+            if not discovered and target:
+                console.print(
+                    "[yellow]No direct path found. Checking for trust-based "
+                    "cross-domain escalation...[/]\n"
+                )
+                # Find path to child domain DA first
+                child_target = _build_target_name(cfg)
+                child_query, child_params = build_shortest_path_query(
+                    source_name, child_target, cfg.domain.name,
+                )
+                try:
+                    child_response = await client.cypher_query(child_query, child_params)
+                    discovered = parse_cypher_response(child_response)
+                except Exception:
+                    discovered = []
+
+                if discovered:
+                    console.print(
+                        f"[green]Found path to {child_target}.[/] "
+                        f"Will chain with trust escalation to {target_name}.\n"
+                    )
+                    # Check for trust edges to append
+                    from pathstrike.bloodhound.cypher import build_trust_map_query
+                    trust_query, _ = build_trust_map_query()
+                    try:
+                        trust_response = await client.cypher_query(trust_query)
+                        trust_paths = parse_cypher_response(trust_response)
+                        if trust_paths:
+                            # Append trust edges to the discovered path
+                            for tp in trust_paths:
+                                for step in tp.steps:
+                                    discovered[0].steps.append(step)
+                            console.print(
+                                "[bold green]Trust escalation step appended to path.[/]\n"
+                            )
+                    except Exception:
+                        pass
 
             if not discovered:
                 console.print("[yellow]No attack paths found. Nothing to do.[/]")
