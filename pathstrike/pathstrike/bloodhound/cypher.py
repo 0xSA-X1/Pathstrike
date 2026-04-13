@@ -144,3 +144,18 @@ def build_asrep_roastable_users_query(domain: str) -> tuple[str, None]:
         f"RETURN u"
     )
     return query, None
+
+
+# ---------------------------------------------------------------------------
+# Trust enumeration queries
+# ---------------------------------------------------------------------------
+
+
+def build_trust_map_query() -> tuple[str, None]:
+    """Find all domain trust relationships in the BH CE graph.
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    query = "MATCH p=(d1:Domain)-[:TrustedBy]->(d2:Domain) RETURN p"
+    return query, None

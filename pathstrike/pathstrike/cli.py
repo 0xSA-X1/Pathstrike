@@ -1455,5 +1455,182 @@ def auto(
         raise typer.Exit(code=1) from exc
 
 
+@app.command()
+def credentials(
+    config: ConfigOption = None,
+) -> None:
+    """Interactively update credentials in the config file.
+
+    Prompts for username, password, domain, and DC host.
+    Press Enter to keep the current value.
+    """
+    import yaml
+
+    # Locate config file
+    config_path = config
+    if config_path is None:
+        config_path = find_config()
+        if config_path is None:
+            console.print("[bold red]No config file found.[/]")
+            raise typer.Exit(code=1)
+
+    config_path = Path(config_path).expanduser().resolve()
+    console.print(f"[dim]Editing:[/] {config_path}\n")
+
+    # Load raw YAML (preserve structure)
+    with open(config_path, "r") as fh:
+        raw = yaml.safe_load(fh)
+
+    creds = raw.get("credentials", {})
+    domain_cfg = raw.get("domain", {})
+
+    # Show current values and prompt for new ones
+    cur_user = creds.get("username", "")
+    cur_pass = creds.get("password", "")
+    cur_domain = domain_cfg.get("name", "")
+    cur_dc = domain_cfg.get("dc_host", "")
+    cur_dc_fqdn = domain_cfg.get("dc_fqdn", "")
+
+    console.print("[bold]Current credentials:[/]")
+    console.print(f"  Username: [green]{cur_user}[/]")
+    console.print(f"  Password: [green]{'*' * len(cur_pass) if cur_pass else '(none)'}[/]")
+    console.print(f"  Domain:   [green]{cur_domain}[/]")
+    console.print(f"  DC Host:  [green]{cur_dc}[/]")
+    console.print(f"  DC FQDN:  [green]{cur_dc_fqdn}[/]")
+    console.print("\n[dim]Press Enter to keep current value.[/]\n")
+
+    new_user = typer.prompt("Username", default=cur_user).strip()
+    new_pass = typer.prompt("Password", default=cur_pass).strip()
+    new_domain = typer.prompt("Domain", default=cur_domain).strip()
+    new_dc = typer.prompt("DC Host (IP)", default=cur_dc).strip()
+    new_dc_fqdn = typer.prompt("DC FQDN", default=cur_dc_fqdn).strip()
+
+    # Update raw config
+    if "credentials" not in raw:
+        raw["credentials"] = {}
+    raw["credentials"]["username"] = new_user
+    raw["credentials"]["password"] = new_pass
+
+    if "domain" not in raw:
+        raw["domain"] = {}
+    raw["domain"]["name"] = new_domain
+    raw["domain"]["dc_host"] = new_dc
+    if new_dc_fqdn:
+        raw["domain"]["dc_fqdn"] = new_dc_fqdn
+
+    # Write back
+    with open(config_path, "w") as fh:
+        yaml.dump(raw, fh, default_flow_style=False, sort_keys=False)
+
+    console.print(f"\n[bold green]Config updated:[/] {config_path}")
+    console.print(f"  Username: [green]{new_user}[/]")
+    console.print(f"  Domain:   [green]{new_domain}[/]")
+    console.print(f"  DC Host:  [green]{new_dc}[/]")
+
+
+@app.command()
+def trusts(
+    config: ConfigOption = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Enumerate domain trust relationships from BloodHound CE.
+
+    Queries the BH CE graph for all ``TrustedBy`` edges between Domain
+    nodes and displays the trust map.  Identifies child→parent trusts
+    that are exploitable via Golden Ticket with SID History injection.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    from pathstrike.bloodhound.cypher import build_trust_map_query
+
+    async def _run():
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            console.print("[bold]Querying BH CE for domain trusts...[/]\n")
+            query, _ = build_trust_map_query()
+
+            try:
+                response = await client.cypher_query(query)
+            except Exception as exc:
+                console.print(f"[red]Cypher query failed: {exc}[/]")
+                return
+
+            raw_data = response.get("data", {})
+            if not raw_data:
+                console.print("[yellow]No trust relationships found.[/]")
+                return
+
+            # Parse nodes and edges
+            nodes_data = {}
+            edges_data = []
+            if isinstance(raw_data, dict):
+                nodes_data = raw_data.get("nodes", {})
+                edges_data = raw_data.get("edges", [])
+            elif isinstance(raw_data, list):
+                for row in raw_data:
+                    if isinstance(row, dict):
+                        nodes_data.update(row.get("nodes", {}))
+                        edges_data.extend(row.get("edges", []))
+
+            # Build node lookup
+            node_map = {}
+            for nid, ndata in nodes_data.items():
+                props = {**ndata}
+                inner = ndata.get("properties", {})
+                if isinstance(inner, dict):
+                    props.update(inner)
+                node_map[nid] = {
+                    "name": props.get("name", props.get("label", "Unknown")),
+                    "sid": props.get("objectId", props.get("objectid", "")),
+                }
+
+            table = Table(title="Domain Trust Map")
+            table.add_column("Source Domain", style="green")
+            table.add_column("", style="bold")
+            table.add_column("Target Domain", style="cyan")
+            table.add_column("Type", style="yellow")
+            table.add_column("Exploitable", style="red")
+
+            for edge in edges_data:
+                src_id = str(edge.get("source", ""))
+                tgt_id = str(edge.get("target", ""))
+                src = node_map.get(src_id, {"name": src_id, "sid": ""})
+                tgt = node_map.get(tgt_id, {"name": tgt_id, "sid": ""})
+
+                src_name = src["name"]
+                tgt_name = tgt["name"]
+
+                # Detect trust direction
+                if src_name.upper().endswith(f".{tgt_name.upper()}"):
+                    trust_type = "Child→Parent"
+                    exploitable = "Golden Ticket + EA SID"
+                elif tgt_name.upper().endswith(f".{src_name.upper()}"):
+                    trust_type = "Parent→Child"
+                    exploitable = "Golden Ticket"
+                else:
+                    trust_type = "External/Forest"
+                    exploitable = "Inter-realm TGT"
+
+                table.add_row(
+                    src_name,
+                    "TrustedBy →",
+                    tgt_name,
+                    trust_type,
+                    exploitable,
+                )
+
+            console.print(table)
+            console.print(
+                f"\n[dim]Use [bold]pathstrike attack[/dim] to exploit "
+                "discovered trust paths automatically.[/]"
+            )
+
+    try:
+        asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 if __name__ == "__main__":
     app()

