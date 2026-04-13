@@ -1600,10 +1600,13 @@ def trusts(
                 src_name = src["name"]
                 tgt_name = tgt["name"]
 
+                # Get actual edge label from BH CE
+                edge_label = edge.get("label", edge.get("kind", "Trust"))
+
                 # Detect trust direction
                 if src_name.upper().endswith(f".{tgt_name.upper()}"):
                     trust_type = "Child→Parent"
-                    exploitable = "Golden Ticket + EA SID"
+                    exploitable = "Golden Ticket + EA SID History"
                 elif tgt_name.upper().endswith(f".{src_name.upper()}"):
                     trust_type = "Parent→Child"
                     exploitable = "Golden Ticket"
@@ -1613,7 +1616,7 @@ def trusts(
 
                 table.add_row(
                     src_name,
-                    "TrustedBy →",
+                    f"{edge_label} →",
                     tgt_name,
                     trust_type,
                     exploitable,

@@ -33,7 +33,7 @@ from pathstrike.models import (
 from pathstrike.tools import impacket_wrapper as impacket
 
 
-@register_handler("TrustedBy")
+@register_handler("TrustedBy", "SameForestTrust", "ExternalTrust", "TrustedForestTrust")
 class TrustedByHandler(BaseEdgeHandler):
     """Exploit ``TrustedBy`` edges via trust key abuse.
 

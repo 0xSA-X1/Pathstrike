@@ -157,5 +157,5 @@ def build_trust_map_query() -> tuple[str, None]:
     Returns:
         Tuple of (cypher_query, None).
     """
-    query = "MATCH p=(d1:Domain)-[:TrustedBy]->(d2:Domain) RETURN p"
+    query = "MATCH p=(d1:Domain)-[r]->(d2:Domain) RETURN p"
     return query, None
