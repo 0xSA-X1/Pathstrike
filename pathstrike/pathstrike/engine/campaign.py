@@ -118,6 +118,7 @@ class CampaignOrchestrator:
                 break
 
             # --- DISCOVER ---
+            all_paths: list[AttackPath] = []
             all_scored: list[ScoredPath] = []
             for identity in to_query:
                 self.queried_identities.add(identity)
@@ -127,22 +128,38 @@ class CampaignOrchestrator:
 
                 paths = await self._discover_paths(identity)
                 if paths:
+                    all_paths.extend(paths)
                     scored = rank_paths(paths)
-                    # Filter already-completed targets
                     scored = [
                         s for s in scored
                         if s.path.target.name not in self.completed_targets
                     ]
                     all_scored.extend(scored)
 
-            # Check for trust escalation opportunities
+            # Compose trust chains: if a path reaches DA/Domain, append
+            # trust edges to create end-to-end cross-domain paths
+            trust_extensions = await self._get_trust_edges()
+            if trust_extensions:
+                composed = self._compose_trust_chains(all_paths, trust_extensions)
+                if composed:
+                    composed_scored = rank_paths(composed)
+                    all_scored.extend(composed_scored)
+
+            # Also add any post-DA trust paths if domains already compromised
             trust_paths = await self._discover_trust_escalation()
             if trust_paths:
                 trust_scored = rank_paths(trust_paths)
                 all_scored.extend(trust_scored)
 
-            # Re-sort combined results
+            # Re-sort combined results and deduplicate by target
             all_scored.sort(key=lambda s: s.composite_score, reverse=True)
+            seen_targets: set[str] = set()
+            deduped: list[ScoredPath] = []
+            for sp in all_scored:
+                if sp.path.target.name not in seen_targets:
+                    seen_targets.add(sp.path.target.name)
+                    deduped.append(sp)
+            all_scored = deduped
 
             if not all_scored:
                 console.print(
@@ -154,30 +171,29 @@ class CampaignOrchestrator:
             # --- DISPLAY ---
             self._display_ranked_paths(all_scored, iteration)
 
+            # --- SELECT ---
+            if self.mode == ExecutionMode.interactive:
+                selected = self._interactive_select(all_scored)
+                if selected is None:
+                    console.print("[yellow]Campaign aborted by user.[/]")
+                    result.duration_seconds = time.time() - start_time
+                    return result
+                execution_queue = [selected]
+            elif self.mode == ExecutionMode.auto:
+                execution_queue = all_scored[:self.max_targets]
+            else:
+                # Dry run — show all and stop
+                for sp in all_scored[:self.max_targets]:
+                    await self._execute_path(sp)
+                break
+
             # --- EXECUTE ---
             executed_any = False
-            for scored_path in all_scored[:self.max_targets]:
+            for scored_path in execution_queue:
                 target_name = scored_path.path.target.name
-
                 if target_name in self.completed_targets:
                     continue
 
-                # Interactive: ask user
-                if self.mode == ExecutionMode.interactive:
-                    console.print(
-                        f"\n[bold]Execute path to "
-                        f"[green]{target_name}[/] "
-                        f"(score: {scored_path.composite_score:.1f})?[/]"
-                    )
-                    proceed = console.input("[y/n/q] (y): ").strip().lower()
-                    if proceed == "q":
-                        console.print("[yellow]Campaign aborted by user.[/]")
-                        result.duration_seconds = time.time() - start_time
-                        return result
-                    if proceed == "n":
-                        continue
-
-                # Execute the path
                 success = await self._execute_path(scored_path)
                 result.total_paths_attempted += 1
 
@@ -310,6 +326,74 @@ class CampaignOrchestrator:
 
         return trust_paths
 
+    async def _get_trust_edges(self) -> list[AttackPath]:
+        """Get all trust edges between domains."""
+        try:
+            query, _ = build_trust_map_query()
+            response = await self.bh_client.cypher_query(query)
+            return parse_cypher_response(response)
+        except Exception:
+            return []
+
+    def _compose_trust_chains(
+        self,
+        base_paths: list[AttackPath],
+        trust_paths: list[AttackPath],
+    ) -> list[AttackPath]:
+        """Compose DA paths with trust edges into end-to-end cross-domain paths.
+
+        If a base path ends at DA or a Domain node, and a trust edge
+        starts from that domain, create a combined path that goes all
+        the way through the trust boundary.
+        """
+        from pathstrike.models import PathStep
+
+        composed: list[AttackPath] = []
+        da_names = {"DOMAIN ADMINS", "ENTERPRISE ADMINS", "ADMINISTRATORS"}
+
+        for base in base_paths:
+            target_name = base.target.name.split("@")[0].upper()
+            target_domain = (
+                base.target.domain
+                or (base.target.name.split("@")[1] if "@" in base.target.name else "")
+            ).upper()
+
+            # Check if this path reaches DA or a Domain node
+            is_da_path = target_name in da_names or base.target.label == "Domain"
+            if not is_da_path:
+                continue
+
+            # Find trust edges from this domain
+            for trust in trust_paths:
+                trust_source = trust.source.name.upper()
+                if trust_source != target_domain and trust_source != base.target.name.upper():
+                    continue
+
+                # Don't create composed path if target already completed
+                if trust.target.name in self.completed_targets:
+                    continue
+
+                # Compose: base path steps + trust path steps
+                combined_steps = list(base.steps)
+                for i, trust_step in enumerate(trust.steps):
+                    combined_steps.append(
+                        PathStep(
+                            index=len(combined_steps),
+                            edge=trust_step.edge,
+                            handler_name=trust_step.handler_name,
+                            status="pending",
+                        )
+                    )
+
+                composed_path = AttackPath(
+                    steps=combined_steps,
+                    source=base.source,
+                    target=trust.target,
+                )
+                composed.append(composed_path)
+
+        return composed
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -371,6 +455,44 @@ class CampaignOrchestrator:
             console.print(
                 f"  [bold red]Domain compromised:[/] [green]{target.name}[/]"
             )
+
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def _interactive_select(
+        self, scored: list[ScoredPath]
+    ) -> ScoredPath | None:
+        """Let the user pick a target by number.
+
+        Returns the selected ScoredPath, or None to abort.
+        """
+        console.print(
+            "\n[bold]Select a target to attack:[/] "
+            "[dim](enter number, or 'q' to quit)[/]"
+        )
+        choice = console.input(f"[1-{len(scored[:20])}] (1): ").strip()
+
+        if choice.lower() == "q":
+            return None
+
+        if choice == "" or choice.lower() == "y":
+            return scored[0]
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(scored):
+                target = scored[idx]
+                console.print(
+                    f"  Selected: [green]{target.path.target.name}[/] "
+                    f"(score: {target.composite_score:.1f})"
+                )
+                return target
+        except ValueError:
+            pass
+
+        console.print("[yellow]Invalid selection, using #1.[/]")
+        return scored[0]
 
     # ------------------------------------------------------------------
     # Display
