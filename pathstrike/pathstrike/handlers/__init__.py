@@ -20,6 +20,9 @@ Supported edge categories:
 * **Container** -- OU / Container object exploitation
 * **Ticket Forging** -- Golden / Silver ticket forging
 * **Coercion** -- Authentication coercion and relay (PetitPotam, PrinterBug, DFSCoerce)
+
+Note: ``kerberos.py`` is a utility module for Kerberoasting/AS-REP CLI commands,
+not an edge handler — it is imported by ``cli.py`` directly.
 """
 
 from pathstrike.handlers import (  # noqa: F401 — imported for side-effect registration

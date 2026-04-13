@@ -25,6 +25,25 @@ from pathstrike.config import PathStrikeConfig
 
 logger = logging.getLogger("pathstrike.tools.bloodyad")
 
+_SENSITIVE_FLAGS = {"-p", "-password", "--password", "-hashes", "-aesKey", "-k"}
+
+
+def _redact_cmd(cmd: list[str]) -> str:
+    """Redact sensitive arguments from a command list for logging."""
+    redacted = []
+    skip_next = False
+    for i, arg in enumerate(cmd):
+        if skip_next:
+            redacted.append("***REDACTED***")
+            skip_next = False
+        elif arg in _SENSITIVE_FLAGS and i + 1 < len(cmd):
+            redacted.append(arg)
+            skip_next = True
+        else:
+            redacted.append(arg)
+    return " ".join(shlex.quote(c) for c in redacted)
+
+
 # ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
@@ -55,7 +74,7 @@ async def run_bloodyad(
         Standardised result dict with ``success``, ``output``, ``parsed``, and ``error`` keys.
     """
     cmd = _build_command(args, config, auth_args)
-    logger.debug("Executing: %s", " ".join(shlex.quote(c) for c in cmd))
+    logger.debug("Executing: %s", _redact_cmd(cmd))
 
     result: dict[str, Any] = {
         "success": False,

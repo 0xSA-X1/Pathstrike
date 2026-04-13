@@ -30,7 +30,7 @@ from pathstrike.models import (
 from pathstrike.tools import impacket_wrapper as impacket
 
 
-@register_handler("HasSIDHistory")
+@register_handler("HasSIDHistory", "SpoofSIDHistory")
 class HasSIDHistoryHandler(BaseEdgeHandler):
     """Exploit ``HasSIDHistory`` for cross-domain privilege escalation.
 

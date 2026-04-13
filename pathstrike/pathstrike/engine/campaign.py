@@ -105,8 +105,9 @@ class CampaignOrchestrator:
             f"[green]{initial_identity}[/]\n"
         )
 
+        max_iterations = 20  # Safety limit to prevent infinite loops
         iteration = 0
-        while True:
+        while iteration < max_iterations:
             iteration += 1
 
             # Find identities we haven't queried yet
@@ -298,9 +299,8 @@ class CampaignOrchestrator:
                 response = await self.bh_client.cypher_query(path_query)
                 paths = parse_cypher_response(response)
                 all_paths.extend(paths)
-            except Exception:
-                # No path to this target — skip silently
-                pass
+            except Exception as exc:
+                logger.debug("No path to %s: %s", target_name, exc)
 
         logger.info(
             "Discovered %d reachable path(s) from %s",
@@ -373,7 +373,8 @@ class CampaignOrchestrator:
 
             logger.debug("Found %d individual trust edge(s)", len(individual))
             return individual
-        except Exception:
+        except Exception as exc:
+            logger.debug("Trust edge discovery failed: %s", exc)
             return []
 
     def _compose_trust_chains(

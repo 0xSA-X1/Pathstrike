@@ -29,6 +29,28 @@ _GPO_GUID_RE = re.compile(
     r"\{[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}"
 )
 
+_SENSITIVE_FLAGS = {"-p", "-password", "-hashes"}
+
+
+def _redact_cmd(cmd: list[str]) -> str:
+    """Redact sensitive arguments from a command list for logging."""
+    redacted = []
+    skip_next = False
+    for i, arg in enumerate(cmd):
+        if skip_next:
+            redacted.append("***REDACTED***")
+            skip_next = False
+        elif arg in _SENSITIVE_FLAGS and i + 1 < len(cmd):
+            redacted.append(arg)
+            skip_next = True
+        elif ":" in arg and "/" in arg and i == 1:
+            # Redact target string: DOMAIN/user:password
+            parts = arg.split(":", 1)
+            redacted.append(f"{parts[0]}:***" if len(parts) == 2 else arg)
+        else:
+            redacted.append(arg)
+    return " ".join(shlex.quote(c) for c in redacted)
+
 
 # ---------------------------------------------------------------------------
 # Core runner
@@ -52,7 +74,7 @@ async def run_pygpoabuse(
         Standardised result dict.
     """
     cmd = ["pygpoabuse", *args]
-    logger.debug("Executing: %s", " ".join(shlex.quote(c) for c in cmd))
+    logger.debug("Executing: %s", _redact_cmd(cmd))
 
     result: dict[str, Any] = {
         "success": False,
@@ -187,7 +209,21 @@ async def abuse_gpo(
     if description:
         args.extend(["-description", description])
 
-    # Append auth flags last (e.g. -hashes, -k, -no-pass, -aesKey).
-    args.extend(auth_flags)
+    # Filter auth flags — pyGPOAbuse supports -hashes, -k, -dc-ip
+    # but NOT -no-pass or -aesKey (use -k + -ccache for Kerberos instead).
+    unsupported = {"-no-pass", "-aesKey"}
+    filtered_flags = []
+    skip_next = False
+    for i, flag in enumerate(auth_flags):
+        if skip_next:
+            skip_next = False
+            continue
+        if flag in unsupported:
+            # -aesKey takes a value, -no-pass doesn't
+            if flag == "-aesKey":
+                skip_next = True  # skip the next arg (the key value)
+            continue
+        filtered_flags.append(flag)
+    args.extend(filtered_flags)
 
     return await run_pygpoabuse(args, timeout=timeout)

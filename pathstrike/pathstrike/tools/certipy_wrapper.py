@@ -28,6 +28,24 @@ from typing import Any
 
 logger = logging.getLogger("pathstrike.tools.certipy")
 
+_SENSITIVE_FLAGS = {"-p", "-password", "--password", "-hashes", "-aes", "-pfx-password"}
+
+
+def _redact_cmd(cmd: list[str]) -> str:
+    """Redact sensitive arguments from a command list for logging."""
+    redacted = []
+    skip_next = False
+    for i, arg in enumerate(cmd):
+        if skip_next:
+            redacted.append("***REDACTED***")
+            skip_next = False
+        elif arg in _SENSITIVE_FLAGS and i + 1 < len(cmd):
+            redacted.append(arg)
+            skip_next = True
+        else:
+            redacted.append(arg)
+    return " ".join(shlex.quote(c) for c in redacted)
+
 
 # ---------------------------------------------------------------------------
 # Core runner
@@ -54,7 +72,7 @@ async def run_certipy(
         and ``error`` keys.
     """
     cmd = ["certipy", subcommand] + args
-    logger.debug("Executing: %s", " ".join(shlex.quote(c) for c in cmd))
+    logger.debug("Executing: %s", _redact_cmd(cmd))
 
     result: dict[str, Any] = {
         "success": False,
@@ -461,11 +479,13 @@ async def certipy_template(
     args = ["-target", target, "-template", template] + auth_args
 
     if save_old:
-        args.append("-save-old")
+        # certipy uses -save-configuration <file>, not -save-old
+        args.extend(["-save-configuration", f"{template}_backup.json"])
     if configuration:
         config_path = configuration.get("config_path")
         if config_path:
-            args.extend(["-configuration", config_path])
+            # certipy uses -write-configuration, not -configuration
+            args.extend(["-write-configuration", config_path])
 
     return await run_certipy("template", args, timeout=timeout)
 

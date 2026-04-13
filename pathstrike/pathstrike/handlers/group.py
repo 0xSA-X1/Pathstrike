@@ -42,7 +42,7 @@ class MemberOfHandler(BaseEdgeHandler):
         return None
 
 
-@register_handler("AddMembers")
+@register_handler("AddMembers", "AddMember")
 class AddMembersHandler(BaseEdgeHandler):
     """Handles AddMembers edges.
 

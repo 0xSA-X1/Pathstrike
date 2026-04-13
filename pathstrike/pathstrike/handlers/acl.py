@@ -239,7 +239,7 @@ class WriteDaclHandler(BaseEdgeHandler):
 # ======================================================================
 
 
-@register_handler("WriteOwner")
+@register_handler("WriteOwner", "WriteOwnerRaw")
 class WriteOwnerHandler(BaseEdgeHandler):
     """Handles WriteOwner edges.
 
@@ -314,7 +314,7 @@ class WriteOwnerHandler(BaseEdgeHandler):
 # ======================================================================
 
 
-@register_handler("Owns")
+@register_handler("Owns", "OwnsRaw")
 class OwnsHandler(BaseEdgeHandler):
     """Handles Owns edges.
 

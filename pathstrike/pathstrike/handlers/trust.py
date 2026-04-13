@@ -33,13 +33,21 @@ from pathstrike.models import (
 from pathstrike.tools import impacket_wrapper as impacket
 
 
-@register_handler("TrustedBy", "SameForestTrust", "ExternalTrust", "TrustedForestTrust")
+@register_handler(
+    "TrustedBy", "SameForestTrust", "ExternalTrust", "TrustedForestTrust",
+    "CrossForestTrust", "AbuseTGTDelegation", "HasTrustKeys",
+)
 class TrustedByHandler(BaseEdgeHandler):
     """Exploit ``TrustedBy`` edges via trust key abuse.
 
     Automatically detects child→parent relationships and escalates
     to Enterprise Admin via Golden Ticket with SID History injection.
     """
+
+    def __init__(self, config, credential_store):
+        super().__init__(config, credential_store)
+        self._current_edge_child_sid: str | None = None
+        self._current_edge_parent_sid: str | None = None
 
     # ------------------------------------------------------------------
     # Prerequisites

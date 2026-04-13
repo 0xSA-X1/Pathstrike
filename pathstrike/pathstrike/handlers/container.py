@@ -21,7 +21,7 @@ from pathstrike.models import (
 )
 
 
-@register_handler("Contains")
+@register_handler("Contains", "ClaimSpecialIdentity")
 class ContainsHandler(BaseEdgeHandler):
     """Handle ``Contains`` edges representing OU membership.
 

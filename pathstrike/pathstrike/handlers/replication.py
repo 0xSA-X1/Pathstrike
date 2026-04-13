@@ -13,7 +13,7 @@ from pathstrike.models import (
 from pathstrike.tools import impacket_wrapper as impacket
 
 
-@register_handler("GetChanges", "GetChangesAll", "DCSync")
+@register_handler("GetChanges", "GetChangesAll", "GetChangesInFilteredSet", "DCSync")
 class DCSyncHandler(BaseEdgeHandler):
     """Handles GetChanges, GetChangesAll, and DCSync edges.
 

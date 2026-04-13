@@ -34,7 +34,7 @@ from pathstrike.tools import bloodyad_wrapper as bloody
 from pathstrike.tools import pygpoabuse_wrapper as pygpo
 
 
-@register_handler("GPLink", "GpLink")
+@register_handler("GPLink", "GpLink", "WriteGPLink")
 class GPLinkHandler(BaseEdgeHandler):
     """Exploit ``GPLink``/``GpLink`` edges via pyGPOAbuse.
 
@@ -44,9 +44,11 @@ class GPLinkHandler(BaseEdgeHandler):
     GUIDs — achieving code execution on all linked machines.
     """
 
-    _gpo_dn: str | None = None
-    _gpo_guid: str | None = None
-    _taskname: str = "PathStrike"
+    def __init__(self, config, credential_store):
+        super().__init__(config, credential_store)
+        self._gpo_dn: str | None = None
+        self._gpo_guid: str | None = None
+        self._taskname: str = "PathStrike"
 
     # ------------------------------------------------------------------
     # Prerequisites

