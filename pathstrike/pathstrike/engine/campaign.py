@@ -83,6 +83,7 @@ class CampaignOrchestrator:
         self.completed_targets: set[str] = set()
         self.failed_paths: list[ScoredPath] = []
         self.domains_compromised: set[str] = set()
+        self._captured_creds: list[dict[str, str]] = []
 
     async def run_campaign(self) -> CampaignResult:
         """Execute the autonomous campaign loop.
@@ -237,7 +238,11 @@ class CampaignOrchestrator:
         )
         result.duration_seconds = time.time() - start_time
 
+        # Snapshot credentials before they get wiped
+        self._captured_creds = self._snapshot_credentials()
+
         self._display_campaign_summary(result)
+        self._save_credentials_file()
         return result
 
     # ------------------------------------------------------------------
@@ -603,6 +608,49 @@ class CampaignOrchestrator:
 
         console.print(table)
 
+    def _snapshot_credentials(self) -> list[dict[str, str]]:
+        """Snapshot all credentials from the store before they get wiped."""
+        creds: list[dict[str, str]] = []
+        for key, cred_list in self.cred_store._credentials.items():
+            for cred in cred_list:
+                creds.append({
+                    "username": cred.username,
+                    "domain": cred.domain,
+                    "type": cred.cred_type.value,
+                    "value": cred.value,
+                    "obtained_from": cred.obtained_from or "",
+                })
+        return creds
+
+    def _save_credentials_file(self) -> None:
+        """Save captured credentials to a file."""
+        if not self._captured_creds:
+            return
+
+        import os
+        from pathlib import Path
+
+        creds_dir = Path.home() / ".pathstrike"
+        creds_dir.mkdir(parents=True, exist_ok=True)
+        creds_file = creds_dir / "campaign_credentials.txt"
+
+        with open(creds_file, "w") as fh:
+            fh.write("# PathStrike Campaign Credentials\n")
+            fh.write(f"# Captured: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            for cred in self._captured_creds:
+                fh.write(
+                    f"{cred['domain']}/{cred['username']}  "
+                    f"[{cred['type']}]  {cred['value']}\n"
+                )
+                if cred["obtained_from"]:
+                    fh.write(f"  # {cred['obtained_from']}\n")
+
+        # Set restrictive permissions
+        os.chmod(creds_file, 0o600)
+        console.print(
+            f"\n[bold]Credentials saved to:[/] [green]{creds_file}[/]"
+        )
+
     def _display_campaign_summary(self, result: CampaignResult) -> None:
         """Show final campaign results."""
         console.print("\n" + "═" * 60)
@@ -621,9 +669,38 @@ class CampaignOrchestrator:
             for d in result.domains_compromised:
                 console.print(f"  🏴 {d}")
 
+        # Show captured credentials with actual values
+        if self._captured_creds:
+            console.print(f"\n[bold cyan]Captured Credentials ({len(self._captured_creds)}):[/]")
+            for cred in self._captured_creds:
+                ctype = cred["type"]
+                user = cred["username"]
+                domain = cred["domain"]
+                value = cred["value"]
+
+                if ctype == "nt_hash":
+                    console.print(
+                        f"  💎 [green]{domain}/{user}[/]  "
+                        f"[yellow]NT Hash:[/] {value}"
+                    )
+                elif ctype == "password":
+                    console.print(
+                        f"  🔑 [green]{domain}/{user}[/]  "
+                        f"[yellow]Password:[/] {value}"
+                    )
+                elif ctype == "ccache":
+                    console.print(
+                        f"  🎫 [green]{domain}/{user}[/]  "
+                        f"[yellow]Ticket:[/] {value}"
+                    )
+                else:
+                    console.print(
+                        f"  🔐 [green]{domain}/{user}[/]  "
+                        f"[yellow]{ctype}:[/] {value}"
+                    )
+
         console.print(f"\nPaths attempted: {result.total_paths_attempted}")
         console.print(f"Paths succeeded: [green]{result.total_paths_succeeded}[/]")
         console.print(f"Paths failed: [red]{result.total_paths_failed}[/]")
-        console.print(f"Credentials captured: {result.credentials_captured}")
         console.print(f"Duration: {result.duration_seconds:.1f}s")
         console.print("═" * 60)
