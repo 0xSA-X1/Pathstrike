@@ -327,11 +327,37 @@ class CampaignOrchestrator:
         return trust_paths
 
     async def _get_trust_edges(self) -> list[AttackPath]:
-        """Get all trust edges between domains."""
+        """Get individual trust edges as single-step AttackPaths.
+
+        The trust query returns all edges between Domain nodes.  We split
+        the parsed path into individual single-edge paths so each can be
+        composed independently (child→parent vs parent→child).
+        """
+        from pathstrike.models import PathStep
+
         try:
             query, _ = build_trust_map_query()
             response = await self.bh_client.cypher_query(query)
-            return parse_cypher_response(response)
+            parsed = parse_cypher_response(response)
+
+            individual: list[AttackPath] = []
+            for path in parsed:
+                for step in path.steps:
+                    # Create a single-step AttackPath for each trust edge
+                    single = AttackPath(
+                        steps=[PathStep(
+                            index=0,
+                            edge=step.edge,
+                            handler_name=step.handler_name,
+                            status="pending",
+                        )],
+                        source=step.edge.source,
+                        target=step.edge.target,
+                    )
+                    individual.append(single)
+
+            logger.debug("Found %d individual trust edge(s)", len(individual))
+            return individual
         except Exception:
             return []
 
@@ -353,25 +379,44 @@ class CampaignOrchestrator:
 
         for base in base_paths:
             target_name = base.target.name.split("@")[0].upper()
-            target_domain = (
-                base.target.domain
-                or (base.target.name.split("@")[1] if "@" in base.target.name else "")
-            ).upper()
+            # Extract domain from the target name (e.g. DOMAIN ADMINS@NORTH.SEV... → NORTH.SEV...)
+            if "@" in base.target.name:
+                target_domain = base.target.name.split("@")[1].upper()
+            elif base.target.domain:
+                target_domain = base.target.domain.upper()
+            else:
+                target_domain = base.target.name.upper()  # Domain nodes ARE the domain
 
             # Check if this path reaches DA or a Domain node
             is_da_path = target_name in da_names or base.target.label == "Domain"
             if not is_da_path:
                 continue
 
-            # Find trust edges from this domain
+            logger.debug(
+                "Composable DA path: %s (domain=%s)", base.target.name, target_domain,
+            )
+
+            # Find trust edges FROM this domain TO another domain
             for trust in trust_paths:
                 trust_source = trust.source.name.upper()
-                if trust_source != target_domain and trust_source != base.target.name.upper():
+                trust_target = trust.target.name.upper()
+
+                # Trust source must match the DA path's domain
+                if trust_source != target_domain:
                     continue
 
-                # Don't create composed path if target already completed
+                # Skip if trust goes back to same domain
+                if trust_target == target_domain:
+                    continue
+
+                # Skip already completed
                 if trust.target.name in self.completed_targets:
                     continue
+
+                logger.debug(
+                    "Composing: %s → [trust] → %s",
+                    base.target.name, trust.target.name,
+                )
 
                 # Compose: base path steps + trust path steps
                 combined_steps = list(base.steps)
