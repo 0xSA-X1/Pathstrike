@@ -24,7 +24,8 @@ from rich.table import Table
 
 from pathstrike.bloodhound.client import BloodHoundClient
 from pathstrike.bloodhound.cypher import (
-    build_all_high_value_targets_query,
+    build_high_value_nodes_query,
+    build_shortest_path_to_target_query,
     build_trust_map_query,
 )
 from pathstrike.bloodhound.parser import parse_cypher_response
@@ -230,14 +231,61 @@ class CampaignOrchestrator:
     async def _discover_paths(
         self, identity: str
     ) -> list[AttackPath]:
-        """Query BH CE for all high-value targets reachable from identity."""
-        query, _ = build_all_high_value_targets_query(identity)
+        """Query BH CE for shortest paths to each high-value target.
+
+        Two-step approach:
+        1. Find all high-value nodes in the domain
+        2. For each, query the shortest path from identity → target
+        """
+        domain = self.config.domain.name
+
+        # Step 1: Find all high-value targets
+        hv_query, _ = build_high_value_nodes_query(domain)
         try:
-            response = await self.bh_client.cypher_query(query)
-            return parse_cypher_response(response)
+            hv_response = await self.bh_client.cypher_query(hv_query)
         except Exception as exc:
-            logger.warning("Discovery query failed for %s: %s", identity, exc)
+            logger.warning("High-value target discovery failed: %s", exc)
             return []
+
+        # Extract target names from literals
+        target_names: list[str] = []
+        literals = hv_response.get("data", {}).get("literals", [])
+        for lit in literals:
+            if lit.get("key") == "name" and lit.get("value"):
+                target_names.append(lit["value"])
+
+        if not target_names:
+            logger.info("No high-value targets found in %s", domain)
+            return []
+
+        logger.info(
+            "Found %d high-value target(s) in %s", len(target_names), domain,
+        )
+
+        # Step 2: Find shortest path to each target
+        all_paths: list[AttackPath] = []
+        for target_name in target_names:
+            if target_name == identity:
+                continue
+            if target_name in self.completed_targets:
+                continue
+
+            path_query, _ = build_shortest_path_to_target_query(
+                identity, target_name,
+            )
+            try:
+                response = await self.bh_client.cypher_query(path_query)
+                paths = parse_cypher_response(response)
+                all_paths.extend(paths)
+            except Exception:
+                # No path to this target — skip silently
+                pass
+
+        logger.info(
+            "Discovered %d reachable path(s) from %s",
+            len(all_paths), identity,
+        )
+        return all_paths
 
     async def _discover_trust_escalation(self) -> list[AttackPath]:
         """Check for trust edges from compromised domains.
@@ -344,9 +392,12 @@ class CampaignOrchestrator:
         table.add_column("Edge Types", style="dim")
 
         for i, sp in enumerate(scored[:20], 1):
-            edges = " → ".join(s.edge.edge_type for s in sp.path.steps)
-            if len(edges) > 60:
-                edges = edges[:57] + "..."
+            # Show unique edge types in order, not all 71 steps
+            seen = []
+            for s in sp.path.steps:
+                if not seen or seen[-1] != s.edge.edge_type:
+                    seen.append(s.edge.edge_type)
+            edges = " → ".join(seen)
 
             table.add_row(
                 str(i),

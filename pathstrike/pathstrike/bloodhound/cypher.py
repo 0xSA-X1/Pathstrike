@@ -166,16 +166,37 @@ def build_trust_map_query() -> tuple[str, None]:
 # ---------------------------------------------------------------------------
 
 
-def build_all_high_value_targets_query(
-    source_name: str,
-) -> tuple[str, None]:
-    """Find shortest paths from source to ALL high-value targets.
+def build_high_value_nodes_query(domain: str) -> tuple[str, None]:
+    """Find all high-value nodes in a domain (targets for campaign discovery).
 
-    Discovers paths to groups with admincount=true, BH CE Tier Zero
-    objects, and Domain nodes.  Returns up to 50 paths.
+    Returns node names with admincount=true, isTierZero=true, or Domain type.
 
     Args:
-        source_name: Fully qualified source (e.g. ``USER@DOMAIN.LOCAL``).
+        domain: Domain to scope.
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    query = (
+        f"MATCH (t) "
+        f"WHERE (t.admincount = true OR t.isTierZero = true OR t:Domain) "
+        f"AND t.domain = '{_escape(domain.upper())}' "
+        f"RETURN t.name AS name, t.objectid AS objectid, labels(t) AS labels"
+    )
+    return query, None
+
+
+def build_shortest_path_to_target_query(
+    source_name: str,
+    target_name: str,
+) -> tuple[str, None]:
+    """Find the shortest path from source to a specific target.
+
+    Uses the edge-type filter to only traverse exploitable edges.
+
+    Args:
+        source_name: Fully qualified source.
+        target_name: Fully qualified target.
 
     Returns:
         Tuple of (cypher_query, None).
@@ -183,13 +204,8 @@ def build_all_high_value_targets_query(
     edge_filter = _edge_type_filter()
     query = (
         f"MATCH p=shortestPath("
-        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..]->(t)"
-        f") "
-        f"WHERE (t:Group OR t:Domain OR t:User OR t:Computer) "
-        f"AND t.name <> '{_escape(source_name)}' "
-        f"AND (t.admincount = true OR t.system_tags CONTAINS 'admin_tier_zero' "
-        f"OR t:Domain) "
-        f"RETURN p LIMIT 50"
+        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..]->(t {{name: '{_escape(target_name)}'}})"
+        f") RETURN p"
     )
     return query, None
 

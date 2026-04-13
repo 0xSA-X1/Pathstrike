@@ -188,7 +188,7 @@ def score_target_node(node: NodeInfo) -> float:
 
     # 3. Check BH CE properties
     props = node.properties or {}
-    if props.get("isTierZero") or "admin_tier_zero" in str(props.get("system_tags", "")):
+    if props.get("isTierZero") is True:
         score = max(score, 85.0)
     if props.get("admincount") is True:
         score = max(score, 75.0)
