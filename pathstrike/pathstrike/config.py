@@ -52,6 +52,15 @@ class ExecutionConfig(BaseModel):
     auto_time_sync: bool = True
 
 
+class CampaignConfig(BaseModel):
+    """Autonomous campaign behavior settings."""
+
+    max_targets: int = 10
+    trust_escalation: bool = True
+    rescan_after_escalation: bool = True
+    max_total_paths: int = 50
+
+
 class PathStrikeConfig(BaseModel):
     """Root configuration object aggregating all sub-configs."""
 
@@ -60,6 +69,7 @@ class PathStrikeConfig(BaseModel):
     credentials: CredentialsConfig
     target: TargetConfig = Field(default_factory=TargetConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    campaign: CampaignConfig = Field(default_factory=CampaignConfig)
 
 
 # Default config search order (checked when ``-c`` is not supplied).

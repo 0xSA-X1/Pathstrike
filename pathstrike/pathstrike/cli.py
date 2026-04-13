@@ -1681,5 +1681,104 @@ def trusts(
         raise typer.Exit(code=1) from exc
 
 
+@app.command()
+def campaign(
+    source: SourceOption = None,
+    config: ConfigOption = None,
+    mode: Annotated[
+        ExecutionMode,
+        typer.Option("--mode", "-m", help="Execution mode: interactive, auto, or dry_run"),
+    ] = ExecutionMode.interactive,
+    max_retries: Annotated[
+        int,
+        typer.Option("--max-retries", help="Max retries per step"),
+    ] = -1,
+    max_targets: Annotated[
+        int,
+        typer.Option("--max-targets", help="Max high-value targets to pursue per round"),
+    ] = 10,
+    no_time_sync: Annotated[
+        bool,
+        typer.Option("--no-time-sync", help="Disable automatic ntpdate clock sync"),
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Autonomous attack campaign — discover, rank, and chain ALL attack paths.
+
+    Queries BloodHound CE for every reachable high-value target,
+    ranks them by privilege value (Enterprise Admin → Domain Admin →
+    Backup Operators → ...), and executes the highest-value paths
+    automatically.
+
+    After each successful escalation, re-queries from the new position
+    to discover additional paths.  Automatically chains trust
+    escalation (child→parent domain) when Domain Admin is reached.
+
+    [bold green]Interactive mode[/] (default): shows ranked paths and asks
+    before each execution.
+
+    [bold yellow]Auto mode[/] (-m auto): fully autonomous — executes all
+    paths by score without prompting.
+
+    [bold cyan]Dry-run mode[/] (-m dry_run): discovers and ranks paths
+    without executing anything.
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    source_name = _build_source_name(source, cfg)
+
+    retry_policy = _build_retry_policy(cfg)
+    if max_retries >= 0:
+        retry_policy.max_retries = max_retries
+
+    if no_time_sync or not cfg.execution.auto_time_sync:
+        from pathstrike.engine.error_handler import ErrorCategory
+        retry_on = set(retry_policy.retry_on)
+        retry_on.discard(ErrorCategory.TIME_SKEW)
+        retry_policy.retry_on = frozenset(retry_on)
+
+    console.print(
+        f"[bold]Campaign Mode:[/] {mode.value}\n"
+        f"[bold]Source:[/] {source_name}\n"
+        f"[bold]Max targets per round:[/] {max_targets}\n"
+        f"[bold]Max retries:[/] {retry_policy.max_retries}\n"
+        f"[bold]Auto time sync:[/] {'disabled' if no_time_sync else 'enabled'}\n"
+    )
+
+    async def _run():
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            cred_store = _seed_credential_store(cfg)
+            rollback_mgr = RollbackManager(cfg)
+
+            from pathstrike.engine.campaign import CampaignOrchestrator
+
+            campaign_orch = CampaignOrchestrator(
+                config=cfg,
+                bh_client=client,
+                cred_store=cred_store,
+                rollback_mgr=rollback_mgr,
+                retry_policy=retry_policy,
+                mode=mode,
+                verbose=verbose,
+                max_targets=max_targets,
+            )
+
+            result = await campaign_orch.run_campaign()
+
+            if not result.targets_compromised and mode != ExecutionMode.dry_run:
+                raise typer.Exit(code=1)
+
+    try:
+        asyncio.run(_run())
+    except (ValueError, typer.Exit) as exc:
+        if isinstance(exc, ValueError):
+            console.print(f"[bold red]Config error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 if __name__ == "__main__":
     app()

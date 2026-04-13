@@ -159,3 +159,80 @@ def build_trust_map_query() -> tuple[str, None]:
     """
     query = "MATCH p=(d1:Domain)-[r]->(d2:Domain) RETURN p"
     return query, None
+
+
+# ---------------------------------------------------------------------------
+# Campaign discovery queries (multi-target)
+# ---------------------------------------------------------------------------
+
+
+def build_all_high_value_targets_query(
+    source_name: str,
+) -> tuple[str, None]:
+    """Find shortest paths from source to ALL high-value targets.
+
+    Discovers paths to groups with admincount=true, BH CE Tier Zero
+    objects, and Domain nodes.  Returns up to 50 paths.
+
+    Args:
+        source_name: Fully qualified source (e.g. ``USER@DOMAIN.LOCAL``).
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    edge_filter = _edge_type_filter()
+    query = (
+        f"MATCH p=shortestPath("
+        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..]->(t)"
+        f") "
+        f"WHERE (t:Group OR t:Domain OR t:User OR t:Computer) "
+        f"AND t.name <> '{_escape(source_name)}' "
+        f"AND (t.admincount = true OR t.system_tags CONTAINS 'admin_tier_zero' "
+        f"OR t:Domain) "
+        f"RETURN p LIMIT 50"
+    )
+    return query, None
+
+
+def build_reachable_targets_query(
+    source_name: str,
+    max_depth: int = 10,
+) -> tuple[str, None]:
+    """Find ALL reachable targets from source with exploitable edges.
+
+    Broader than high-value-only — discovers any node reachable via
+    exploitation edges.  Used for post-escalation re-discovery.
+
+    Args:
+        source_name: Fully qualified source.
+        max_depth: Maximum path depth.
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    edge_filter = _edge_type_filter()
+    query = (
+        f"MATCH p=shortestPath("
+        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..{max_depth}]->(t)"
+        f") "
+        f"WHERE t.name <> '{_escape(source_name)}' "
+        f"AND (t:Group OR t:Domain OR t:User OR t:Computer) "
+        f"RETURN p LIMIT 50"
+    )
+    return query, None
+
+
+def build_outbound_edges_query(node_name: str) -> tuple[str, None]:
+    """Count outbound edges by type for a node (used for dynamic scoring).
+
+    Args:
+        node_name: Fully qualified node name.
+
+    Returns:
+        Tuple of (cypher_query, None).
+    """
+    query = (
+        f"MATCH (n {{name: '{_escape(node_name)}'}})-[r]->(m) "
+        f"RETURN type(r) AS edge_type, count(*) AS cnt"
+    )
+    return query, None

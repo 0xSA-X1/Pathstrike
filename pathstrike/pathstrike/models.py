@@ -84,6 +84,28 @@ class RollbackAction(BaseModel):
     executed: bool = False
 
 
+class ScoredPath(BaseModel):
+    """An attack path annotated with privilege-value scoring."""
+
+    path: AttackPath
+    target_score: float = Field(ge=0, le=100, description="Privilege value of the final target (0-100)")
+    feasibility: float = Field(ge=0, le=1.0, description="Product of edge weights (0-1)")
+    composite_score: float = Field(ge=0, le=100, description="target_score * feasibility")
+    domain: str = ""
+
+
+class CampaignResult(BaseModel):
+    """Summary of an autonomous campaign execution."""
+
+    targets_compromised: list[str] = Field(default_factory=list)
+    domains_compromised: list[str] = Field(default_factory=list)
+    total_paths_attempted: int = 0
+    total_paths_succeeded: int = 0
+    total_paths_failed: int = 0
+    credentials_captured: int = 0
+    duration_seconds: float = 0.0
+
+
 class ExecutionMode(StrEnum):
     """Execution modes controlling user interaction during attack."""
 
