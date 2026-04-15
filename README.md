@@ -2,13 +2,13 @@
 
 **Automated Active Directory attack path exploitation via BloodHound CE.**
 
-PathStrike discovers and executes AD privilege escalation paths identified by BloodHound Community Edition. Point it at a compromised user, and it will find the shortest path to Domain Admin (or any target), then exploit each edge automatically using battle-tested offensive tools.
+PathStrike discovers and executes AD privilege escalation paths identified by BloodHound Community Edition using Bloodhound API. Point it at a compromised user, and it will find the shortest path to Domain Admin or highest privilege (if a path exists), then exploit each edge automatically using a variety of tools.
 
 ---
 
 ## Features
 
-- **Path Discovery** -- queries BloodHound CE for shortest attack paths via Cypher
+- **Path Discovery** -- queries BloodHound's API for attack paths via Cypher
 - **Automated Exploitation** -- 50+ BloodHound edge types handled by dedicated attack modules
 - **Campaign Mode** -- autonomous multi-target loop: discover, rank, exploit, re-discover
 - **Cross-Domain Escalation** -- detects and exploits domain trust relationships (child-to-parent, forest trusts)
@@ -45,7 +45,7 @@ PathStrike discovers and executes AD privilege escalation paths identified by Bl
 
 ```bash
 # Clone and install
-git clone https://github.com/YOUR_USERNAME/Pathstrike.git
+git clone https://github.com/0x-SA-X1/Pathstrike.git
 cd Pathstrike/pathstrike
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
@@ -56,7 +56,7 @@ pip install git+https://github.com/Pennyw0rth/NetExec.git
 
 # Configure
 cp pathstrike.yaml.example pathstrike.yaml
-# Edit pathstrike.yaml with your BloodHound CE API keys, domain info, and credentials
+# Edit pathstrike.yaml with your BloodHound CE API keys [Optional: domain info, and credentials]
 
 # Verify everything is ready
 pathstrike verify
@@ -74,7 +74,6 @@ pathstrike attack -s jsmith -m auto
 pathstrike campaign -s jsmith
 ```
 
-See [INSTALL.md](pathstrike/INSTALL.md) for detailed setup and troubleshooting.
 
 ---
 
@@ -93,7 +92,7 @@ See [INSTALL.md](pathstrike/INSTALL.md) for detailed setup and troubleshooting.
 | `pathstrike trusts` | Enumerate domain trust relationships |
 | `pathstrike kerberoast` | Kerberoasting attack |
 | `pathstrike asreproast` | AS-REP roasting attack |
-| `pathstrike credentials` | Display captured credentials |
+| `pathstrike credentials` | Display captured credentials or Write new credentials to config file |
 | `pathstrike timesync` | Check or sync Kerberos clock offset |
 | `pathstrike rollback` | Reverse AD changes from a previous attack |
 | `pathstrike checkpoints` | List and manage saved attack checkpoints |
@@ -122,8 +121,8 @@ domain:
   dc_fqdn: "dc01.corp.local"
 
 credentials:
-  username: "jsmith"
-  password: "Summer2024!"
+  username: "johnsmith"
+  password: "Winter2020!"
   # Or: nt_hash / ccache_path
 
 target:
@@ -144,7 +143,7 @@ execution:
 - Python 3.11+
 - BloodHound Community Edition (running with API keys)
 - Linux attacker box (Kali, Parrot, Ubuntu)
-- External tools: bloodyAD, Impacket, Certipy, NetExec, ntpdate (see [INSTALL.md](pathstrike/INSTALL.md))
+- External tools: bloodyAD, Impacket, Certipy, NetExec, ntpdate
 
 ---
 
@@ -155,7 +154,6 @@ execution:
 - [ ] **ROADtools** -- Azure AD / Entra ID enumeration and exploitation. Integrate `roadrecon` for Azure AD data collection and `roadlib` for token manipulation to extend attack paths into hybrid and cloud-only environments.
 - [ ] **GitHound** -- Git credential discovery. Scan repositories, commit history, and CI/CD pipelines for leaked secrets (API keys, tokens, passwords) that can feed new credentials into PathStrike's credential store.
 - [ ] **VsphereHound** -- VMware vSphere enumeration for BloodHound. Ingest vSphere relationships (VM-to-host, permissions, roles) to discover attack paths through virtualization infrastructure into AD.
-- [ ] **ADCSKiller** -- Streamlined ADCS exploitation as an alternative/supplement to Certipy for certificate abuse edge types.
 - [ ] **Coercer** -- Expanded authentication coercion beyond PetitPotam/PrinterBug/DFSCoerce. Integrate Coercer's comprehensive MS-RPC method database for more reliable coercion across edge types.
 - [ ] **KrbRelayUp** -- Local privilege escalation via Kerberos relay. Chain with existing RBCD and shadow credential handlers for local-to-domain escalation paths.
 - [ ] **Whisker** -- Alternative shadow credential manipulation tooling for `AddKeyCredentialLink` edges.
@@ -167,10 +165,9 @@ execution:
 - [ ] **OPSEC profiles** -- configurable noise levels (stealth vs speed) with tool selection preferences
 - [ ] **Plugin system** -- drop-in handler modules for custom/proprietary edge types
 - [ ] **Real-time BloodHound sync** -- push newly compromised nodes back into BloodHound CE for live graph updates
-- [ ] **Webhook notifications** -- Slack/Teams/Discord alerts on domain compromise or credential capture
 - [ ] **SOCKS proxy support** -- route tool traffic through proxychains/SOCKS for pivoting
 - [ ] **Multi-forest campaigns** -- orchestrate attacks across multiple forests from a single config
-
+- [ ] **Mythic Plugin** -- access to the tool via Mythic
 ---
 
 ## Disclaimer
@@ -196,20 +193,6 @@ PathStrike is built on top of incredible work by the offensive security communit
 | **DFSCoerce** | MS-DFSNM Distributed File System coercion | [github.com/Wh04m1001/DFSCoerce](https://github.com/Wh04m1001/DFSCoerce) |
 | **ntlmrelayx** | NTLM relay framework (part of Impacket) | [github.com/fortra/impacket](https://github.com/fortra/impacket) |
 
-### Roadmap Tools
-
-| Tool | Description | Link |
-|---|---|---|
-| **ROADtools** | Azure AD / Entra ID exploration framework | [github.com/dirkjanm/ROADtools](https://github.com/dirkjanm/ROADtools) |
-| **GitHound** | Git credential and secret discovery | [github.com/tillson/git-hound](https://github.com/tillson/git-hound) |
-| **VsphereHound** | VMware vSphere data collection for BloodHound | [github.com/intrusionops/VsphereHound](https://github.com/intrusionops/VsphereHound) |
-| **Coercer** | Comprehensive MS-RPC authentication coercion | [github.com/p0dalirius/Coercer](https://github.com/p0dalirius/Coercer) |
-| **KrbRelayUp** | Kerberos relay local privilege escalation | [github.com/Dec0ne/KrbRelayUp](https://github.com/Dec0ne/KrbRelayUp) |
-| **Whisker** | Shadow credential manipulation | [github.com/eladshamir/Whisker](https://github.com/eladshamir/Whisker) |
-| **PKINITtools** | PKINIT authentication utilities | [github.com/dirkjanm/PKINITtools](https://github.com/dirkjanm/PKINITtools) |
-| **ADCSKiller** | Streamlined ADCS exploitation | [github.com/grimlockx/ADCSKiller](https://github.com/grimlockx/ADCSKiller) |
-
----
 
 ## License
 
