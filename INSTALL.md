@@ -117,7 +117,7 @@ This checks every binary on PATH and tests BloodHound CE connectivity.
 cp pathstrike.yaml.example pathstrike.yaml
 
 # Edit with your values
-nano pathstrike.yaml
+vim pathstrike.yaml
 ```
 
 ### Required fields
