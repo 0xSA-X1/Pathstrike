@@ -30,6 +30,12 @@ Thumbs.db
 *.pem
 *.key
 campaign_credentials.txt
+pathstrike.yaml
+pathstrike.yml
+.pathstrike.yaml
 
 # Checkpoints
 .pathstrike/
+
+# Rollback logs (auto-generated during attacks)
+rollback_logs/

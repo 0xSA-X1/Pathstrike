@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -157,6 +158,41 @@ def _build_retry_policy(cfg: PathStrikeConfig) -> RetryPolicy:
     return RetryPolicy(
         max_retries=cfg.execution.max_retries,
     )
+
+
+# ---------------------------------------------------------------------------
+# Rollback log auto-save
+# ---------------------------------------------------------------------------
+
+ROLLBACK_LOG_DIR = Path("rollback_logs")
+
+
+def _save_rollback_log(rollback_mgr: RollbackManager, label: str) -> Path | None:
+    """Save rollback actions to a timestamped JSON file if any exist.
+
+    Returns the path to the saved file, or ``None`` if there were no actions.
+    """
+    if len(rollback_mgr) == 0:
+        return None
+
+    ROLLBACK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"rollback_{label}_{ts}.json"
+    log_path = ROLLBACK_LOG_DIR / filename
+    rollback_mgr.save_to_file(log_path)
+    console.print(
+        f"\n[bold cyan]Rollback log saved:[/] {log_path}\n"
+        f"[dim]Run 'pathstrike rollback {log_path}' to undo changes.[/]"
+    )
+    return log_path
+
+
+def _find_latest_rollback_log() -> Path | None:
+    """Find the most recent rollback log file in the rollback_logs directory."""
+    if not ROLLBACK_LOG_DIR.exists():
+        return None
+    logs = sorted(ROLLBACK_LOG_DIR.glob("rollback_*.json"), key=lambda p: p.stat().st_mtime)
+    return logs[-1] if logs else None
 
 
 def _display_paths(paths: list[AttackPath], max_paths: int) -> None:
@@ -422,7 +458,9 @@ def attack(
                 checkpoint_mgr=checkpoint_mgr,
             )
 
-            return await orchestrator.execute_path(path, mode)
+            result = await orchestrator.execute_path(path, mode)
+            _save_rollback_log(rollback_mgr, "attack")
+            return result
 
     try:
         success = asyncio.run(_run())
@@ -529,9 +567,11 @@ def _attack_resume(
                 checkpoint_mgr=checkpoint_mgr,
             )
 
-            return await orchestrator.execute_path_from_checkpoint(
+            result = await orchestrator.execute_path_from_checkpoint(
                 path, mode, resume_index
             )
+            _save_rollback_log(rollback_mgr, "attack_resume")
+            return result
 
     try:
         success = asyncio.run(_run())
@@ -778,9 +818,11 @@ def timesync(
 @app.command()
 def rollback(
     log_file: Annotated[
-        Path,
-        typer.Argument(help="Path to the rollback JSON log file", exists=True),
-    ],
+        Optional[Path],
+        typer.Argument(
+            help="Path to the rollback JSON log file. If omitted, uses the most recent log from rollback_logs/.",
+        ),
+    ] = None,
     config: ConfigOption = None,
     dry_run: Annotated[
         bool,
@@ -800,11 +842,30 @@ def rollback(
 ) -> None:
     """Undo actions recorded in a rollback log file.
 
+    If no LOG_FILE is given, the most recent log from ``rollback_logs/``
+    is used automatically.
+
     Use ``--dry-run`` to preview what commands would be executed.
     Use ``--force`` to continue even if individual rollback actions fail.
     """
     setup_logging(verbose=verbose)
     cfg = _load_config_or_exit(config)
+
+    # Resolve log file: explicit argument or auto-discover latest
+    if log_file is None:
+        log_file = _find_latest_rollback_log()
+        if log_file is None:
+            console.print(
+                "[bold red]No rollback log specified and no logs found in "
+                "rollback_logs/.[/]\n"
+                "[dim]Run an attack first, or pass a log file explicitly: "
+                "pathstrike rollback <log_file>[/]"
+            )
+            raise typer.Exit(code=1)
+        console.print(f"[dim]Using latest rollback log:[/] {log_file}\n")
+    elif not log_file.exists():
+        console.print(f"[bold red]Rollback log not found:[/] {log_file}")
+        raise typer.Exit(code=1)
 
     try:
         mgr = RollbackManager.load_from_file(log_file, cfg)
@@ -963,119 +1024,6 @@ def list_checkpoints(
         f"\n[dim]Total: {len(checkpoints)} checkpoint(s)[/]\n"
         "[dim]Resume a failed path: pathstrike attack --resume <checkpoint-file> -s <source>[/]"
     )
-
-
-@app.command()
-def validate(
-    config: ConfigOption = None,
-    verbose: VerboseOption = False,
-) -> None:
-    """Validate configuration, tool availability, and BloodHound CE connectivity.
-
-    Performs comprehensive pre-flight checks:
-    - YAML config syntax and field validation
-    - Required external tool availability
-    - BloodHound CE API connectivity
-    - Domain controller reachability
-    - Time offset measurement
-    """
-    setup_logging(verbose=verbose)
-    cfg = _load_config_or_exit(config)
-
-    all_ok = True
-
-    # ---- Config validation ----
-    console.print("[bold]1. Configuration[/]")
-    console.print(f"  Domain: [green]{cfg.domain.name}[/]")
-    console.print(f"  DC Host: [green]{cfg.domain.dc_host}[/]")
-    console.print(f"  Target: [green]{cfg.target.group}@{cfg.domain.name.upper()}[/]")
-    console.print(f"  Mode: [green]{cfg.execution.mode.value}[/]")
-    console.print(f"  Max retries: [green]{cfg.execution.max_retries}[/]")
-    console.print("  [bold green]Config valid[/]\n")
-
-    # ---- Tool checks ----
-    console.print("[bold]2. External Tools[/]")
-    required_tools = {
-        "bloodyAD": "bloodyAD",
-        "secretsdump.py": "secretsdump.py",
-        "getST.py": "getST.py",
-        "getTGT.py": "getTGT.py",
-        "certipy": "certipy",
-        "netexec": "netexec",
-    }
-    optional_tools = {
-        "ntpdate": "ntpdate",
-        "PetitPotam.py": "PetitPotam.py",
-        "printerbug.py": "printerbug.py",
-    }
-
-    for name, binary in required_tools.items():
-        found = shutil.which(binary)
-        if found:
-            console.print(f"  [green]OK[/] {name}")
-        else:
-            console.print(f"  [red]MISSING[/] {name} -- [red]REQUIRED but not found[/]")
-            all_ok = False
-
-    for name, binary in optional_tools.items():
-        found = shutil.which(binary)
-        if found:
-            console.print(f"  [green]OK[/] {name} [dim](optional)[/]")
-        else:
-            console.print(f"  [yellow]SKIP[/]  {name} [dim](optional, not found)[/]")
-
-    console.print()
-
-    # ---- BH CE connectivity ----
-    console.print("[bold]3. BloodHound CE API[/]")
-    console.print(f"  URL: {cfg.bloodhound.base_url}")
-
-    async def _check_bh() -> bool:
-        try:
-            async with BloodHoundClient.connect(cfg.bloodhound) as client:
-                return await client.check_connection()
-        except Exception as exc:
-            console.print(f"  [red]Connection failed: {exc}[/]")
-            return False
-
-    try:
-        bh_ok = asyncio.run(_check_bh())
-    except Exception:
-        bh_ok = False
-
-    if bh_ok:
-        console.print("  [bold green]Connected successfully[/]\n")
-    else:
-        console.print("  [bold red]Connection failed[/]\n")
-        all_ok = False
-
-    # ---- Time offset ----
-    console.print("[bold]4. Time Synchronization[/]")
-
-    async def _check_time() -> float | None:
-        try:
-            from pathstrike.engine.time_sync import check_time_offset
-            return await check_time_offset(cfg.domain.dc_host, cfg.domain.dc_fqdn)
-        except Exception:
-            return None
-
-    offset = asyncio.run(_check_time())
-    if offset is not None:
-        abs_offset = abs(offset)
-        if abs_offset <= 300:
-            console.print(f"  [bold green]Offset: {offset:.1f}s (within tolerance)[/]\n")
-        else:
-            console.print(f"  [bold red]Offset: {offset:.1f}s (EXCEEDS 5-min tolerance)[/]\n")
-            all_ok = False
-    else:
-        console.print("  [yellow]Could not measure time offset[/]\n")
-
-    # ---- Summary ----
-    if all_ok:
-        console.print("[bold green]All checks passed. Ready to attack![/]")
-    else:
-        console.print("[bold red]Some checks failed. Review the output above.[/]")
-        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -1459,7 +1407,9 @@ def auto(
                     rollback_mgr=rollback_mgr,
                     verbose=verbose,
                 )
-                return await orchestrator.execute_path(path, mode)
+                result = await orchestrator.execute_path(path, mode)
+                _save_rollback_log(rollback_mgr, "auto")
+                return result
 
             # Display findings
             finding_data = findings.get("data", [])
@@ -1765,6 +1715,7 @@ def campaign(
             )
 
             result = await campaign_orch.run_campaign()
+            _save_rollback_log(rollback_mgr, "campaign")
 
             if not result.targets_compromised and mode != ExecutionMode.dry_run:
                 raise typer.Exit(code=1)
