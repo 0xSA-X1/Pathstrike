@@ -46,7 +46,7 @@ PathStrike discovers and executes AD privilege escalation paths identified by Bl
 ```bash
 # Clone and install
 git clone https://github.com/0x-SA-X1/Pathstrike.git
-cd Pathstrike/pathstrike
+cd Pathstrike
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 
