@@ -1338,114 +1338,101 @@ def recon(
 
 @app.command()
 def auto(
+    source: SourceOption = None,
     config: ConfigOption = None,
     mode: Annotated[
         ExecutionMode,
-        typer.Option("--mode", "-m", help="Execution mode"),
+        typer.Option("--mode", "-m", help="Execution mode: interactive, auto, or dry_run"),
     ] = ExecutionMode.interactive,
-    output: Annotated[
-        Optional[Path],
-        typer.Option("--output", "-o", help="Export results to file"),
-    ] = None,
+    max_retries: Annotated[
+        int,
+        typer.Option("--max-retries", help="Max retries per step"),
+    ] = -1,
+    max_targets: Annotated[
+        int,
+        typer.Option("--max-targets", help="Max reachable targets to pursue per round"),
+    ] = 10,
+    max_depth: Annotated[
+        int,
+        typer.Option("--max-depth", help="Maximum path depth when enumerating reachable targets"),
+    ] = 10,
+    no_time_sync: Annotated[
+        bool,
+        typer.Option("--no-time-sync", help="Disable automatic ntpdate clock sync"),
+    ] = False,
     verbose: VerboseOption = False,
 ) -> None:
-    """Auto-discover and exploit attack paths using BH CE's analysis engine.
+    """Greedy reachable-targets exploitation — escalate as far as possible.
 
-    Queries BloodHound CE's pre-analyzed attack path findings, ranks
-    them by severity, and offers to exploit the highest-value paths
-    automatically.
+    Enumerates every exploitable node reachable from the source (users,
+    groups, computers, domains) via handler-backed edges, [bold]without[/]
+    restricting to high-value principals.  This lets PathStrike pivot
+    through intermediate targets — e.g. a non-admin group that has
+    GenericWrite over a service account, which in turn owns the DC.
 
-    This is the zero-configuration mode — no need to specify source
-    or target. BH CE identifies the attack paths for you.
+    After each successful escalation, re-queries from the new identity
+    to discover additional reachable nodes, chaining opportunistically
+    until nothing new is exploitable.
+
+    Use [bold]pathstrike campaign[/] instead when you specifically want
+    to drive toward Domain Admin / Enterprise Admin / Tier Zero.
     """
     setup_logging(verbose=verbose)
     cfg = _load_config_or_exit(config)
 
-    async def _run() -> bool:
+    source_name = _build_source_name(source, cfg)
+
+    retry_policy = _build_retry_policy(cfg)
+    if max_retries >= 0:
+        retry_policy.max_retries = max_retries
+
+    if no_time_sync or not cfg.execution.auto_time_sync:
+        from pathstrike.engine.error_handler import ErrorCategory
+        retry_on = set(retry_policy.retry_on)
+        retry_on.discard(ErrorCategory.TIME_SKEW)
+        retry_policy.retry_on = frozenset(retry_on)
+
+    console.print(
+        f"[bold]Auto Mode (reachable-targets):[/] {mode.value}\n"
+        f"[bold]Source:[/] {source_name}\n"
+        f"[bold]Max targets per round:[/] {max_targets}\n"
+        f"[bold]Max path depth:[/] {max_depth}\n"
+        f"[bold]Max retries:[/] {retry_policy.max_retries}\n"
+        f"[bold]Auto time sync:[/] {'disabled' if no_time_sync else 'enabled'}\n"
+    )
+
+    async def _run():
         async with BloodHoundClient.connect(cfg.bloodhound) as client:
-            # Step 1: Get available domains
-            console.print("[bold]Querying BH CE for available domains...[/]")
-            raw_domains = await client.get_available_domains()
+            cred_store = _seed_credential_store(cfg)
+            rollback_mgr = RollbackManager(cfg)
 
-            if not raw_domains:
-                console.print("[red]No domains found in BH CE.[/]")
-                return False
+            from pathstrike.engine.campaign import CampaignOrchestrator
 
-            for d in raw_domains:
-                console.print(
-                    f"  Domain: [green]{d.get('name', 'Unknown')}[/] "
-                    f"(ID: {d.get('id', 'N/A')})"
-                )
-
-            # Step 2: Get attack path findings
-            console.print("\n[bold]Querying BH CE for pre-analyzed attack paths...[/]")
-
-            try:
-                findings = await client.get_attack_path_findings()
-            except Exception as exc:
-                console.print(f"[yellow]Could not fetch attack path findings: {exc}[/]")
-                console.print("[dim]Falling back to Cypher-based path discovery...[/]\n")
-                # Fallback to standard pathfinding
-                source_name = _build_source_name(None, cfg)
-                target_name = _build_target_name(cfg)
-                query, params = build_shortest_path_query(
-                    source_name, target_name, cfg.domain.name,
-                )
-                response = await client.cypher_query(query, params)
-                discovered = parse_cypher_response(response)
-                if not discovered:
-                    console.print("[yellow]No attack paths found.[/]")
-                    return False
-                console.print(f"Found [green]{len(discovered)}[/] path(s) via Cypher.\n")
-                # Execute first path
-                path = discovered[0]
-                cred_store = _seed_credential_store(cfg)
-                rollback_mgr = RollbackManager(cfg)
-                orchestrator = AttackOrchestrator(
-                    config=cfg,
-                    cred_store=cred_store,
-                    rollback_mgr=rollback_mgr,
-                    verbose=verbose,
-                )
-                result = await orchestrator.execute_path(path, mode)
-                _save_rollback_log(rollback_mgr, "auto")
-                return result
-
-            # Display findings
-            finding_data = findings.get("data", [])
-            if not finding_data:
-                console.print("[yellow]No attack path findings from BH CE analysis.[/]")
-                console.print(
-                    "[dim]Run BH CE analysis first, or use 'pathstrike attack' "
-                    "for Cypher-based discovery.[/]"
-                )
-                return False
-
-            table = Table(title="BH CE Attack Path Findings")
-            table.add_column("#", style="bold")
-            table.add_column("Finding", style="green")
-            table.add_column("Severity", style="red")
-            table.add_column("Domain", style="cyan")
-            table.add_column("Principals", style="yellow")
-
-            for i, finding in enumerate(finding_data[:20], 1):
-                table.add_row(
-                    str(i),
-                    str(finding.get("finding_type", finding.get("type", "Unknown"))),
-                    str(finding.get("severity", finding.get("risk", "N/A"))),
-                    str(finding.get("domain_name", finding.get("domain", ""))),
-                    str(finding.get("principal_count", finding.get("impacted_count", "N/A"))),
-                )
-
-            console.print(table)
-            console.print(
-                f"\n[bold]{len(finding_data)} finding(s) total.[/] "
-                "Use [bold]pathstrike attack[/] to exploit specific paths."
+            auto_orch = CampaignOrchestrator(
+                config=cfg,
+                bh_client=client,
+                cred_store=cred_store,
+                rollback_mgr=rollback_mgr,
+                retry_policy=retry_policy,
+                mode=mode,
+                verbose=verbose,
+                max_targets=max_targets,
+                reachable_mode=True,
+                max_depth=max_depth,
             )
-            return True
+
+            result = await auto_orch.run_campaign()
+            _save_rollback_log(rollback_mgr, "auto")
+
+            if not result.targets_compromised and mode != ExecutionMode.dry_run:
+                raise typer.Exit(code=1)
 
     try:
         asyncio.run(_run())
+    except (ValueError, typer.Exit) as exc:
+        if isinstance(exc, ValueError):
+            console.print(f"[bold red]Config error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
     except Exception as exc:
         console.print(f"[bold red]Error:[/] {exc}")
         raise typer.Exit(code=1) from exc
@@ -1653,16 +1640,20 @@ def campaign(
     ] = False,
     verbose: VerboseOption = False,
 ) -> None:
-    """Autonomous attack campaign — discover, rank, and chain ALL attack paths.
+    """Autonomous attack campaign — drive toward Domain Admin / Tier Zero.
 
-    Queries BloodHound CE for every reachable high-value target,
-    ranks them by privilege value (Enterprise Admin → Domain Admin →
-    Backup Operators → ...), and executes the highest-value paths
-    automatically.
+    Queries BloodHound CE for every reachable [bold]high-value[/] target
+    (Domain Admins, Enterprise Admins, Tier Zero, Domain nodes) and
+    chains paths toward them.  Ranks by privilege value and executes
+    the highest-value paths automatically.
 
     After each successful escalation, re-queries from the new position
     to discover additional paths.  Automatically chains trust
     escalation (child→parent domain) when Domain Admin is reached.
+
+    Use [bold]pathstrike auto[/] instead for opportunistic escalation
+    through non-privileged intermediates (groups, service accounts)
+    when no direct high-value path exists yet.
 
     [bold green]Interactive mode[/] (default): shows ranked paths and asks
     before each execution.

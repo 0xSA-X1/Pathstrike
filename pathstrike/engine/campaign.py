@@ -25,6 +25,7 @@ from rich.table import Table
 from pathstrike.bloodhound.client import BloodHoundClient
 from pathstrike.bloodhound.cypher import (
     build_high_value_nodes_query,
+    build_reachable_targets_query,
     build_shortest_path_to_target_query,
     build_trust_map_query,
 )
@@ -67,6 +68,8 @@ class CampaignOrchestrator:
         mode: ExecutionMode = ExecutionMode.interactive,
         verbose: bool = False,
         max_targets: int = 10,
+        reachable_mode: bool = False,
+        max_depth: int = 10,
     ) -> None:
         self.config = config
         self.bh_client = bh_client
@@ -76,6 +79,8 @@ class CampaignOrchestrator:
         self.mode = mode
         self.verbose = verbose
         self.max_targets = max_targets
+        self.reachable_mode = reachable_mode
+        self.max_depth = max_depth
 
         # Campaign state
         self.owned_identities: set[str] = set()
@@ -128,7 +133,10 @@ class CampaignOrchestrator:
                     f"[bold]Discovering paths from:[/] [cyan]{identity}[/]"
                 )
 
-                paths = await self._discover_paths(identity)
+                if self.reachable_mode:
+                    paths = await self._discover_reachable_paths(identity)
+                else:
+                    paths = await self._discover_paths(identity)
                 if paths:
                     all_paths.extend(paths)
                     scored = rank_paths(paths)
@@ -307,6 +315,38 @@ class CampaignOrchestrator:
             len(all_paths), identity,
         )
         return all_paths
+
+    async def _discover_reachable_paths(
+        self, identity: str
+    ) -> list[AttackPath]:
+        """Query BH CE for paths to ALL exploitable reachable nodes.
+
+        Unlike :meth:`_discover_paths`, this does NOT restrict targets to
+        high-value principals.  It returns paths to any reachable
+        User/Group/Computer/Domain node via handler-backed edges, enabling
+        opportunistic escalation through non-privileged intermediates
+        (e.g. a non-admin group that ACLs into a service account).
+        """
+        query, _ = build_reachable_targets_query(
+            identity, max_depth=self.max_depth,
+        )
+        try:
+            response = await self.bh_client.cypher_query(query)
+            paths = parse_cypher_response(response)
+        except Exception as exc:
+            logger.warning("Reachable-targets discovery failed: %s", exc)
+            return []
+
+        filtered = [
+            p for p in paths
+            if p.target.name != identity
+            and p.target.name not in self.completed_targets
+        ]
+        logger.info(
+            "Discovered %d reachable path(s) from %s",
+            len(filtered), identity,
+        )
+        return filtered
 
     async def _discover_trust_escalation(self) -> list[AttackPath]:
         """Check for trust edges from compromised domains.
