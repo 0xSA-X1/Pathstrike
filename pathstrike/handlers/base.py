@@ -173,6 +173,49 @@ class BaseEdgeHandler(ABC):
         )
         return args
 
+    def _get_certipy_auth_args(self, principal: str | None = None) -> list[str]:
+        """Build certipy-compatible authentication arguments.
+
+        Certipy uses a slightly different CLI surface than bloodyAD:
+        ``-u user@domain``, ``-p password``, ``-hashes :NTHASH``, ``-k``
+        for Kerberos, ``-dc-ip`` for explicit DC targeting.  This helper
+        inspects the credential store for *principal* (or falls back to
+        the configured credential) and returns ready-to-append args.
+        """
+        domain = self.config.domain.name
+        user = principal or self.config.credentials.username
+        dc_ip = self.config.domain.dc_host
+
+        args: list[str] = ["-u", f"{user}@{domain}", "-dc-ip", dc_ip]
+
+        cred = self.cred_store.get_best_credential(user, domain)
+        if cred is not None:
+            match cred.cred_type:
+                case CredentialType.password:
+                    args.extend(["-p", cred.value])
+                case CredentialType.nt_hash:
+                    args.extend(["-hashes", f":{cred.value}"])
+                case CredentialType.aes_key:
+                    args.extend(["-aes", cred.value])
+                case CredentialType.ccache:
+                    args.append("-k")
+                case CredentialType.certificate:
+                    args.extend(["-pfx", cred.value])
+                case _:
+                    pass  # fall through to config below
+            if len(args) > 4:  # something beyond -u/-dc-ip was added
+                return args
+
+        # Fall back to initial config credentials
+        cfg = self.config.credentials
+        if cfg.ccache_path:
+            args.append("-k")
+        elif cfg.nt_hash:
+            args.extend(["-hashes", f":{cfg.nt_hash}"])
+        elif cfg.password:
+            args.extend(["-p", cfg.password])
+        return args
+
     # ------------------------------------------------------------------
     # Impacket authentication helpers
     # ------------------------------------------------------------------

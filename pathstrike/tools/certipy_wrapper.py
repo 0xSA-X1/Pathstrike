@@ -101,12 +101,18 @@ async def run_certipy(
         result["return_code"] = proc.returncode
 
         if proc.returncode != 0:
-            result["error"] = stderr or f"certipy {subcommand} exited with code {proc.returncode}"
-            logger.error(
-                "certipy %s failed (rc=%d): %s",
-                subcommand,
-                proc.returncode,
-                result["error"],
+            # Short 1-line summary goes to `error` (surfaces in handler
+            # messages + the Rich step table).  Full stderr stays in the
+            # session log file only, to avoid flooding the console
+            # mid-Live-render.
+            short_err = _extract_certipy_error(stderr) or (
+                f"certipy {subcommand} exited with code {proc.returncode}"
+            )
+            result["error"] = short_err
+            result["full_stderr"] = stderr
+            logger.debug(
+                "certipy %s failed (rc=%d): %s\n--- full stderr ---\n%s",
+                subcommand, proc.returncode, short_err, stderr,
             )
             return result
 
@@ -118,19 +124,37 @@ async def run_certipy(
     except asyncio.TimeoutError:
         result["error"] = f"certipy {subcommand} timed out after {timeout}s"
         result["error_type"] = "timeout"
-        logger.error(result["error"])
+        logger.warning(result["error"])
     except FileNotFoundError:
         result["error"] = (
             "certipy binary not found. Install via: pip install certipy-ad"
         )
         result["error_type"] = "tool_not_found"
-        logger.error(result["error"])
+        logger.error(result["error"])  # real config error — keep at ERROR
     except OSError as exc:
         result["error"] = f"OS error launching certipy: {exc}"
         result["error_type"] = "os_error"
-        logger.error(result["error"])
+        logger.warning(result["error"])
 
     return result
+
+
+def _extract_certipy_error(stderr: str) -> str | None:
+    """Pull a useful one-line error message from certipy stderr.
+
+    Certipy prints structured ``[!] ...`` / ``[-] ...`` lines when things
+    fail.  Pick the most informative one (last non-empty line that starts
+    with ``[-]`` or contains ``Error``); fall back to the last line.
+    """
+    if not stderr:
+        return None
+    lines = [ln.rstrip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    for line in reversed(lines):
+        if line.startswith("[-]") or "Error" in line or "failed" in line.lower():
+            return line.strip("[-] ").strip()[:300]
+    return lines[-1][:300]
 
 
 # ---------------------------------------------------------------------------
