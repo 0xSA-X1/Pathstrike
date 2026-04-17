@@ -476,56 +476,73 @@ class RollbackManager:
         Some rollback actions need to run multiple sub-commands to fully
         reverse a step — e.g. WriteOwner on a Group both adds a group
         member and grants a GenericAll ACE, so the rollback removes both.
-        We split on ``;`` at the TOP LEVEL (respecting quotes via shlex)
-        and return one arg-list per sub-command, each separately prepared
-        by :meth:`_build_rollback_command` (connection/auth injection).
 
-        Returns an empty list for an empty input.
+        Tokenises ONCE via shlex (posix mode preserves quoted args
+        correctly), splits at ``;`` boundaries, and injects bloodyAD
+        connection/auth args per sub-command.  No re-quoting or
+        second-pass shlex is done — that round-trip was unsafe for args
+        containing quotes or shell metacharacters (e.g. passwords with
+        ``'``) and could corrupt rollback commands.
         """
         raw = raw_command.strip()
         if not raw:
             return []
 
-        # shlex doesn't split on ';' directly.  Tokenize then regroup.
+        # Tokenise once; shlex posix mode handles quoted args cleanly.
         lexer = shlex.shlex(raw, posix=True)
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
 
+        # Group tokens at ';' boundaries.  A ';' can appear either as its
+        # own token (when preceded/followed by whitespace) or embedded in
+        # another token like "USER;" — handle both.
         groups: list[list[str]] = []
         current: list[str] = []
         for tok in tokens:
-            # Handle tokens like "JUDITH.MADER;" that still contain ';'
-            # because shlex treats ';' as an ordinary character.
-            if ";" in tok:
-                head, _, tail = tok.partition(";")
-                if head:
-                    current.append(head)
-                if current:
-                    groups.append(current)
-                    current = []
-                # Tail could itself contain more ';' — handle recursively
-                remainder = tail
-                while ";" in remainder:
-                    lhs, _, remainder = remainder.partition(";")
-                    if lhs:
-                        groups.append([lhs])
-                if remainder:
-                    current.append(remainder)
-            else:
+            if ";" not in tok:
                 current.append(tok)
+                continue
+            # Split this token on ';' — each ';' boundary ends the current
+            # group and starts a new one.  Non-empty pieces go into the
+            # surrounding groups.
+            parts = tok.split(";")
+            for i, part in enumerate(parts):
+                if i > 0:
+                    # Previous ';' boundary — close current group.
+                    if current:
+                        groups.append(current)
+                    current = []
+                if part:
+                    current.append(part)
         if current:
             groups.append(current)
 
-        # Re-apply connection/auth injection per sub-command.  The
-        # single-command helper handles quoting/escaping; we reconstruct
-        # the sub-command string and let it parse again so that injection
-        # rules (bloodyAD connection args) stay consistent.
-        return [
-            self._build_rollback_command(" ".join(shlex.quote(p) for p in group))
-            for group in groups
-            if group
+        # Prepare bloodyAD connection + auth args once (they're identical
+        # across sub-commands on the same target).
+        connection_args = [
+            "--host",
+            self._config.domain.dc_fqdn or self._config.domain.dc_host,
+            "-d",
+            self._config.domain.name,
+            "--dc-ip",
+            self._config.domain.dc_host,
         ]
+        auth_args = self._build_config_auth_args()
+
+        # Build each sub-command's argv directly from the tokens, without
+        # round-tripping through shlex.quote + shlex.split.
+        result: list[list[str]] = []
+        for group in groups:
+            if not group:
+                continue
+            if group[0].lower() == "bloodyad":
+                result.append(
+                    [group[0]] + connection_args + auth_args + group[1:]
+                )
+            else:
+                result.append(list(group))
+        return result
 
     def _build_config_auth_args(self) -> list[str]:
         """Build authentication arguments from the static config for rollback."""

@@ -16,6 +16,7 @@ Status indicators:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -26,6 +27,51 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+
+class _QuietLive:
+    """Context manager wrapping Rich's :class:`Live` with log-handler muzzling.
+
+    During in-place Live rendering, stray log messages printed to the
+    same console cause the panel to fragment / stack.  On ``__enter__``
+    every handler attached to the pathstrike logger has its level
+    raised to CRITICAL; on ``__exit__`` prior levels are restored.  The
+    session log file keeps receiving records regardless — only
+    console-bound output is suppressed during the Live context.
+
+    The wrapper also proxies :meth:`update` so
+    :meth:`AttackProgressTracker._refresh` can call ``self._live.update(...)``
+    transparently whether the Live is active or not.
+    """
+
+    def __init__(self, tracker: "AttackProgressTracker") -> None:
+        self._tracker = tracker
+        self._live = Live(
+            tracker._render(),
+            console=tracker.console,
+            refresh_per_second=4,
+            transient=False,
+        )
+        self._prev_levels: list[tuple[logging.Handler, int]] = []
+
+    def __enter__(self):
+        pathstrike_logger = logging.getLogger("pathstrike")
+        for handler in pathstrike_logger.handlers:
+            self._prev_levels.append((handler, handler.level))
+            handler.setLevel(logging.CRITICAL)
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._live.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            for handler, level in self._prev_levels:
+                handler.setLevel(level)
+            self._prev_levels.clear()
+
+    def update(self, *args, **kwargs):
+        return self._live.update(*args, **kwargs)
 
 
 class StepStatus(StrEnum):
@@ -186,55 +232,24 @@ class AttackProgressTracker:
             self._extra_messages = self._extra_messages[-8:]
         self._refresh()
 
-    def live(self) -> "Live":
+    def live(self) -> _QuietLive:
         """Return a Rich Live context manager for real-time rendering.
 
-        The context manager also temporarily raises the pathstrike logger's
-        console handler to CRITICAL while Live is active, so stray log
-        messages can't break the in-place re-render (which was causing the
-        panel to stack/duplicate on-screen).  The DEBUG+ session log file
-        keeps receiving every record regardless — no information is lost.
+        Wraps Rich's :class:`Live` with log-handler muzzling: on
+        ``__enter__`` every handler attached to the pathstrike logger is
+        raised to CRITICAL; on ``__exit__`` prior levels are restored.
+        This prevents stray log messages from emitting to stdout during
+        Live's in-place re-render (which was causing the panel to
+        stack/duplicate on-screen).  The DEBUG+ session log file keeps
+        receiving every record regardless.
+
+        Important: callers must use ``with tracker.live() as display:``.
+        The returned wrapper proxies :meth:`update` to the underlying
+        Live so :meth:`_refresh` keeps working via ``self._live``.
         """
         self._start_time = time.monotonic()
-
-        import logging as _logging
-        from rich.logging import RichHandler as _RichHandler
-
-        outer_self = self
-
-        class _QuietLive:
-            """Wraps Rich's Live with log-handler muzzling on enter/exit."""
-
-            def __init__(self) -> None:
-                self._live = Live(
-                    outer_self._render(),
-                    console=outer_self.console,
-                    refresh_per_second=4,
-                    transient=False,
-                )
-                self._prev_levels: list[tuple[_logging.Handler, int]] = []
-
-            def __enter__(self):
-                pathstrike_logger = _logging.getLogger("pathstrike")
-                for handler in pathstrike_logger.handlers:
-                    if isinstance(handler, _RichHandler):
-                        self._prev_levels.append((handler, handler.level))
-                        handler.setLevel(_logging.CRITICAL)
-                self._live.__enter__()
-                return self._live
-
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                result = self._live.__exit__(exc_type, exc_val, exc_tb)
-                for handler, level in self._prev_levels:
-                    handler.setLevel(level)
-                return result
-
-            def update(self, *args, **kwargs):
-                return self._live.update(*args, **kwargs)
-
-        wrapper = _QuietLive()
-        self._live = wrapper._live  # so _refresh() works
-        return wrapper
+        self._live = _QuietLive(self)
+        return self._live
 
     def _refresh(self) -> None:
         """Update the live display."""

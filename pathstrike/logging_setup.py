@@ -76,6 +76,23 @@ def setup_logging(
     """
     global _session_log_path, _warning_counter
 
+    # Clear any state left over from an earlier setup_logging() call in the
+    # same Python process (e.g. tests, or two Typer commands dispatched
+    # in-process).  Without this, _session_log_path would still point at
+    # the previous run's log and _warning_counter would accumulate across
+    # commands.  Also clear any stale faketime prefix so a prior command's
+    # DC offset doesn't leak into a new one.
+    _session_log_path = None
+    _warning_counter = None
+
+    try:
+        # Lazy import avoids a circular dependency — engine.time_sync does
+        # not import logging_setup, so this is always safe.
+        from pathstrike.engine.time_sync import set_faketime_prefix as _clear_ft
+        _clear_ft(None)
+    except Exception:  # pragma: no cover — defensive; shouldn't fail
+        pass
+
     logger = logging.getLogger(LOGGER_NAME)
 
     # Prevent duplicate handlers on repeated calls

