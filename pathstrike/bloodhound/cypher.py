@@ -219,6 +219,12 @@ def build_reachable_targets_query(
     Broader than high-value-only — discovers any node reachable via
     exploitation edges.  Used for post-escalation re-discovery.
 
+    Enumerates candidate targets first (User/Group/Computer/Domain),
+    then finds the shortest path from source to each.  This two-stage
+    pattern is required because ``shortestPath((s)-[*]->(t))`` with
+    only ``s`` bound collapses to a single overall shortest match in
+    BH CE's Cypher planner — losing every other reachable target.
+
     Args:
         source_name: Fully qualified source.
         max_depth: Maximum path depth.
@@ -227,12 +233,15 @@ def build_reachable_targets_query(
         Tuple of (cypher_query, None).
     """
     edge_filter = _edge_type_filter()
+    src = _escape(source_name)
     query = (
+        f"MATCH (t) "
+        f"WHERE (t:Group OR t:Domain OR t:User OR t:Computer) "
+        f"AND t.name <> '{src}' "
+        f"WITH t "
         f"MATCH p=shortestPath("
-        f"(s {{name: '{_escape(source_name)}'}})-[{edge_filter}*1..{max_depth}]->(t)"
+        f"(s {{name: '{src}'}})-[{edge_filter}*1..{max_depth}]->(t)"
         f") "
-        f"WHERE t.name <> '{_escape(source_name)}' "
-        f"AND (t:Group OR t:Domain OR t:User OR t:Computer) "
         f"RETURN p LIMIT 50"
     )
     return query, None
