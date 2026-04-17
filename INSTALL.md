@@ -1,17 +1,18 @@
-# PathStrike -- Install Guide
+# PathStrike — Install Guide
 
 ## Requirements
 
-- **Python 3.11+**
-- **BloodHound Community Edition** running with API keys configured
-- **Linux attacker box** (Kali, Parrot, etc.) -- time sync tools need sudo
+- **Python 3.11+** (3.12 / 3.13 tested)
+- **BloodHound Community Edition v9.0.1 or newer** — earlier builds are missing or differently gate the `/api/v2/graphs/cypher` endpoint Pathstrike depends on. See [Section 4](#4-bloodhound-ce-setup-v901-required).
+- **Linux attacker box** (Kali, Parrot, Debian, Ubuntu)
+- **Root access helpful** — time sync, Docker, some package installs need sudo
 
 ---
 
 ## 1. Install PathStrike
 
 ```bash
-git clone https://github.com/0x-SA-X1/Pathstrike.git
+git clone https://github.com/0xSA-X1/Pathstrike.git
 cd Pathstrike
 
 # Create a virtual environment (recommended)
@@ -26,10 +27,12 @@ pip install -e .
 > are up to date: `pip install --upgrade pip setuptools wheel`
 
 This installs the `pathstrike` CLI command and pulls in:
-- `httpx` -- async HTTP client for BloodHound CE API
-- `pydantic` -- config validation
-- `typer` + `rich` -- CLI framework + live progress display
-- `pyyaml` -- config file parsing
+
+- `httpx` — async HTTP client for BloodHound CE API
+- `pydantic` — config validation
+- `typer` + `rich` — CLI framework + live progress display
+- `pyyaml` — config file parsing
+- `ldap3` (transitively via bloodyAD) — powers Pathstrike's live Recycle Bin and LDAP enumeration
 
 ---
 
@@ -37,7 +40,7 @@ This installs the `pathstrike` CLI command and pulls in:
 
 PathStrike wraps these tools as async subprocesses. Install whichever you need:
 
-### bloodyAD (AD object manipulation -- ACLs, passwords, RBCD, shadow creds)
+### bloodyAD (AD object manipulation — ACLs, passwords, RBCD, shadow creds, writable enum)
 
 ```bash
 pip install bloodyAD
@@ -49,55 +52,87 @@ pip install bloodyAD
 pip install impacket
 ```
 
-### Certipy (AD CS / certificate attacks -- ESC1-ESC13)
+### Certipy — install via pipx to avoid dependency conflicts
+
+**Important:** Certipy (`certipy-ad`) pins `cryptography~=42.0.8`, which conflicts with bloodyAD's `cryptography==44.0.2`. Installing Certipy into the same venv as bloodyAD will downgrade cryptography and break bloodyAD. Use pipx to keep Certipy in its own isolated environment:
 
 ```bash
-pip install certipy-ad
+# Install pipx first if you don't have it
+sudo apt install pipx
+pipx ensurepath
+
+# Install Certipy in an isolated env (on PATH via pipx)
+pipx install certipy-ad
+
+# Verify
+which certipy        # ~/.local/bin/certipy (pipx)
+certipy --version
 ```
+
+Pathstrike subprocesses Certipy via PATH — it doesn't care whether Certipy lives in pipx or the venv, only that `certipy` is callable.
 
 ### NetExec (credential validation, LAPS, command execution)
 
-NetExec is not on PyPI. Install via pipx or from GitHub:
+NetExec isn't on PyPI. Install via pipx or from GitHub:
 
 ```bash
-# Option A: pipx (recommended -- isolated install, stays on PATH)
-sudo apt install pipx
+# Option A: pipx (recommended — isolated install, stays on PATH)
 pipx install git+https://github.com/Pennyw0rth/NetExec.git
 
-# Option B: pip from GitHub (installs into current venv)
+# Option B: pip from GitHub (installs into current venv — may conflict with cryptography)
 pip install git+https://github.com/Pennyw0rth/NetExec.git
 
-# Option C: Kali -- already packaged
+# Option C: Kali — already packaged
 sudo apt install netexec
 ```
 
-### ntpdate (Kerberos time sync -- auto-fix for clock skew)
+### ntpdate (Kerberos system-clock sync)
 
 ```bash
 # Kali (usually pre-installed)
 which ntpdate
 
-# Debian/Ubuntu -- ntpdate has been replaced by ntpsec-ntpdate
+# Debian/Ubuntu — ntpdate has been replaced by ntpsec-ntpdate
 sudo apt install ntpsec-ntpdate
 
 # Arch
 sudo pacman -S ntp
 ```
 
-> If ntpdate is unavailable, PathStrike will fall back to
-> `chronyd -q` -> `net time` -> `rdate` automatically.
+### libfaketime (Kerberos skew fallback — no sudo / no NTP required)
+
+When system clock sync fails (no sudo, NTP blocked, DC unreachable for NTP but reachable for LDAP), PathStrike falls back to wrapping each tool subprocess with `faketime +Xs` where `X` is the DC offset measured via `ntpdate -q`. This doesn't change the real system clock but gives each Kerberos-using subprocess a correct clock.
+
+```bash
+# Option A: Kali / Debian package (easiest)
+sudo apt install faketime
+
+# Option B: Build from source (pins to latest)
+git clone https://github.com/wolfcw/libfaketime.git
+cd libfaketime
+sudo make install        # installs /usr/local/bin/faketime + /usr/local/lib/faketime/
+cd .. && rm -rf libfaketime
+
+# Verify
+which faketime           # /usr/bin/faketime or /usr/local/bin/faketime
+```
+
+PathStrike detects `faketime` on PATH and uses it automatically when system sync fails.
 
 ### Install everything at once
 
 ```bash
 # Python tools (inside your venv)
-pip install bloodyAD impacket certipy-ad
+pip install bloodyAD impacket
 
-# NetExec (from GitHub)
-pip install git+https://github.com/Pennyw0rth/NetExec.git
+# Certipy in its own pipx env (avoids cryptography conflict)
+pipx install certipy-ad
+
+# NetExec (pipx preferred, or venv if you accept the cryptography churn)
+pipx install git+https://github.com/Pennyw0rth/NetExec.git
 
 # System tools
-sudo apt install ntpsec-ntpdate    # or ntpdate on Kali
+sudo apt install ntpsec-ntpdate faketime
 ```
 
 ### Verify all tools are available
@@ -106,7 +141,7 @@ sudo apt install ntpsec-ntpdate    # or ntpdate on Kali
 pathstrike verify
 ```
 
-This checks every binary on PATH and tests BloodHound CE connectivity.
+This checks every binary on PATH (bloodyAD, impacket CLIs, certipy, netexec, pyGPOAbuse, ntlmrelayx, ntpdate, **faketime**), measures the time offset against the DC, and tests BloodHound CE connectivity.
 
 ---
 
@@ -124,14 +159,14 @@ vim pathstrike.yaml
 
 ```yaml
 bloodhound:
-  base_url: "http://localhost:8080"        # BH CE URL
-  token_id: "your-api-token-id"            # Settings -> API Keys in BH CE
-  token_key: "your-api-token-key-base64"
+  base_url: "http://localhost:8080"        # BH CE URL (v9.0.1+ required)
+  token_id: "your-api-token-id"            # My Profile -> API Key Management in BH CE
+  token_key: "your-api-token-key"
 
 domain:
   name: "corp.local"                       # Target AD domain
   dc_host: "10.10.10.10"                   # DC IP address
-  dc_fqdn: "dc01.corp.local"              # DC FQDN (for Kerberos/NTP)
+  dc_fqdn: "dc01.corp.local"               # DC FQDN (for Kerberos/NTP)
 
 credentials:
   username: "jsmith"
@@ -153,7 +188,7 @@ execution:
   timeout: 30                              # Per-tool timeout (seconds)
   max_paths: 5                             # Max paths to discover
   max_retries: 3                           # Retries on transient failures
-  auto_time_sync: true                     # Auto ntpdate on clock skew
+  auto_time_sync: true                     # Auto ntpdate + faketime fallback on skew
 ```
 
 ### Config auto-discovery
@@ -168,19 +203,56 @@ You don't need `-c config.yaml` every time. PathStrike searches these locations 
 
 ---
 
-## 4. BloodHound CE Setup
+## 4. BloodHound CE Setup (v9.0.1+ required)
 
-1. Start BH CE (Docker or bare metal)
-2. Go to **Settings -> API Keys**
-3. Create a new API key pair
-4. Copy the **Token ID** and **Token Key** into your config
-5. **Import SharpHound/BloodHound data** so the graph has nodes and edges
+**PathStrike requires BloodHound Community Edition v9.0.1 or newer.** Older builds (including the `bloodhound 8.7.0~rc3-0kali1` package shipped by Kali's apt repo) either don't implement the `/api/v2/graphs/cypher` endpoint or have different permission-gate semantics that cause silent 404 responses. If you see `BH API error 404: resource not found` during `pathstrike paths` / `campaign` / `auto`, check your BH CE version first.
+
+### Recommended: Docker Compose install
+
+This is the upstream-recommended way to run BH CE and always gets you the latest stable version:
+
+```bash
+# Stop any pre-existing native BH stack that would conflict on port 8080 / 7687
+sudo systemctl stop bloodhound 2>/dev/null
+sudo pkill -9 -f 'org.neo4j.server.CommunityEntryPoint'
+sudo pkill -9 -f bhapi
+
+# Install Docker + Compose plugin if not already present
+sudo apt install -y docker.io docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"          # log out/in to take effect
+
+# Pull and launch BH CE
+mkdir -p ~/bloodhound-ce && cd ~/bloodhound-ce
+curl -L https://ghst.ly/getbhce -o docker-compose.yml
+sudo docker compose pull
+sudo docker compose up -d
+
+# Grab the initial admin password
+sleep 30
+sudo docker compose logs bloodhound 2>&1 | grep -i "Initial Password" | tail -1
+```
+
+### Create an API token
+
+1. Open `http://localhost:8080`, log in as `admin` with the initial password, change it on first login
+2. Top-right avatar → **My Profile** → **API Key Management** → **Create Token**
+3. Give it any name, copy the **Token ID** and **Token Key** into `pathstrike.yaml`
+4. Tokens inherit the creating user's permissions — create as admin for broadest access
+
+### Import your collection data
+
+5. Collect AD data with a CE-compatible collector (not BloodHound-Legacy):
+   - **bloodhound-ce-python** (Kali: `pip install bloodhound-ce`, NOT `bloodhound-python` which is legacy 4.x)
+   - **SharpHound** (Windows / Mono)
+6. Upload the resulting zip via the BH CE UI → **File Ingest** or **Quick Upload**
+7. Wait for analysis to complete (sidebar shows pending/running counts)
 
 ---
 
 ## 5. Usage
 
-### Discover attack paths
+### Discover attack paths (read-only)
 
 ```bash
 # Shortest path from compromised user to Domain Admins
@@ -189,11 +261,34 @@ pathstrike paths -s jsmith
 # All shortest paths
 pathstrike paths -s jsmith --all
 
-# Verbose (debug logging)
+# Verbose (debug logging to console; always also to the session log file)
 pathstrike paths -s jsmith -v
 ```
 
-### Execute an attack path
+### Interactive step-through campaign (recommended for engagements)
+
+```bash
+# Each round presents a ranked table of reachable targets; you pick one
+pathstrike campaign
+
+# Restrict to Domain Admins / Enterprise Admins / Tier Zero targets only
+pathstrike campaign --high-value-only
+
+# Override max targets per round (default 10)
+pathstrike campaign --max-targets 15
+```
+
+### Greedy auto escalation (no prompts)
+
+```bash
+# Chases the deepest reachable exploitable target; doesn't prompt
+pathstrike auto
+
+# Limit how deep it searches
+pathstrike auto --max-depth 8
+```
+
+### Execute a single attack path
 
 ```bash
 # Interactive mode (prompts before each step)
@@ -208,32 +303,38 @@ pathstrike attack -s jsmith -m dry_run
 # Override retry count
 pathstrike attack -s jsmith --max-retries 5
 
-# Disable auto time sync
+# Disable auto time sync (will not attempt ntpdate or faketime fallback)
 pathstrike attack -s jsmith --no-time-sync
-```
-
-### Run an autonomous campaign
-
-```bash
-# Interactive campaign (prompts before each path)
-pathstrike campaign -s jsmith
-
-# Fully autonomous campaign
-pathstrike campaign -s jsmith -m auto
-
-# Limit to 5 targets per round
-pathstrike campaign -s jsmith -m auto --max-targets 5
 ```
 
 ### Time synchronisation
 
 ```bash
-# Check clock offset with DC
+# Check clock offset with DC (non-invasive)
 pathstrike timesync --check
 
-# Sync clock with DC (requires sudo)
+# Sync clock with DC (tries ntpdate, chronyd, net time, rdate — requires sudo)
 pathstrike timesync
 ```
+
+If all system-clock sync methods fail but `faketime` is installed, PathStrike will automatically wrap subsequent attack subprocesses with `faketime +Xs` where `X` is the measured offset. This works without root.
+
+### Session log + warning summary
+
+Every run writes a full DEBUG-level log to:
+
+```
+~/.pathstrike/logs/session_<YYYYMMDD_HHMMSS>.log
+```
+
+The console stays quiet by default — only step outcomes, captured credentials, and actionable errors are shown. If any warnings or errors were logged during the run, the tool prints a one-line hint at exit:
+
+```
+⚠  3 warning(s) logged during this run.
+   cat /home/sax1/.pathstrike/logs/session_20260417_134120.log
+```
+
+Use `-v` / `--verbose` to mirror DEBUG to the console too.
 
 ### List supported edge types
 
@@ -243,47 +344,60 @@ pathstrike edges
 
 ### Rollback changes
 
-Rollback logs are saved automatically after every attack, auto, and campaign run
-to the `rollback_logs/` directory.
+Rollback logs are saved automatically after every attack, auto, and campaign run to `rollback_logs/`.
 
 ```bash
-# Roll back the most recent attack (auto-discovers latest log)
-pathstrike rollback
-
 # Roll back a specific log file
 pathstrike rollback rollback_logs/rollback_campaign_20260414_153022.json
 
 # Preview what would be rolled back without executing
-pathstrike rollback --dry-run
+pathstrike rollback --dry-run rollback_logs/...
 
 # Continue rolling back even if some actions fail
-pathstrike rollback --force
+pathstrike rollback --force rollback_logs/...
 ```
 
 ---
 
 ## 6. Troubleshooting
 
-### `pip install -e .` fails with `Cannot import setuptools.backends._legacy`
+### BH CE: `BH API error 404: resource not found` on `/api/v2/graphs/cypher`
 
-Your setuptools is too old or too new. Update it:
+Your BH CE is too old. Upgrade to v9.0.1+ (see [Section 4](#4-bloodhound-ce-setup-v901-required)). Common signs:
+
+- You're running the Kali apt `bloodhound` package (`bloodhound 8.7.0~rc3-0kali1` or older)
+- `GET /api/v2/available-domains` works but `POST /api/v2/graphs/cypher` returns 404
+
+### Certipy: `ModuleNotFoundError: No module named 'pkg_resources'`
+
+Python 3.13 doesn't include `pkg_resources` by default. Either update setuptools, or (preferred) install certipy via pipx so it manages its own deps:
 
 ```bash
-pip install --upgrade pip setuptools wheel
-pip install -e .
+pip uninstall -y certipy-ad
+pipx install certipy-ad
+certipy --version
 ```
 
-### `netexec` -- `No matching distribution found`
+### Certipy and bloodyAD cryptography version conflict
 
-NetExec isn't on PyPI. Install from GitHub:
+`certipy-ad 5.x` pins `cryptography~=42.0.8`; `bloodyad 2.5+` pins `cryptography==44.0.2`. They cannot live in the same venv. Install Certipy via pipx:
 
 ```bash
-pip install git+https://github.com/Pennyw0rth/NetExec.git
+pipx install certipy-ad
+pip install --force-reinstall 'cryptography==44.0.2'   # restore for bloodyAD
+```
+
+### `netexec` — `No matching distribution found`
+
+NetExec isn't on PyPI. Install from GitHub via pipx:
+
+```bash
+pipx install git+https://github.com/Pennyw0rth/NetExec.git
 # or on Kali:
 sudo apt install netexec
 ```
 
-### `ntpdate` -- `Package has no installation candidate`
+### `ntpdate` — `Package has no installation candidate`
 
 On newer Debian/Ubuntu, ntpdate was replaced:
 
@@ -291,15 +405,27 @@ On newer Debian/Ubuntu, ntpdate was replaced:
 sudo apt install ntpsec-ntpdate
 ```
 
-### `KRB_AP_ERR_SKEW` / Clock skew too great
+### `KRB_AP_ERR_SKEW` / `Clock skew too great`
 
-PathStrike auto-fixes this during attacks. To fix manually:
+PathStrike auto-handles this in two stages:
+
+1. Tries `sudo ntpdate <dc>`, `sudo chronyd`, `sudo net time`, `sudo rdate` in order
+2. If all system sync methods fail and `faketime` is installed, enables a per-subprocess clock offset via `faketime +Xs`
+
+Manual fixes if the auto path doesn't work:
 
 ```bash
 sudo ntpdate dc01.corp.local
-# or
-sudo chronyd -q 'server dc01.corp.local iburst'
+# or without sudo, once libfaketime is installed, Pathstrike will wrap
+# tool calls with faketime automatically — no manual action needed
 ```
+
+### `KDC_ERR_CLIENT_NOT_TRUSTED` during shadow-credentials
+
+Usually a clock skew problem at the KDC side. See the `KRB_AP_ERR_SKEW` fix above — install libfaketime so PathStrike can compensate without root. If that doesn't resolve it:
+
+- Confirm DC actually has a valid KDC certificate (check `certipy find`)
+- Confirm your Certipy build does PKINIT properly (v5+ is most reliable)
 
 ### Tool not found errors
 
@@ -308,25 +434,25 @@ sudo chronyd -q 'server dc01.corp.local iburst'
 pathstrike verify
 
 # Install missing Python tools
-pip install bloodyAD impacket certipy-ad
-pip install git+https://github.com/Pennyw0rth/NetExec.git
+pip install bloodyAD impacket
+pipx install certipy-ad
+pipx install git+https://github.com/Pennyw0rth/NetExec.git
+sudo apt install ntpsec-ntpdate faketime
 ```
 
 ### BloodHound CE connection failed
 
-- Confirm BH CE is running: `curl http://localhost:8080/api/version`
+- Confirm BH CE is running: `curl http://localhost:8080/ui` (expect HTTP 200)
 - Check `base_url` in config matches the actual BH CE address
-- Verify API key is valid and not expired
+- Verify API key is valid and not expired (regenerate if in doubt)
+- Confirm the data you collected is for the domain in your config (`pathstrike domains`)
 
 ### Permission errors on time sync
 
-ntpdate needs root to change the system clock:
+`ntpdate` / `chronyd` / `net time` / `rdate` all need root to change the system clock. If you can't use sudo:
 
-```bash
-sudo ntpdate 10.10.10.10
-```
-
-If you can't use sudo, disable auto sync and manage time manually:
+1. Install libfaketime (`sudo apt install faketime`) and PathStrike will wrap tools with the right clock offset — no root required for subsequent runs
+2. Or disable auto sync and manage time manually:
 
 ```yaml
 execution:
@@ -334,3 +460,13 @@ execution:
 ```
 
 Or use `--no-time-sync` on the CLI.
+
+### Rich Live panel appears stacked / fragmented
+
+Fixed in recent releases — `_QuietLive` now muzzles log handlers while the progress panel is active. If you still see it, pull latest:
+
+```bash
+cd ~/Tools/Pathstrike
+git pull origin main
+pip install -e .
+```
