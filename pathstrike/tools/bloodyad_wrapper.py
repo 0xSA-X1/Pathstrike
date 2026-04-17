@@ -524,6 +524,94 @@ async def set_write_owner(
     )
 
 
+async def get_writable(
+    config: PathStrikeConfig,
+    auth_args: list[str],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Run ``bloodyAD get writable`` and return the parsed list of targets.
+
+    Lists every AD object the authenticated principal can write to —
+    directly or transitively via group memberships.  Used by the
+    orchestrator after a successful compromise to discover newly
+    reachable edges that BH CE's static snapshot doesn't know about.
+
+    Output format parsed:
+
+        distinguishedName: CN=SAM,CN=Users,DC=example,DC=local
+        permission: WRITE
+
+        distinguishedName: CN=Bob,CN=Users,DC=example,DC=local
+        permission: OWN
+
+    The parsed list contains ``(edge_type, dn, permission)`` triples where
+    ``edge_type`` is already mapped to a BloodHound-compatible label
+    (``GenericWrite``, ``Owns``, ``WriteOwner``, ``WriteDacl``).
+    """
+    result = await run_bloodyad(
+        ["get", "writable"],
+        config,
+        auth_args=auth_args,
+        timeout=timeout,
+    )
+    if not result["success"]:
+        return result
+
+    parsed_edges = _parse_writable_output(result.get("output", ""))
+    result["parsed"] = {"writable_targets": parsed_edges}
+    return result
+
+
+# Map bloodyAD's permission strings to BloodHound-style edge types.
+# Anything not in this table is skipped (e.g. CREATE_CHILD, DELETE aren't
+# exploitation primitives for Pathstrike's current handler set).
+_WRITABLE_PERMISSION_TO_EDGE: dict[str, str] = {
+    "WRITE": "GenericWrite",
+    "OWN": "Owns",
+    "WRITE_OWNER": "WriteOwner",
+    "WRITE_DACL": "WriteDacl",
+}
+
+
+def _parse_writable_output(
+    stdout: str,
+) -> list[dict[str, str]]:
+    """Parse ``bloodyAD get writable`` output into structured entries.
+
+    Returns a list of dicts with keys: ``dn``, ``permission``,
+    ``edge_type``.  Entries with unrecognised permissions are dropped.
+    """
+    import re as _re
+
+    results: list[dict[str, str]] = []
+    # Entries are separated by blank lines; split loosely to tolerate
+    # single or multiple empty lines between them.
+    for chunk in _re.split(r"\n\s*\n", stdout.strip()):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        dn: str | None = None
+        perm: str | None = None
+        for line in chunk.splitlines():
+            line = line.strip()
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            key_lower = key.strip().lower()
+            val = val.strip()
+            if key_lower in {"distinguishedname", "dn"}:
+                dn = val
+            elif key_lower == "permission":
+                perm = val.upper()
+        if not dn or not perm:
+            continue
+        edge_type = _WRITABLE_PERMISSION_TO_EDGE.get(perm)
+        if not edge_type:
+            continue
+        results.append({"dn": dn, "permission": perm, "edge_type": edge_type})
+    return results
+
+
 async def set_write_dacl(
     target_dn: str,
     principal_dn: str,

