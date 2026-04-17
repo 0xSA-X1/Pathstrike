@@ -186,16 +186,55 @@ class AttackProgressTracker:
             self._extra_messages = self._extra_messages[-8:]
         self._refresh()
 
-    def live(self) -> Live:
-        """Return a Rich Live context manager for real-time rendering."""
+    def live(self) -> "Live":
+        """Return a Rich Live context manager for real-time rendering.
+
+        The context manager also temporarily raises the pathstrike logger's
+        console handler to CRITICAL while Live is active, so stray log
+        messages can't break the in-place re-render (which was causing the
+        panel to stack/duplicate on-screen).  The DEBUG+ session log file
+        keeps receiving every record regardless — no information is lost.
+        """
         self._start_time = time.monotonic()
-        self._live = Live(
-            self._render(),
-            console=self.console,
-            refresh_per_second=4,
-            transient=False,
-        )
-        return self._live
+
+        import logging as _logging
+        from rich.logging import RichHandler as _RichHandler
+
+        outer_self = self
+
+        class _QuietLive:
+            """Wraps Rich's Live with log-handler muzzling on enter/exit."""
+
+            def __init__(self) -> None:
+                self._live = Live(
+                    outer_self._render(),
+                    console=outer_self.console,
+                    refresh_per_second=4,
+                    transient=False,
+                )
+                self._prev_levels: list[tuple[_logging.Handler, int]] = []
+
+            def __enter__(self):
+                pathstrike_logger = _logging.getLogger("pathstrike")
+                for handler in pathstrike_logger.handlers:
+                    if isinstance(handler, _RichHandler):
+                        self._prev_levels.append((handler, handler.level))
+                        handler.setLevel(_logging.CRITICAL)
+                self._live.__enter__()
+                return self._live
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                result = self._live.__exit__(exc_type, exc_val, exc_tb)
+                for handler, level in self._prev_levels:
+                    handler.setLevel(level)
+                return result
+
+            def update(self, *args, **kwargs):
+                return self._live.update(*args, **kwargs)
+
+        wrapper = _QuietLive()
+        self._live = wrapper._live  # so _refresh() works
+        return wrapper
 
     def _refresh(self) -> None:
         """Update the live display."""

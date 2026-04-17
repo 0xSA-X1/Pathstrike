@@ -103,9 +103,19 @@ async def run_bloodyad(
         result["return_code"] = proc.returncode
 
         if proc.returncode != 0:
-            result["error"] = stderr or f"bloodyAD exited with code {proc.returncode}"
-            logger.error(
-                "bloodyAD failed (rc=%d): %s", proc.returncode, result["error"]
+            # The `error` field is what surfaces in orchestrator tables and
+            # retry messages — keep it short.  The full stderr (with Python
+            # traceback, when bloodyAD bubbles one up) is kept verbatim in
+            # ``full_stderr`` and is only emitted to the log FILE at DEBUG
+            # level, so the console doesn't get flooded mid-Live-render.
+            short_err = _extract_error_summary(stderr) or (
+                f"bloodyAD exited with code {proc.returncode}"
+            )
+            result["error"] = short_err
+            result["full_stderr"] = stderr
+            logger.debug(
+                "bloodyAD failed (rc=%d): %s\n--- full stderr ---\n%s",
+                proc.returncode, short_err, stderr,
             )
             return result
 
@@ -117,19 +127,64 @@ async def run_bloodyad(
     except asyncio.TimeoutError:
         result["error"] = f"bloodyAD timed out after {timeout}s"
         result["error_type"] = "timeout"
-        logger.error(result["error"])
+        logger.warning(result["error"])
     except FileNotFoundError:
         result["error"] = (
             "bloodyAD binary not found. Ensure it is installed and on PATH."
         )
         result["error_type"] = "tool_not_found"
-        logger.error(result["error"])
+        logger.error(result["error"])  # real config error — keep at ERROR
     except OSError as exc:
         result["error"] = f"OS error launching bloodyAD: {exc}"
         result["error_type"] = "os_error"
-        logger.error(result["error"])
+        logger.warning(result["error"])
 
     return result
+
+
+def _extract_error_summary(stderr: str) -> str | None:
+    """Distill a useful one-line error message from bloodyAD stderr.
+
+    bloodyAD bubbles up full Python tracebacks from its dependencies
+    (kerbad, badldap, asysocks, impacket) when an operation fails.  That's
+    noise in the Rich attack-progress table.  We try to pull the actual
+    error message from the trailing lines first, then fall back to
+    recognising common exception classes.
+    """
+    if not stderr:
+        return None
+
+    lines = [ln.rstrip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # Prioritise well-known exception classes with their message
+    known = (
+        "KerberosError:",
+        "LDAPModifyException:",
+        "LDAPSearchException:",
+        "LDAPBindException:",
+        "LDAPException:",
+        "TimeoutError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "PermissionError",
+    )
+    for line in reversed(lines):
+        for prefix in known:
+            if prefix in line:
+                # Strip leading module path, keep the exception name + message
+                idx = line.find(prefix)
+                return line[idx:].strip().rstrip(".")[:300]
+
+    # Last non-empty line is usually the final exception message in a
+    # traceback (after "The above exception was the direct cause..." blocks).
+    last = lines[-1]
+    # If it's a plain "ExceptionName" with no message, include the line above
+    # too, which typically holds context.
+    if ":" not in last and len(lines) >= 2:
+        return f"{lines[-2].strip()} → {last}".strip()[:300]
+    return last[:300]
 
 
 # ---------------------------------------------------------------------------
