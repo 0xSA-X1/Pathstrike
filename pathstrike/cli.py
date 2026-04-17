@@ -1632,28 +1632,44 @@ def campaign(
     ] = -1,
     max_targets: Annotated[
         int,
-        typer.Option("--max-targets", help="Max high-value targets to pursue per round"),
+        typer.Option("--max-targets", help="Max targets to pursue per round"),
     ] = 10,
+    max_depth: Annotated[
+        int,
+        typer.Option("--max-depth", help="Maximum path depth when enumerating reachable targets"),
+    ] = 10,
+    high_value_only: Annotated[
+        bool,
+        typer.Option(
+            "--high-value-only",
+            help="Restrict discovery to Domain Admins / Enterprise Admins / Tier Zero / Domain nodes (old behavior)",
+        ),
+    ] = False,
     no_time_sync: Annotated[
         bool,
         typer.Option("--no-time-sync", help="Disable automatic ntpdate clock sync"),
     ] = False,
     verbose: VerboseOption = False,
 ) -> None:
-    """Autonomous attack campaign — drive toward Domain Admin / Tier Zero.
+    """Interactive step-through attack campaign — exploit, requery, repeat.
 
-    Queries BloodHound CE for every reachable [bold]high-value[/] target
-    (Domain Admins, Enterprise Admins, Tier Zero, Domain nodes) and
-    chains paths toward them.  Ranks by privilege value and executes
-    the highest-value paths automatically.
+    Enumerates every reachable exploitable node from your owned
+    identities (users, groups, computers, domains) via handler-backed
+    edges.  After each successful step, re-queries BH CE from the new
+    position to surface additional paths — letting you step through
+    an environment one compromise at a time.
 
-    After each successful escalation, re-queries from the new position
-    to discover additional paths.  Automatically chains trust
-    escalation (child→parent domain) when Domain Admin is reached.
+    [bold yellow]Note:[/] BH CE is a static snapshot. If exploiting a
+    step changes AD state (e.g. WriteOwner grants new ACLs), you must
+    [bold]re-collect and re-upload[/] bloodhound-ce-python data between
+    steps to see the newly-created edges in subsequent queries.
 
-    Use [bold]pathstrike auto[/] instead for opportunistic escalation
-    through non-privileged intermediates (groups, service accounts)
-    when no direct high-value path exists yet.
+    Use [bold]--high-value-only[/] to restrict discovery to privileged
+    targets (Domain Admins, Enterprise Admins, Tier Zero, Domain nodes)
+    when you specifically want to drive toward final DA compromise.
+
+    Use [bold]pathstrike auto[/] for greedy non-interactive escalation
+    that chases the deepest reachable target without prompting.
 
     [bold green]Interactive mode[/] (default): shows ranked paths and asks
     before each execution.
@@ -1679,10 +1695,13 @@ def campaign(
         retry_on.discard(ErrorCategory.TIME_SKEW)
         retry_policy.retry_on = frozenset(retry_on)
 
+    discovery_desc = "high-value targets only" if high_value_only else "all reachable targets"
     console.print(
         f"[bold]Campaign Mode:[/] {mode.value}\n"
         f"[bold]Source:[/] {source_name}\n"
+        f"[bold]Discovery:[/] {discovery_desc}\n"
         f"[bold]Max targets per round:[/] {max_targets}\n"
+        f"[bold]Max path depth:[/] {max_depth}\n"
         f"[bold]Max retries:[/] {retry_policy.max_retries}\n"
         f"[bold]Auto time sync:[/] {'disabled' if no_time_sync else 'enabled'}\n"
     )
@@ -1703,6 +1722,8 @@ def campaign(
                 mode=mode,
                 verbose=verbose,
                 max_targets=max_targets,
+                reachable_mode=not high_value_only,
+                max_depth=max_depth,
             )
 
             result = await campaign_orch.run_campaign()
