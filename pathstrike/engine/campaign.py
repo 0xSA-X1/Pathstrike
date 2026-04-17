@@ -216,6 +216,12 @@ class CampaignOrchestrator:
                     # Harvest new identities from credential store
                     self._harvest_new_identities()
 
+                    # Claim every node along the exploited path as owned so
+                    # subsequent rounds re-query from intermediate positions
+                    # (e.g. after compromising MANAGEMENT group via Judith's
+                    # WriteOwner, next round queries from MANAGEMENT's POV).
+                    self._claim_path_nodes_as_owned(scored_path)
+
                     # Check if we compromised a domain
                     self._check_domain_compromise(scored_path)
 
@@ -316,6 +322,42 @@ class CampaignOrchestrator:
         )
         return all_paths
 
+    # Well-known pseudo-principals that BH CE links through ClaimSpecialIdentity
+    # etc.  Including them in path discovery pollutes the target list — every
+    # user implicitly reaches SCHANNEL AUTHENTICATION, EVERYONE, etc., but
+    # those aren't real attack targets.
+    _WELL_KNOWN_PRINCIPALS = frozenset({
+        "EVERYONE",
+        "AUTHENTICATED USERS",
+        "THIS ORGANIZATION",
+        "ANONYMOUS LOGON",
+        "INTERACTIVE",
+        "NETWORK",
+        "BATCH",
+        "SERVICE",
+        "SELF",
+        "SYSTEM",
+        "LOCAL SERVICE",
+        "NETWORK SERVICE",
+        "SCHANNEL AUTHENTICATION",
+        "NTLM AUTHENTICATION",
+        "DIGEST AUTHENTICATION",
+        "ENTERPRISE DOMAIN CONTROLLERS",
+        "OTHER ORGANIZATION",
+        "PRINCIPAL SELF",
+        "OWNER RIGHTS",
+    })
+
+    @classmethod
+    def _is_well_known_principal(cls, name: str) -> bool:
+        """Return True if *name* is a well-known pseudo-principal."""
+        if not name:
+            return False
+        # Strip the @domain suffix if present — pseudo principals are named
+        # like "SCHANNEL AUTHENTICATION@CERTIFIED.HTB"
+        short = name.split("@", 1)[0].strip().upper()
+        return short in cls._WELL_KNOWN_PRINCIPALS
+
     async def _discover_reachable_paths(
         self, identity: str
     ) -> list[AttackPath]:
@@ -326,6 +368,10 @@ class CampaignOrchestrator:
         User/Group/Computer/Domain node via handler-backed edges, enabling
         opportunistic escalation through non-privileged intermediates
         (e.g. a non-admin group that ACLs into a service account).
+
+        Well-known pseudo-principals (EVERYONE, SCHANNEL AUTHENTICATION,
+        etc.) are filtered out — they're implicit targets for every
+        principal in AD and aren't useful escalation destinations.
         """
         query, _ = build_reachable_targets_query(
             identity, max_depth=self.max_depth,
@@ -341,10 +387,12 @@ class CampaignOrchestrator:
             p for p in paths
             if p.target.name != identity
             and p.target.name not in self.completed_targets
+            and not self._is_well_known_principal(p.target.name)
         ]
         logger.info(
-            "Discovered %d reachable path(s) from %s",
-            len(filtered), identity,
+            "Discovered %d reachable path(s) from %s "
+            "(%d well-known pseudo-principals filtered)",
+            len(filtered), identity, len(paths) - len(filtered),
         )
         return filtered
 
@@ -535,6 +583,31 @@ class CampaignOrchestrator:
             if identity not in self.owned_identities:
                 self.owned_identities.add(identity)
                 logger.info("New identity captured: %s", identity)
+
+    def _claim_path_nodes_as_owned(self, scored: ScoredPath) -> None:
+        """Mark every node in a successfully-exploited path as owned.
+
+        After a path is compromised, every intermediate node along the
+        chain is effectively under the attacker's control for query
+        purposes (the attacker can now traverse BH CE edges *from* those
+        nodes via group membership, ACL grants, etc.).  Adding them to
+        ``owned_identities`` makes the next discovery round re-query
+        from each node, exposing paths that only branch off at mid-chain
+        — useful for step-through exploration and pentest reporting.
+
+        Credential capture is still handled separately by the cred_store;
+        this is purely about BH CE query perspective, not authentication.
+        """
+        for step in scored.path.steps:
+            for endpoint in (step.edge.source, step.edge.target):
+                if not endpoint or not endpoint.name:
+                    continue
+                name = endpoint.name.upper()
+                if name not in self.owned_identities:
+                    self.owned_identities.add(name)
+                    logger.info(
+                        "Node marked as owned (compromised in path): %s", name,
+                    )
 
     def _check_domain_compromise(self, scored: ScoredPath) -> None:
         """Check if the completed path represents domain compromise.
