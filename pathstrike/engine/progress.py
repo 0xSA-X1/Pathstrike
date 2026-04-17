@@ -73,6 +73,15 @@ class _QuietLive:
     def update(self, *args, **kwargs):
         return self._live.update(*args, **kwargs)
 
+    def __getattr__(self, name: str):
+        """Proxy any other attribute (start, stop, refresh, etc.) to the inner Live.
+
+        The orchestrator may call ``.stop()``, ``.start(refresh=True)``,
+        ``.refresh()`` or other Rich Live methods that we don't explicitly
+        wrap — forward them transparently so the wrapper is a drop-in.
+        """
+        return getattr(self._live, name)
+
 
 class StepStatus(StrEnum):
     """Visual status for each step in the progress display."""
