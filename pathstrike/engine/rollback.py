@@ -309,61 +309,83 @@ class RollbackManager:
         self.logger.debug("Rollback command: %s", action.command)
 
         try:
-            cmd_parts = self._build_rollback_command(action.command)
+            # A rollback action may contain multiple chained commands
+            # separated by ';' (e.g. remove group member, then remove DACL
+            # ACE).  Build each sub-command independently and run in order;
+            # stop on the first failure so we don't try to clean up state
+            # that wasn't actually touched.
+            sub_commands = self._build_rollback_commands(action.command)
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_parts,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            if not sub_commands:
+                self.logger.error("Rollback command produced no sub-commands: %s", action.command)
+                self._failed_rollbacks.append(
+                    {
+                        "step_index": action.step_index,
+                        "description": action.description,
+                        "command": action.command,
+                        "error": "empty command after parsing",
+                    }
+                )
+                return False
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=self._config.execution.timeout,
-            )
+            last_cmd_parts: list[str] = []
+            for cmd_parts in sub_commands:
+                last_cmd_parts = cmd_parts
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd_parts,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
 
-            stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
-            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=self._config.execution.timeout,
+                )
 
-            if proc.returncode == 0:
-                action.executed = True
-                self.logger.info("Rollback succeeded: %s", action.description)
+                stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+                stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+                if proc.returncode != 0:
+                    error_msg = stderr[:500] if stderr else f"exit code {proc.returncode}"
+                    self.logger.error(
+                        "Rollback sub-command failed (rc=%d): %s | stderr: %s",
+                        proc.returncode,
+                        " ".join(cmd_parts[:4]),
+                        stderr[:500],
+                    )
+                    self._failed_rollbacks.append(
+                        {
+                            "step_index": action.step_index,
+                            "description": action.description,
+                            "command": action.command,
+                            "error": error_msg,
+                        }
+                    )
+                    return False
+
                 if stdout:
-                    self.logger.debug("Rollback output: %s", stdout[:500])
+                    self.logger.debug("Rollback sub-command output: %s", stdout[:500])
 
-                # Verification step
-                if verify:
-                    if cmd_parts and cmd_parts[0].lower() == "bloodyad":
-                        self.logger.info(
-                            "Verification requested for bloodyAD rollback: %s "
-                            "(verification not yet implemented)",
-                            action.description,
-                        )
-                    else:
-                        self.logger.info(
-                            "Verification is not yet implemented for non-bloodyAD "
-                            "commands: %s",
-                            action.description,
-                        )
+            # All sub-commands succeeded
+            action.executed = True
+            self.logger.info("Rollback succeeded: %s", action.description)
 
-                return True
+            # Verification step (informational only)
+            if verify and last_cmd_parts:
+                if last_cmd_parts[0].lower() == "bloodyad":
+                    self.logger.info(
+                        "Verification requested for bloodyAD rollback: %s "
+                        "(verification not yet implemented)",
+                        action.description,
+                    )
+                else:
+                    self.logger.info(
+                        "Verification is not yet implemented for non-bloodyAD "
+                        "commands: %s",
+                        action.description,
+                    )
 
-            error_msg = stderr[:500] if stderr else f"exit code {proc.returncode}"
-            self.logger.error(
-                "Rollback failed (rc=%d): %s | stderr: %s",
-                proc.returncode,
-                action.description,
-                stderr[:500],
-            )
-            self._failed_rollbacks.append(
-                {
-                    "step_index": action.step_index,
-                    "description": action.description,
-                    "command": action.command,
-                    "error": error_msg,
-                }
-            )
-            return False
+            return True
 
         except asyncio.TimeoutError:
             error_msg = f"Timed out after {self._config.execution.timeout}s"
@@ -447,6 +469,63 @@ class RollbackManager:
             return [parts[0]] + connection_args + auth_args + parts[1:]
 
         return parts
+
+    def _build_rollback_commands(self, raw_command: str) -> list[list[str]]:
+        """Split a compound rollback command on ``;`` and build each piece.
+
+        Some rollback actions need to run multiple sub-commands to fully
+        reverse a step — e.g. WriteOwner on a Group both adds a group
+        member and grants a GenericAll ACE, so the rollback removes both.
+        We split on ``;`` at the TOP LEVEL (respecting quotes via shlex)
+        and return one arg-list per sub-command, each separately prepared
+        by :meth:`_build_rollback_command` (connection/auth injection).
+
+        Returns an empty list for an empty input.
+        """
+        raw = raw_command.strip()
+        if not raw:
+            return []
+
+        # shlex doesn't split on ';' directly.  Tokenize then regroup.
+        lexer = shlex.shlex(raw, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+
+        groups: list[list[str]] = []
+        current: list[str] = []
+        for tok in tokens:
+            # Handle tokens like "JUDITH.MADER;" that still contain ';'
+            # because shlex treats ';' as an ordinary character.
+            if ";" in tok:
+                head, _, tail = tok.partition(";")
+                if head:
+                    current.append(head)
+                if current:
+                    groups.append(current)
+                    current = []
+                # Tail could itself contain more ';' — handle recursively
+                remainder = tail
+                while ";" in remainder:
+                    lhs, _, remainder = remainder.partition(";")
+                    if lhs:
+                        groups.append([lhs])
+                if remainder:
+                    current.append(remainder)
+            else:
+                current.append(tok)
+        if current:
+            groups.append(current)
+
+        # Re-apply connection/auth injection per sub-command.  The
+        # single-command helper handles quoting/escaping; we reconstruct
+        # the sub-command string and let it parse again so that injection
+        # rules (bloodyAD connection args) stay consistent.
+        return [
+            self._build_rollback_command(" ".join(shlex.quote(p) for p in group))
+            for group in groups
+            if group
+        ]
 
     def _build_config_auth_args(self) -> list[str]:
         """Build authentication arguments from the static config for rollback."""
