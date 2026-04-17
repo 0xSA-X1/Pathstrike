@@ -72,7 +72,9 @@ async def run_impacket_tool(
     Returns:
         Standardised result dict.
     """
-    cmd = [tool_name, *args]
+    from pathstrike.engine.time_sync import get_faketime_prefix
+
+    cmd = get_faketime_prefix() + [tool_name, *args]
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
     result: dict[str, Any] = {

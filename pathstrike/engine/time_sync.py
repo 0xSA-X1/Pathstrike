@@ -199,6 +199,134 @@ def _parse_ntpdate_offset(output: str) -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Faketime fallback — wrap subprocesses when system clock sync isn't possible
+# ---------------------------------------------------------------------------
+
+# Module-level prefix consulted by every subprocess wrapper (bloodyAD,
+# certipy, impacket, etc.).  Populated by set_faketime_prefix() when
+# system clock sync fails and a DC offset has been measured.
+_faketime_prefix: list[str] = []
+
+
+def get_faketime_prefix() -> list[str]:
+    """Return the current faketime command prefix, or an empty list.
+
+    Subprocess wrappers prepend this to their argv so every tool run
+    happens against a clock matching the Domain Controller, without
+    requiring root to change the system clock.
+    """
+    return list(_faketime_prefix)
+
+
+def set_faketime_prefix(offset_seconds: float | None) -> bool:
+    """Enable (or disable) the faketime prefix.
+
+    Args:
+        offset_seconds: Seconds of offset to apply to subprocess clocks
+            (positive = shift forward, negative = shift back).
+            Pass ``None`` to clear the prefix.
+
+    Returns:
+        True if the prefix was set successfully, False if faketime is
+        unavailable on PATH (in which case the prefix stays empty).
+    """
+    global _faketime_prefix
+
+    if offset_seconds is None:
+        if _faketime_prefix:
+            logger.debug("Clearing faketime prefix")
+        _faketime_prefix = []
+        return True
+
+    if not shutil.which("faketime"):
+        logger.warning(
+            "faketime binary not found — install libfaketime "
+            "(https://github.com/wolfcw/libfaketime) to let PathStrike "
+            "compensate Kerberos clock skew without requiring root"
+        )
+        _faketime_prefix = []
+        return False
+
+    # Faketime supports relative offsets like "+3600s" or "-1h".
+    # Round to whole seconds — sub-second precision isn't needed for KRB5.
+    seconds = int(round(offset_seconds))
+    sign = "+" if seconds >= 0 else "-"
+    offset_arg = f"{sign}{abs(seconds)}s"
+    _faketime_prefix = ["faketime", offset_arg]
+    logger.info(
+        "Enabled faketime prefix (%s) — subprocesses will run with clock "
+        "offset %ds to match the DC", offset_arg, seconds,
+    )
+    return True
+
+
+async def sync_time_with_faketime_fallback(
+    dc_host: str,
+    dc_fqdn: str | None = None,
+    timeout: int = 30,
+) -> TimeSyncResult:
+    """Sync the system clock, or fall back to faketime wrapping on failure.
+
+    Order:
+      1. Try :func:`sync_time` (ntpdate / chronyd / net time / rdate).
+         Requires sudo; modifies the real system clock.
+      2. If system sync fails: query the DC offset via ``ntpdate -q``
+         (non-invasive) and enable the faketime prefix.  Subsequent
+         subprocess calls will run with a corrected clock without
+         touching the real system clock.
+
+    Returns a TimeSyncResult where ``method="faketime"`` when the
+    fallback was used.
+    """
+    result = await sync_time(dc_host, dc_fqdn, timeout=timeout)
+    if result.success:
+        # Real clock is good now; make sure we don't also apply faketime.
+        set_faketime_prefix(None)
+        return result
+
+    logger.info(
+        "System clock sync failed (%s); attempting faketime fallback",
+        result.message,
+    )
+
+    offset = await check_time_offset(dc_host, dc_fqdn, timeout=timeout)
+    if offset is None:
+        return TimeSyncResult(
+            success=False,
+            method="none",
+            message=(
+                f"Could not sync system clock AND could not measure DC offset "
+                f"via ntpdate -q.  Original error: {result.message}"
+            ),
+        )
+
+    if set_faketime_prefix(offset):
+        return TimeSyncResult(
+            success=True,
+            method="faketime",
+            message=(
+                f"System clock sync failed; wrapping subprocesses with "
+                f"faketime to compensate {offset:+.1f}s DC skew (install "
+                f"libfaketime if you see errors — see "
+                f"https://github.com/wolfcw/libfaketime)"
+            ),
+            offset_seconds=offset,
+        )
+
+    # faketime isn't installed
+    return TimeSyncResult(
+        success=False,
+        method="none",
+        message=(
+            f"System clock sync failed AND faketime is not installed.  "
+            f"DC offset is {offset:+.1f}s.  Install libfaketime or run "
+            f"with sudo to enable auto-sync."
+        ),
+        offset_seconds=offset,
+    )
+
+
 async def ensure_time_sync(
     dc_host: str,
     dc_fqdn: str | None = None,

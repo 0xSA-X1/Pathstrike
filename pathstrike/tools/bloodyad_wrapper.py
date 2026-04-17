@@ -73,7 +73,9 @@ async def run_bloodyad(
     Returns:
         Standardised result dict with ``success``, ``output``, ``parsed``, and ``error`` keys.
     """
-    cmd = _build_command(args, config, auth_args)
+    from pathstrike.engine.time_sync import get_faketime_prefix
+
+    cmd = get_faketime_prefix() + _build_command(args, config, auth_args)
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
     result: dict[str, Any] = {

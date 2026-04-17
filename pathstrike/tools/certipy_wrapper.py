@@ -71,7 +71,9 @@ async def run_certipy(
         Standardised result dict with ``success``, ``output``, ``parsed``,
         and ``error`` keys.
     """
-    cmd = ["certipy", subcommand] + args
+    from pathstrike.engine.time_sync import get_faketime_prefix
+
+    cmd = get_faketime_prefix() + ["certipy", subcommand] + args
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
     result: dict[str, Any] = {

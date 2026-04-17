@@ -34,7 +34,10 @@ from pathstrike.engine.error_handler import (
 )
 from pathstrike.engine.progress import AttackProgressTracker, StepStatus
 from pathstrike.engine.rollback import RollbackManager
-from pathstrike.engine.time_sync import TimeSyncResult, sync_time
+from pathstrike.engine.time_sync import (
+    TimeSyncResult,
+    sync_time_with_faketime_fallback,
+)
 from pathstrike.models import AttackPath, Credential, ExecutionMode, PathStep
 
 # Trigger handler registration by importing the handlers package.
@@ -493,7 +496,7 @@ class AttackOrchestrator:
         dc_host = self.config.domain.dc_host
         dc_fqdn = self.config.domain.dc_fqdn
 
-        result = await sync_time(dc_host, dc_fqdn)
+        result = await sync_time_with_faketime_fallback(dc_host, dc_fqdn)
 
         if result.success:
             self._time_synced = True

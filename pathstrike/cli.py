@@ -655,6 +655,7 @@ def verify(
         "pyGPOAbuse": "pygpoabuse",
         "impacket (ntlmrelayx)": "ntlmrelayx.py",
         "ntpdate (time sync)": "ntpdate",
+        "faketime (skew fallback)": "faketime",
     }
 
     tool_table = Table(
