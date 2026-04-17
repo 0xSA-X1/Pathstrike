@@ -152,6 +152,13 @@ class CampaignOrchestrator:
         # authenticating user can actually enroll in differs per principal,
         # so we re-run for each new identity.
         self._adcs_enumerated_identities: set[str] = set()
+        # Track which identities we've run the AD Recycle Bin scan for.
+        # Unlike ADCS, the Deleted Objects container is domain-scoped and
+        # the visible contents are roughly identical for any user with
+        # Read on CN=Deleted Objects — so one successful scan is usually
+        # enough, but we re-run per-identity to catch delegation edge
+        # cases (and the scan is cheap: a single LDAP query).
+        self._deleted_enum_done: set[str] = set()
 
     async def run_campaign(self) -> CampaignResult:
         """Execute the autonomous campaign loop.
@@ -567,11 +574,17 @@ class CampaignOrchestrator:
                 object_id="", name=cap_edge.target,
                 label="User", domain=domain, properties={},
             )
+            # Merge cap_edge.properties onto the EdgeInfo so edge-specific
+            # handler inputs (e.g. RestorableFrom needs deleted_dn,
+            # last_known_parent, sam_account_name) travel with the
+            # synthesised path.  Always include a discovery provenance tag.
+            edge_props: dict[str, Any] = {"discovered_via": cap_edge.source_method}
+            edge_props.update(cap_edge.properties)
             edge = EdgeInfo(
                 edge_type=cap_edge.edge_type,
                 source=source_node,
                 target=target_node,
-                properties={"discovered_via": cap_edge.source_method},
+                properties=edge_props,
             )
             step = PathStep(
                 index=0,
@@ -884,6 +897,12 @@ class CampaignOrchestrator:
             # Also run ADCS enumeration for this identity (Phase 3B).
             await self._enumerate_adcs_for_identity(identity, user_part, id_domain)
 
+            # And check the AD Recycle Bin for tombstoned privileged
+            # accounts this identity can restore (Phase 3C).
+            await self._enumerate_deleted_objects_for_identity(
+                identity, user_part, id_domain,
+            )
+
     async def _enumerate_adcs_for_identity(
         self, identity: str, user: str, domain: str,
     ) -> None:
@@ -971,6 +990,135 @@ class CampaignOrchestrator:
         if added:
             logger.info(
                 "Live-enum (ADCS): recorded %d ADCS edge(s) from %s findings",
+                added, identity,
+            )
+
+    async def _enumerate_deleted_objects_for_identity(
+        self, identity: str, user: str, domain: str,
+    ) -> None:
+        """Scan the AD Recycle Bin for privileged tombstoned accounts.
+
+        Adds a synthetic ``RestorableFrom`` edge for each interesting
+        deleted account the current identity can reach via LDAP, so the
+        :class:`RestoreDeletedObjectHandler` can resurrect them later.
+
+        Scope (Phase 3C):
+          * Only user-class tombstoned objects.
+          * "Interesting" is pattern-based: privileged name, admin
+            group memberOf, or privileged OU parent.  See
+            :func:`live_enum.is_interesting_deleted`.
+          * LDAP bind via NTLM only (password / NT hash).  Kerberos and
+            certificate auth would need the SPNEGO plumbing — future
+            work.
+        """
+        if identity in self._deleted_enum_done:
+            return
+
+        from pathstrike.models import CredentialType
+        from pathstrike.tools.live_enum import (
+            build_ntlm_connection,
+            enumerate_deleted_users,
+            is_interesting_deleted,
+            is_recycle_bin_enabled,
+            ldap3_available,
+        )
+
+        if not ldap3_available():
+            logger.debug("ldap3 not available; skipping Recycle Bin scan for %s", identity)
+            self._deleted_enum_done.add(identity)
+            return
+
+        cred = self.cred_store.get_best_credential(user, domain)
+        if cred is None:
+            self._deleted_enum_done.add(identity)
+            return
+
+        password: str | None = None
+        nt_hash: str | None = None
+        if cred.cred_type == CredentialType.password:
+            password = cred.value
+        elif cred.cred_type == CredentialType.nt_hash:
+            nt_hash = cred.value
+        else:
+            # Kerberos / cert auth for live_enum not wired up yet — skip
+            # silently so we don't spam for AES/ccache identities.
+            self._deleted_enum_done.add(identity)
+            return
+
+        dc_host = self.config.domain.dc_fqdn or self.config.domain.dc_host
+        conn = build_ntlm_connection(
+            dc_host=dc_host,
+            domain=domain,
+            username=user,
+            password=password,
+            nt_hash=nt_hash,
+        )
+        if conn is None:
+            logger.debug("LDAP bind failed for %s; skipping Recycle Bin scan", identity)
+            self._deleted_enum_done.add(identity)
+            return
+
+        try:
+            recycle_enabled = is_recycle_bin_enabled(conn, domain)
+            logger.debug(
+                "AD Recycle Bin Feature enabled on %s: %s",
+                domain, recycle_enabled,
+            )
+            # Even when the Feature isn't enabled, tombstones still exist —
+            # just with fewer preserved attributes.  Enumerate anyway.
+            deleted = enumerate_deleted_users(conn, domain)
+        finally:
+            try:
+                conn.unbind()
+            except Exception:  # pragma: no cover
+                pass
+
+        if not deleted:
+            self._deleted_enum_done.add(identity)
+            return
+
+        logger.info(
+            "Live-enum (Recycle Bin): found %d deleted user(s) visible to %s",
+            len(deleted), identity,
+        )
+
+        domain_upper = domain.upper()
+        added = 0
+        for acct in deleted:
+            if not is_interesting_deleted(acct):
+                continue
+
+            sam = acct.get("sam") or acct.get("name")
+            last_parent = acct.get("last_known_parent")
+            deleted_dn = acct.get("dn")
+            if not (sam and last_parent and deleted_dn):
+                # Missing attributes often means the Recycle Bin isn't on
+                # and AD stripped them.  Can't reanimate without them.
+                continue
+
+            target_name = f"{sam.upper()}@{domain_upper}"
+            if target_name in self.completed_targets:
+                continue
+
+            if self.capability_graph.add_edge(
+                source=identity,
+                edge_type="RestorableFrom",
+                target=target_name,
+                source_method="ldap:recycle-bin",
+                properties={
+                    "deleted_dn": deleted_dn,
+                    "last_known_parent": last_parent,
+                    "sam_account_name": sam,
+                    "when_changed": acct.get("when_changed", ""),
+                },
+            ):
+                added += 1
+
+        self._deleted_enum_done.add(identity)
+
+        if added:
+            logger.info(
+                "Live-enum (Recycle Bin): recorded %d RestorableFrom edge(s) from %s",
                 added, identity,
             )
 

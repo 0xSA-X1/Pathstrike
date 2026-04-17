@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 
-@dataclass(frozen=True)
+@dataclass
 class CapabilityEdge:
     """A single directed edge discovered via live enumeration.
 
@@ -35,15 +35,19 @@ class CapabilityEdge:
             authenticated identity whose effective rights we queried.
         edge_type: The BloodHound-style edge label
             (``"GenericAll"``, ``"GenericWrite"``, ``"ReadGMSAPassword"``,
-            ``"WriteDacl"``, etc.).  Pathstrike exploitation handlers
-            key off this string, so values must match existing handler
-            edge-type registrations.
+            ``"WriteDacl"``, ``"RestorableFrom"``, etc.).  Pathstrike
+            exploitation handlers key off this string, so values must
+            match existing handler edge-type registrations.
         target: Fully-qualified target name, upper-cased.
         discovered_at: UTC timestamp when the edge was observed.  Used
             for debugging / freshness reasoning, not for deduplication.
         source_method: Short tag indicating HOW the edge was discovered
-            (``"bloodyad:get-writable"``, ``"ldap:acl-scan"``, etc.).
+            (``"bloodyad:get-writable"``, ``"ldap:recycle-bin"``, etc.).
             Purely informational.
+        properties: Arbitrary per-edge metadata the handler needs at
+            exploitation time — e.g. a deleted object's DN, last known
+            parent OU, or pre-deletion sAMAccountName.  Excluded from
+            dedup identity.
     """
 
     source: str
@@ -51,10 +55,9 @@ class CapabilityEdge:
     target: str
     discovered_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc),
-        compare=False,
-        hash=False,
     )
-    source_method: str = field(default="unknown", compare=False, hash=False)
+    source_method: str = "unknown"
+    properties: dict[str, str] = field(default_factory=dict)
 
 
 class CapabilityGraph:
@@ -79,8 +82,15 @@ class CapabilityGraph:
         edge_type: str,
         target: str,
         source_method: str = "unknown",
+        properties: dict[str, str] | None = None,
     ) -> bool:
-        """Record an edge.  Returns ``True`` if it was new, ``False`` if duplicate."""
+        """Record an edge.  Returns ``True`` if it was new, ``False`` if duplicate.
+
+        The edge is keyed by ``(source, edge_type, target)`` so re-adding
+        with different ``properties`` is a no-op — mutation is intentional
+        here: we want the first-captured properties to win (they reflect
+        the state at the moment of discovery).
+        """
         src = source.upper()
         tgt = target.upper()
         key = (src, edge_type, tgt)
@@ -91,6 +101,7 @@ class CapabilityGraph:
             edge_type=edge_type,
             target=tgt,
             source_method=source_method,
+            properties=dict(properties or {}),
         )
         self._edges[key] = edge
         self._outbound.setdefault(src, []).append(edge)

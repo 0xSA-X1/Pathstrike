@@ -37,6 +37,7 @@ from pathstrike.handlers import (  # noqa: F401 — imported for side-effect reg
     gpo,
     group,
     password,
+    recycle_bin,
     replication,
     shadow_creds,
     sid_history,
