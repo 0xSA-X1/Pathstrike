@@ -198,34 +198,173 @@ def _try_load_json_file(pattern: str, stdout: str) -> dict[str, Any] | None:
 
 
 def _parse_find_output(stdout: str) -> dict[str, Any] | None:
-    """Parse ``certipy find`` output.
+    """Parse ``certipy find`` output into structured findings.
 
-    certipy find writes results to a JSON file and optionally a BloodHound
-    zip file. Extract paths and any vulnerability counts from stdout.
+    Certipy writes an output summary to stdout and a JSON file to disk.
+    When the JSON file is present we load it for precise findings;
+    otherwise we fall back to scraping stdout.
+
+    Returns a dict with:
+      * ``json_path`` / ``txt_path`` / ``bloodhound_zip`` (file paths if
+        certipy saved them)
+      * ``vulnerabilities``: deduplicated list of ESC labels seen
+        (``["ESC1", "ESC4", ...]``)
+      * ``findings``: list of per-template dicts
+        ``{"template": str, "esc": str, "edge_type": str,
+           "principal": str}`` — one entry per (template × ESC × principal)
+        tuple.  ``edge_type`` is the BloodHound-compatible label
+        (e.g. ``"ADCSESC1"``).
     """
     parsed: dict[str, Any] = {}
 
-    # Look for the JSON output file path
+    # Output file paths
     json_match = re.search(r"Saved JSON output to '(.+?\.json)'", stdout)
     if json_match:
         parsed["json_path"] = json_match.group(1)
 
-    # Look for BloodHound zip
     zip_match = re.search(r"Saved BloodHound data to '(.+?\.zip)'", stdout)
     if zip_match:
         parsed["bloodhound_zip"] = zip_match.group(1)
 
-    # Look for TXT output
     txt_match = re.search(r"Saved text output to '(.+?\.txt)'", stdout)
     if txt_match:
         parsed["txt_path"] = txt_match.group(1)
 
-    # Count vulnerable templates mentioned
-    vuln_templates = re.findall(r"ESC\d+", stdout)
-    if vuln_templates:
-        parsed["vulnerabilities"] = list(set(vuln_templates))
+    # Deduplicated vulnerability labels mentioned anywhere in stdout.
+    vuln_labels = re.findall(r"ESC\d+[a-z]?", stdout)
+    if vuln_labels:
+        parsed["vulnerabilities"] = sorted(set(vuln_labels))
+
+    # Structured findings: prefer the JSON file if available.
+    findings: list[dict[str, str]] = []
+    if "json_path" in parsed:
+        findings = _extract_findings_from_json(parsed["json_path"])
+    if not findings:
+        findings = _extract_findings_from_text(stdout)
+    if findings:
+        parsed["findings"] = findings
 
     return parsed if parsed else None
+
+
+# ESC → BloodHound edge type mapping.  Handlers registered in
+# pathstrike.handlers.adcs key off these names, so keep in sync.
+_ESC_TO_BH_EDGE: dict[str, str] = {
+    "ESC1": "ADCSESC1",
+    "ESC2": "ADCSESC2",
+    "ESC3": "ADCSESC3",
+    "ESC4": "ADCSESC4",
+    "ESC5": "ADCSESC5",
+    "ESC6": "ADCSESC6a",   # BH splits 6 into 6a/6b; default to 6a
+    "ESC6a": "ADCSESC6a",
+    "ESC6b": "ADCSESC6b",
+    "ESC7": "ADCSESC7",
+    "ESC8": "ADCSESC8",
+    "ESC9": "ADCSESC9a",
+    "ESC9a": "ADCSESC9a",
+    "ESC9b": "ADCSESC9b",
+    "ESC10": "ADCSESC10a",
+    "ESC10a": "ADCSESC10a",
+    "ESC10b": "ADCSESC10b",
+    "ESC11": "ADCSESC11",
+    "ESC13": "ADCSESC13",
+}
+
+
+def _extract_findings_from_json(json_path: str) -> list[dict[str, str]]:
+    """Load certipy's JSON output and extract ESC findings.
+
+    certipy's JSON schema (v4 / v5) contains a ``Certificate Templates``
+    section keyed by template index, each template having an optional
+    ``[!] Vulnerabilities`` sub-dict keyed by ESC name.  Values are
+    human-readable strings that usually quote the principal(s) that can
+    exploit the finding.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(json_path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    findings: list[dict[str, str]] = []
+    templates = data.get("Certificate Templates", {}) or {}
+    if isinstance(templates, dict):
+        iterator = templates.values()
+    elif isinstance(templates, list):
+        iterator = templates
+    else:
+        iterator = []
+
+    for tpl in iterator:
+        if not isinstance(tpl, dict):
+            continue
+        name = tpl.get("Template Name") or tpl.get("Display Name") or ""
+        vulns = tpl.get("[!] Vulnerabilities") or tpl.get("Vulnerabilities") or {}
+        if not isinstance(vulns, dict):
+            continue
+        for esc, description in vulns.items():
+            esc_clean = esc.strip().upper()
+            edge_type = _ESC_TO_BH_EDGE.get(esc_clean, f"ADCS{esc_clean}")
+            desc_str = str(description)
+            for principal in _extract_principals(desc_str):
+                findings.append({
+                    "template": str(name),
+                    "esc": esc_clean,
+                    "edge_type": edge_type,
+                    "principal": principal,
+                })
+            if not _extract_principals(desc_str):
+                # Record without principal — the handler may still match
+                # via its own enumeration, and at minimum we note the ESC.
+                findings.append({
+                    "template": str(name),
+                    "esc": esc_clean,
+                    "edge_type": edge_type,
+                    "principal": "",
+                })
+    return findings
+
+
+def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
+    """Fallback text parser for `certipy find` stdout when no JSON file exists.
+
+    Splits stdout on ``Template Name`` markers to get per-template blocks,
+    then looks for ``ESC<N>`` lines within each block and captures any
+    quoted principal names from the description.
+    """
+    findings: list[dict[str, str]] = []
+    # Split on the "Template Name" field — the preamble before the first
+    # split is discarded.
+    blocks = re.split(r"\n\s*Template Name\s*:\s*", stdout)
+    for block in blocks[1:]:
+        lines = block.splitlines()
+        template = lines[0].strip() if lines else ""
+        # Iterate ESC lines within the block
+        for m in re.finditer(
+            r"ESC(\d+[a-z]?)\s*:\s*(.+?)(?=\n\s*(?:ESC\d|\[|Template|$))",
+            block, re.DOTALL,
+        ):
+            esc = f"ESC{m.group(1).upper()}"
+            desc = m.group(2)
+            edge_type = _ESC_TO_BH_EDGE.get(esc, f"ADCS{esc}")
+            principals = _extract_principals(desc) or [""]
+            for principal in principals:
+                findings.append({
+                    "template": template,
+                    "esc": esc,
+                    "edge_type": edge_type,
+                    "principal": principal,
+                })
+    return findings
+
+
+def _extract_principals(text: str) -> list[str]:
+    """Pull quoted principal names from a certipy vulnerability description."""
+    return re.findall(r"'([^']+)'", text)
 
 
 def _parse_req_output(stdout: str) -> dict[str, Any] | None:

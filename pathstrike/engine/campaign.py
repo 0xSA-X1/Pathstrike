@@ -51,6 +51,28 @@ logger = logging.getLogger("pathstrike.engine.campaign")
 console = Console()
 
 
+def _normalise_certipy_principal(principal: str, domain: str) -> str | None:
+    """Convert certipy's ``DOMAIN\\NAME`` / ``DOMAIN.FQDN\\NAME`` to ``NAME@DOMAIN``.
+
+    Returns ``None`` for empty input.  Unrecognised formats (no
+    backslash, no ``@``) are returned upper-cased with the configured
+    domain appended so BH lookup still has something to match.
+    """
+    if not principal:
+        return None
+    p = principal.strip()
+    if "\\" in p:
+        _, _, short = p.partition("\\")
+    elif "@" in p:
+        short, _, _ = p.partition("@")
+    else:
+        short = p
+    short = short.strip()
+    if not short:
+        return None
+    return f"{short.upper()}@{domain.upper()}"
+
+
 def _dn_to_bh_name(dn: str, domain: str) -> str | None:
     """Convert an LDAP distinguishedName to BH CE's ``NAME@DOMAIN`` format.
 
@@ -125,6 +147,11 @@ class CampaignOrchestrator:
         # Track which identities we've already run live-enum for in this
         # session so we don't re-query on every round.
         self._enumerated_identities: set[str] = set()
+        # Track which identities we've run `certipy find -vulnerable` for.
+        # ADCS findings are domain-scoped but the set of templates the
+        # authenticating user can actually enroll in differs per principal,
+        # so we re-run for each new identity.
+        self._adcs_enumerated_identities: set[str] = set()
 
     async def run_campaign(self) -> CampaignResult:
         """Execute the autonomous campaign loop.
@@ -422,6 +449,16 @@ class CampaignOrchestrator:
         etc.) are filtered out — they're implicit targets for every
         principal in AD and aren't useful escalation destinations.
         """
+        # Can't authenticate as a pseudo-principal — BH queries from these
+        # sources are guaranteed to be noise.  Skip silently instead of
+        # logging a warning for every single one of them during multi-
+        # round re-discovery.
+        if self._is_well_known_principal(identity):
+            logger.debug(
+                "Skipping discovery from pseudo-principal source: %s", identity,
+            )
+            return []
+
         # Step 1: enumerate reachable target names
         names_query, _ = build_reachable_target_names_query(
             identity, max_depth=self.max_depth,
@@ -429,7 +466,16 @@ class CampaignOrchestrator:
         try:
             names_response = await self.bh_client.cypher_query(names_query)
         except Exception as exc:
-            logger.warning("Reachable-target name discovery failed: %s", exc)
+            # 404 for cypher = "no results / endpoint returned empty" — demote
+            # from WARNING to DEBUG so it doesn't clutter default output.
+            exc_str = str(exc)
+            if "404" in exc_str or "resource not found" in exc_str:
+                logger.debug(
+                    "Reachable-target name discovery empty for %s: %s",
+                    identity, exc_str[:200],
+                )
+            else:
+                logger.warning("Reachable-target name discovery failed: %s", exc)
             return []
 
         target_names: list[str] = []
@@ -835,6 +881,132 @@ class CampaignOrchestrator:
                     "Live-enum: no new exploitable edges for %s", identity,
                 )
 
+            # Also run ADCS enumeration for this identity (Phase 3B).
+            await self._enumerate_adcs_for_identity(identity, user_part, id_domain)
+
+    async def _enumerate_adcs_for_identity(
+        self, identity: str, user: str, domain: str,
+    ) -> None:
+        """Run ``certipy find -vulnerable`` as *identity* and record ESC edges.
+
+        ADCS escalation paths (ESC1–13) are often missed by BloodHound's
+        static snapshot — SharpHound may not collect cert templates, or
+        analysis may be stale.  We enumerate live with certipy per owned
+        identity: different principals see different vulnerable templates
+        based on their enrollment rights.  Results populate the
+        capability graph as synthetic ``ADCSESCx`` edges pointing at the
+        domain root, so existing ADCS handlers (adcs.py) can exploit
+        them during the next discovery round.
+        """
+        if identity in self._adcs_enumerated_identities:
+            return
+
+        certipy_auth = self._build_certipy_auth_args_for_identity(user, domain)
+        if not certipy_auth:
+            self._adcs_enumerated_identities.add(identity)
+            return
+
+        from pathstrike.tools.certipy_wrapper import certipy_find
+
+        dc = self.config.domain.dc_fqdn or self.config.domain.dc_host
+        logger.info("Live-enum (ADCS): running `certipy find -vulnerable` as %s", identity)
+        try:
+            result = await certipy_find(
+                target=dc,
+                auth_args=certipy_auth,
+                vulnerable=True,
+                stdout=False,
+                timeout=120,
+            )
+        except Exception as exc:
+            logger.debug("certipy find failed for %s: %s", identity, exc)
+            self._adcs_enumerated_identities.add(identity)
+            return
+
+        self._adcs_enumerated_identities.add(identity)
+
+        if not result.get("success"):
+            logger.debug(
+                "certipy find returned no data for %s: %s",
+                identity, result.get("error", "unknown"),
+            )
+            return
+
+        parsed = result.get("parsed") or {}
+        findings = parsed.get("findings", []) or []
+        if not findings:
+            logger.debug("certipy find: no vulnerable templates visible to %s", identity)
+            return
+
+        domain_upper = domain.upper()
+        domain_node = domain_upper  # BH domain nodes use the FQDN as `name`
+
+        added = 0
+        for finding in findings:
+            edge_type = finding.get("edge_type")
+            principal = finding.get("principal") or ""
+            if not edge_type:
+                continue
+
+            # Resolve the ESC's source principal:
+            # If certipy named a specific principal, normalise it.
+            # Otherwise fall back to the enumerating identity — since they
+            # can see this vulnerability, it's actionable from their POV.
+            source = (
+                _normalise_certipy_principal(principal, domain)
+                if principal else identity
+            )
+            if not source:
+                source = identity
+
+            # Target of an ADCS escalation is the domain (→ DA in practice).
+            if self.capability_graph.add_edge(
+                source=source,
+                edge_type=edge_type,
+                target=domain_node,
+                source_method=f"certipy:find-vulnerable/{finding.get('esc', '?')}",
+            ):
+                added += 1
+
+        if added:
+            logger.info(
+                "Live-enum (ADCS): recorded %d ADCS edge(s) from %s findings",
+                added, identity,
+            )
+
+    def _build_certipy_auth_args_for_identity(
+        self, user: str, domain: str,
+    ) -> list[str]:
+        """Certipy-style auth args mirroring :meth:`_build_auth_args_for_identity`.
+
+        Certipy uses ``-u user@domain``, ``-p``, ``-hashes :NT``, ``-k``,
+        ``-pfx`` — slightly different flag names from bloodyAD.
+        """
+        from pathstrike.models import CredentialType
+
+        cred = self.cred_store.get_best_credential(user, domain)
+        if cred is None:
+            return []
+
+        args: list[str] = [
+            "-u", f"{user}@{domain}",
+            "-dc-ip", self.config.domain.dc_host,
+        ]
+        match cred.cred_type:
+            case CredentialType.password:
+                args.extend(["-p", cred.value])
+            case CredentialType.nt_hash:
+                args.extend(["-hashes", f":{cred.value}"])
+            case CredentialType.aes_key:
+                args.extend(["-aes", cred.value])
+            case CredentialType.ccache:
+                args.append("-k")
+            case CredentialType.certificate:
+                args.extend(["-pfx", cred.value])
+            case _:
+                return []
+        return args
+
     def _build_auth_args_for_identity(
         self, user: str, domain: str,
     ) -> list[str]:
@@ -883,6 +1055,12 @@ class CampaignOrchestrator:
                 if not endpoint or not endpoint.name:
                     continue
                 name = endpoint.name.upper()
+                # Pseudo-principals (EVERYONE, AUTHENTICATED USERS, SCHANNEL
+                # AUTHENTICATION, etc.) can't be authenticated as — adding
+                # them to owned_identities just produces 404s on next-round
+                # discovery queries.  Skip them silently.
+                if self._is_well_known_principal(name):
+                    continue
                 if name not in self.owned_identities:
                     self.owned_identities.add(name)
                     logger.info(
