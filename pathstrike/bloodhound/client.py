@@ -111,7 +111,17 @@ class BloodHoundClient:
 
         if response.status_code >= 400:
             detail = response.text[:500]
-            logger.error(
+            # Log level matches severity: 5xx = real server problems;
+            # 404 = routine empty-result or missing optional endpoint (callers
+            # handle these); other 4xx = auth/permission issues worth flagging.
+            if response.status_code >= 500:
+                log_level = logging.ERROR
+            elif response.status_code == 404:
+                log_level = logging.DEBUG
+            else:
+                log_level = logging.WARNING
+            logger.log(
+                log_level,
                 "BH API error: %s %s -> %d: %s",
                 method,
                 endpoint,

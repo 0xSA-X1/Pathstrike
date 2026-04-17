@@ -345,7 +345,7 @@ class CredentialStore:
                 wiped_count += 1
 
         self._credentials.clear()
-        logger.info("Secure wipe completed: %d credential(s) overwritten", wiped_count)
+        logger.debug("Secure wipe completed: %d credential(s) overwritten", wiped_count)
 
     @staticmethod
     def _overwrite_string(s: str) -> None:

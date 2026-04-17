@@ -64,7 +64,9 @@ def parse_cypher_response(response: dict[str, Any]) -> list[AttackPath]:
             logger.warning("Failed to parse path row: %s", exc)
             continue
 
-    logger.info("Parsed %d attack path(s) from cypher response", len(paths))
+    # One log line per per-target query is noise at default verbosity — the
+    # caller (campaign/auto discovery) already logs an aggregate count.
+    logger.debug("Parsed %d attack path(s) from cypher response", len(paths))
     return paths
 
 

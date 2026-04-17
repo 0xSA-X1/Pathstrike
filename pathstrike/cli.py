@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from pathstrike.engine.edge_registry import get_supported_edges, list_handlers
 from pathstrike.engine.error_handler import RetryPolicy
 from pathstrike.engine.orchestrator import AttackOrchestrator
 from pathstrike.engine.rollback import RollbackManager
-from pathstrike.logging_setup import setup_logging
+from pathstrike.logging_setup import print_log_summary, setup_logging
 from pathstrike.models import AttackPath, Credential, CredentialType, ExecutionMode
 
 app = typer.Typer(
@@ -36,6 +37,12 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+# Print a single end-of-run hint (if any warnings/errors were logged) when
+# the process exits, regardless of which subcommand ran or how it exited
+# (normal return, typer.Exit, or KeyboardInterrupt).  The handler is a no-op
+# when no warnings were recorded or when setup_logging wasn't called.
+atexit.register(lambda: print_log_summary(console))
 
 # ---------------------------------------------------------------------------
 # Shared option types

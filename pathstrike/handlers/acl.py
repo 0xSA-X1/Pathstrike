@@ -179,7 +179,7 @@ class GenericAllHandler(BaseEdgeHandler):
         strategy_errors: list[str] = []
 
         # -------- Strategy 1: Shadow Credentials on the computer ----------
-        self.logger.info(
+        self.logger.debug(
             "[Strategy 1/4] Shadow Credentials on computer %s", target,
         )
         result = await bloody.add_shadow_credentials(self.config, auth_args, target)
@@ -201,7 +201,7 @@ class GenericAllHandler(BaseEdgeHandler):
         self.logger.warning("Shadow Creds failed on %s: %s", target, err)
 
         # -------- Strategy 2: RBCD -----------------------------------------
-        self.logger.info(
+        self.logger.debug(
             "[Strategy 2/4] RBCD configuration on %s (trustee=%s)",
             target, principal,
         )
@@ -218,7 +218,7 @@ class GenericAllHandler(BaseEdgeHandler):
         self.logger.warning("RBCD failed on %s: %s", target, err)
 
         # -------- Strategy 3: LAPS Read ------------------------------------
-        self.logger.info("[Strategy 3/4] LAPS password read on %s", target)
+        self.logger.debug("[Strategy 3/4] LAPS password read on %s", target)
         result = await bloody.read_laps(self.config, auth_args, target)
         if result["success"]:
             laps_pwd = self._extract_laps_password(result)
@@ -249,7 +249,7 @@ class GenericAllHandler(BaseEdgeHandler):
             self.logger.warning("LAPS read failed on %s: %s", target, err)
 
         # -------- Strategy 4: Force machine password reset -----------------
-        self.logger.info(
+        self.logger.debug(
             "[Strategy 4/4] Force machine password reset on %s (disruptive)",
             target,
         )
