@@ -53,9 +53,8 @@ BloodHound CE is a **static snapshot** of the graph taken at SharpHound ingest t
 |---|---|---|
 | **`bloodyAD get writable`** | Standard ACE writes (`GenericWrite`, `Owns`, `WriteOwner`, `WriteDacl`) | After every successful compromise, per newly-owned user/computer |
 | **`certipy find -vulnerable`** | AD CS templates with ESC1/ESC3/ESC4/ESC6/ESC9/ESC10/ESC11/ESC13 findings | After every successful compromise, per newly-owned user/computer |
-| **LDAP Recycle Bin scan** | Tombstoned privileged accounts matching `admin/svc_/ca_/oper/backup/cert/sql/iis/dba/...` name heuristics or admin group memberships | After every successful compromise, per identity with NTLM-auth creds |
 
-Each enumerator contributes synthetic edges that appear in the next round's target table tagged with their discovery method (e.g. `ldap:recycle-bin`). Pathstrike prefers BH-sourced multi-hop paths over synthetic single-hops when both point at the same target.
+Each enumerator contributes synthetic edges that appear in the next round's target table tagged with their discovery method. Pathstrike prefers BH-sourced multi-hop paths over synthetic single-hops when both point at the same target.
 
 ---
 
