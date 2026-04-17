@@ -210,20 +210,23 @@ def build_shortest_path_to_target_query(
     return query, None
 
 
-def build_reachable_targets_query(
+def build_reachable_target_names_query(
     source_name: str,
     max_depth: int = 10,
 ) -> tuple[str, None]:
-    """Find ALL reachable targets from source with exploitable edges.
+    """Find the NAMES of all reachable User/Group/Computer/Domain targets.
 
-    Broader than high-value-only — discovers any node reachable via
-    exploitation edges.  Used for post-escalation re-discovery.
+    Returns scalar literals (name/objectid/labels) instead of paths.
+    This is the first half of the two-step reachable-targets discovery:
+    first enumerate target names here, then call
+    :func:`build_shortest_path_to_target_query` per target to get each
+    concrete path as a separate Cypher query.
 
-    Enumerates candidate targets first (User/Group/Computer/Domain),
-    then finds the shortest path from source to each.  This two-stage
-    pattern is required because ``shortestPath((s)-[*]->(t))`` with
-    only ``s`` bound collapses to a single overall shortest match in
-    BH CE's Cypher planner — losing every other reachable target.
+    Why two steps: BH CE's Cypher endpoint returns a single flat graph
+    (one ``nodes`` dict + one ``edges`` array) regardless of how many
+    paths match.  Individual path grouping is lost, so the parser can't
+    reconstruct discrete paths from a ``RETURN p LIMIT 50`` response.
+    Doing one-path-per-query sidesteps that entirely.
 
     Args:
         source_name: Fully qualified source.
@@ -242,9 +245,24 @@ def build_reachable_targets_query(
         f"MATCH p=shortestPath("
         f"(s {{name: '{src}'}})-[{edge_filter}*1..{max_depth}]->(t)"
         f") "
-        f"RETURN p LIMIT 50"
+        f"RETURN DISTINCT t.name AS name, t.objectid AS objectid, "
+        f"labels(t) AS labels "
+        f"LIMIT 50"
     )
     return query, None
+
+
+def build_reachable_targets_query(
+    source_name: str,
+    max_depth: int = 10,
+) -> tuple[str, None]:
+    """Legacy alias — kept for backwards compatibility.
+
+    Returns the same query as :func:`build_reachable_target_names_query`.
+    New callers should use the names-only query plus per-target
+    shortest-path queries for accurate path reconstruction.
+    """
+    return build_reachable_target_names_query(source_name, max_depth)
 
 
 def build_outbound_edges_query(node_name: str) -> tuple[str, None]:

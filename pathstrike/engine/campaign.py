@@ -25,7 +25,7 @@ from rich.table import Table
 from pathstrike.bloodhound.client import BloodHoundClient
 from pathstrike.bloodhound.cypher import (
     build_high_value_nodes_query,
-    build_reachable_targets_query,
+    build_reachable_target_names_query,
     build_shortest_path_to_target_query,
     build_trust_map_query,
 )
@@ -363,38 +363,72 @@ class CampaignOrchestrator:
     ) -> list[AttackPath]:
         """Query BH CE for paths to ALL exploitable reachable nodes.
 
-        Unlike :meth:`_discover_paths`, this does NOT restrict targets to
-        high-value principals.  It returns paths to any reachable
-        User/Group/Computer/Domain node via handler-backed edges, enabling
-        opportunistic escalation through non-privileged intermediates
-        (e.g. a non-admin group that ACLs into a service account).
+        Two-step discovery:
+
+        1. Enumerate every reachable User/Group/Computer/Domain name via
+           :func:`build_reachable_target_names_query`.
+        2. Run :func:`build_shortest_path_to_target_query` per target to
+           retrieve a discrete path.
+
+        This mirrors :meth:`_discover_paths` (the high-value variant).
+        It's needed because BH CE's Cypher endpoint returns a single
+        flat graph when multiple paths match a ``RETURN p`` query —
+        individual paths are lost, so Pathstrike can only reliably parse
+        one path per query.
 
         Well-known pseudo-principals (EVERYONE, SCHANNEL AUTHENTICATION,
         etc.) are filtered out — they're implicit targets for every
         principal in AD and aren't useful escalation destinations.
         """
-        query, _ = build_reachable_targets_query(
+        # Step 1: enumerate reachable target names
+        names_query, _ = build_reachable_target_names_query(
             identity, max_depth=self.max_depth,
         )
         try:
-            response = await self.bh_client.cypher_query(query)
-            paths = parse_cypher_response(response)
+            names_response = await self.bh_client.cypher_query(names_query)
         except Exception as exc:
-            logger.warning("Reachable-targets discovery failed: %s", exc)
+            logger.warning("Reachable-target name discovery failed: %s", exc)
             return []
 
-        filtered = [
-            p for p in paths
-            if p.target.name != identity
-            and p.target.name not in self.completed_targets
-            and not self._is_well_known_principal(p.target.name)
+        target_names: list[str] = []
+        literals = names_response.get("data", {}).get("literals", [])
+        for lit in literals:
+            if lit.get("key") == "name" and lit.get("value"):
+                target_names.append(lit["value"])
+
+        if not target_names:
+            logger.info("No reachable targets found from %s", identity)
+            return []
+
+        # Filter well-knowns and already-completed up front so we don't
+        # waste round-trips on per-target queries we'd throw away.
+        filtered_names = [
+            n for n in target_names
+            if n != identity
+            and n not in self.completed_targets
+            and not self._is_well_known_principal(n)
         ]
+        pseudo_count = len(target_names) - len(filtered_names)
+
+        # Step 2: fetch a discrete shortest path per surviving target.
+        all_paths: list[AttackPath] = []
+        for target_name in filtered_names:
+            path_query, _ = build_shortest_path_to_target_query(
+                identity, target_name,
+            )
+            try:
+                response = await self.bh_client.cypher_query(path_query)
+                paths = parse_cypher_response(response)
+                all_paths.extend(paths)
+            except Exception as exc:
+                logger.debug("No path to %s: %s", target_name, exc)
+
         logger.info(
             "Discovered %d reachable path(s) from %s "
-            "(%d well-known pseudo-principals filtered)",
-            len(filtered), identity, len(paths) - len(filtered),
+            "(%d targets enumerated, %d pseudo-principals filtered)",
+            len(all_paths), identity, len(target_names), pseudo_count,
         )
-        return filtered
+        return all_paths
 
     async def _discover_trust_escalation(self) -> list[AttackPath]:
         """Check for trust edges from compromised domains.
