@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-dark.svg" alt="Pathstrike" width="96">
+  </picture>
+</p>
+
 # PathStrike
 
 **Automated Active Directory attack path exploitation via BloodHound CE.**
