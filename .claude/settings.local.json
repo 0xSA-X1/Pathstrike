@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs -I {} head -20 {})",
+      "Bash(git -C C:/Users/sax1/Documents/GitHub/Pathstrike status)"
+    ]
+  }
+}
