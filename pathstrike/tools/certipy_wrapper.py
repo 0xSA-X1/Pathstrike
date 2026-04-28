@@ -118,8 +118,10 @@ async def run_certipy(
             )
             return result
 
-        # Attempt to extract structured data from the output
-        result["parsed"] = _parse_certipy_output(subcommand, stdout)
+        # certipy-ad writes all status lines to stderr (Python logging default);
+        # combine both streams so the parsers see the full output.
+        parse_source = "\n".join(filter(None, [stdout, stderr]))
+        result["parsed"] = _parse_certipy_output(subcommand, parse_source)
         result["success"] = True
         logger.debug("certipy %s succeeded: %s", subcommand, stdout[:200])
 
@@ -396,8 +398,14 @@ def _parse_auth_output(stdout: str) -> dict[str, Any] | None:
     """
     parsed: dict[str, Any] = {}
 
-    # NT hash extraction
-    nt_match = re.search(r"NT hash.*?:\s*([a-fA-F0-9]{32})", stdout)
+    # NT hash extraction — certipy prints "Got hash for 'user@domain': LM:NT"
+    nt_match = re.search(
+        r"Got hash for [^:]+:\s*[a-fA-F0-9]{32}:([a-fA-F0-9]{32})", stdout
+    )
+    if not nt_match:
+        nt_match = re.search(
+            r"NT hash.*?:\s*(?:[a-fA-F0-9]{32}:)?([a-fA-F0-9]{32})", stdout, re.DOTALL
+        )
     if nt_match:
         parsed["nt_hash"] = nt_match.group(1).lower()
 
@@ -422,8 +430,8 @@ def _parse_shadow_output(stdout: str) -> dict[str, Any] | None:
     """Parse ``certipy shadow`` output for device ID and cert paths."""
     parsed: dict[str, Any] = {}
 
-    # Device ID from shadow credentials addition
-    device_match = re.search(r"Device ID: ([a-fA-F0-9-]+)", stdout, re.IGNORECASE)
+    # Device ID — certipy prints either "DeviceID 'uuid'" or "Device ID: uuid"
+    device_match = re.search(r"Device\s*ID[:\s'\"]+([a-fA-F0-9-]{36})", stdout, re.IGNORECASE)
     if device_match:
         parsed["device_id"] = device_match.group(1)
 
@@ -432,8 +440,16 @@ def _parse_shadow_output(stdout: str) -> dict[str, Any] | None:
     if pfx_match:
         parsed["pfx_path"] = pfx_match.group(1)
 
-    # NT hash from shadow auto (performs full chain)
-    nt_match = re.search(r"NT hash.*?:\s*([a-fA-F0-9]{32})", stdout)
+    # NT hash from shadow auto.
+    # certipy prints: "Got hash for 'user@domain': LM:NT"
+    nt_match = re.search(
+        r"Got hash for [^:]+:\s*[a-fA-F0-9]{32}:([a-fA-F0-9]{32})", stdout
+    )
+    if not nt_match:
+        # fallback for older / alternative output formats
+        nt_match = re.search(
+            r"NT hash.*?:\s*(?:[a-fA-F0-9]{32}:)?([a-fA-F0-9]{32})", stdout, re.DOTALL
+        )
     if nt_match:
         parsed["nt_hash"] = nt_match.group(1).lower()
 
