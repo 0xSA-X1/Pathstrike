@@ -57,6 +57,10 @@ class _QuietLive:
     def __enter__(self):
         pathstrike_logger = logging.getLogger("pathstrike")
         for handler in pathstrike_logger.handlers:
+            # File handlers don't conflict with the Live render — leave them
+            # alone so the session log keeps capturing during the campaign.
+            if isinstance(handler, logging.FileHandler):
+                continue
             self._prev_levels.append((handler, handler.level))
             handler.setLevel(logging.CRITICAL)
         self._live.__enter__()
