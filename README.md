@@ -96,12 +96,6 @@ pathstrike campaign
 
 # Greedy opportunistic escalation (no prompts, chases deepest reachable target)
 pathstrike auto
-
-# Discover-only: list reachable paths without executing
-pathstrike paths
-
-# Execute a specific path with explicit source
-pathstrike attack -s jsmith
 ```
 
 ---
@@ -112,11 +106,8 @@ pathstrike attack -s jsmith
 |---|---|
 | `pathstrike auto` | **Greedy reachable-targets exploitation** — escalate as far as possible from the source, chasing the deepest reachable exploitable node. Re-queries BH + live-enum after each successful step. |
 | `pathstrike campaign` | **Interactive step-through campaign** — enumerates every reachable exploitable node, prompts you to pick one per round, exploits it, re-queries. Use `--high-value-only` to restrict to Domain Admins / Tier Zero. |
-| `pathstrike paths` | Discover shortest attack paths from source to target (read-only) |
-| `pathstrike attack` | Execute a single discovered attack path end-to-end |
 | `pathstrike edges` | List all supported BloodHound edge types and their registered handlers |
 | `pathstrike verify` | Validate config, check that all tools are on PATH, test BH CE connectivity |
-| `pathstrike recon` | Detailed reconnaissance of a target node (group memberships, admin rights, sessions) |
 | `pathstrike domains` | Enumerate all AD domains from BloodHound |
 | `pathstrike kerberoast` | Targeted Kerberoasting attack |
 | `pathstrike asreproast` | AS-REP roasting attack |
