@@ -48,6 +48,116 @@ def _redact_cmd(cmd: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Failure-mode detection
+# ---------------------------------------------------------------------------
+#
+# Two recurring problems with certipy-ad v5 motivate the helpers below:
+#
+# 1. Lab DCs and older Windows installs frequently have a non-functional
+#    LDAPS listener (port 636 open but TLS handshake resets).  Certipy v5
+#    defaults to LDAPS and bails out with ``socket ssl wrapping error``.
+#    We detect that pattern in the captured output and auto-retry the
+#    command with ``-ldap-scheme ldap`` injected.
+#
+# 2. Certipy v5 sometimes exits with returncode 0 even when the underlying
+#    Kerberos / TLS / RPC operation failed (clock skew, PKINIT not
+#    supported, LDAPS reset).  Trusting the rc blindly leads handlers to
+#    interpret real failures as "tool succeeded but parser couldn't find
+#    anything", which is misleading and prevents the alternate-strategy
+#    fall-through in handlers like ACLHandler.  We re-read the captured
+#    output for known failure markers and reclassify those runs as
+#    ``success=False`` with a useful ``error`` field so handlers can
+#    route to their next strategy (e.g. bloodyAD shadow credentials).
+
+# Patterns indicating LDAPS-specific failure that plain LDAP could fix.
+_LDAPS_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"socket ssl wrapping error", re.IGNORECASE),
+    re.compile(r"\[SSL:[^\]]*\]\s*(?:tlsv1|wrong version|unknown protocol)",
+               re.IGNORECASE),
+    re.compile(r"SSL handshake.*?fail", re.IGNORECASE | re.DOTALL),
+)
+
+
+def _is_ldaps_handshake_error(result: dict[str, Any]) -> bool:
+    """True if the captured output points at LDAPS-side TLS failure."""
+    text = (result.get("output") or "") + "\n" + (result.get("stderr") or "")
+    return any(p.search(text) for p in _LDAPS_ERROR_PATTERNS)
+
+
+def _ldaps_error_summary(result: dict[str, Any]) -> str | None:
+    """Pull a concise one-line summary of the LDAPS failure for log lines."""
+    text = (result.get("output") or "") + "\n" + (result.get("stderr") or "")
+    for pattern in _LDAPS_ERROR_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line_end = text.find("\n", m.end())
+            if line_end == -1:
+                line_end = len(text)
+            return text[line_start:line_end].strip().lstrip("[-] ").strip()[:200]
+    return None
+
+
+def _args_specify_ldap_scheme(args: list[str]) -> bool:
+    """True if the caller already pinned ``-ldap-scheme`` (any value)."""
+    return any(
+        a == "-ldap-scheme" or a.startswith("-ldap-scheme=")
+        for a in args
+    )
+
+
+# Patterns indicating certipy returned rc=0 despite a real failure.
+# Order matters — the first match wins, so put specific patterns first.
+# A summary of None means "use the regex's first capture group as the
+# summary" (used for the generic TGT-failure catch-all).
+_SILENT_FAILURE_PATTERNS: tuple[tuple[re.Pattern[str], str | None], ...] = (
+    (re.compile(r"KRB_AP_ERR_SKEW", re.IGNORECASE),
+     "KDC clock skew too great — sync the local clock to the DC"),
+    (re.compile(r"Clock skew too great", re.IGNORECASE),
+     "KDC clock skew too great — sync the local clock to the DC"),
+    (re.compile(r"KDC_ERR_PADATA_TYPE_NOSUPP", re.IGNORECASE),
+     "KDC has no support for PKINIT (no KDC certificate installed on the DC)"),
+    (re.compile(r"KDC_ERR_CLIENT_NOT_TRUSTED", re.IGNORECASE),
+     "KDC does not trust the certificate (cert chain or NTAuthCertificates issue)"),
+    (re.compile(r"KDC_ERR_C_PRINCIPAL_UNKNOWN", re.IGNORECASE),
+     "KDC reports the client principal is unknown"),
+    (re.compile(r"socket ssl wrapping error", re.IGNORECASE),
+     "LDAPS SSL handshake failed against the DC"),
+    (re.compile(r"Connection reset by peer", re.IGNORECASE),
+     "Connection reset by remote peer"),
+    (re.compile(r"\[-\]\s*Got error while trying to request TGT[: ]+(.+)",
+                re.IGNORECASE),
+     None),
+    (re.compile(r"\[-\]\s*Got error[: ]+(.+)", re.IGNORECASE),
+     None),
+)
+
+
+def _detect_silent_failure(stdout: str, stderr: str) -> str | None:
+    """Detect cases where certipy exited 0 even though it actually failed.
+
+    Returns a one-line failure summary suitable for the result ``error``
+    field, or ``None`` when no failure indicators are present.
+    """
+    text = "\n".join(s for s in (stdout, stderr) if s)
+    if not text:
+        return None
+
+    for pattern, summary in _SILENT_FAILURE_PATTERNS:
+        m = pattern.search(text)
+        if m is None:
+            continue
+        if summary is not None:
+            return summary
+        # Use the first capture group as the summary (generic fallback).
+        try:
+            return m.group(1).strip().rstrip(".").strip()[:200]
+        except IndexError:
+            return m.group(0).strip()[:200]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
 
@@ -62,6 +172,24 @@ async def run_certipy(
     Subcommands supported: ``find``, ``req``, ``auth``, ``ca``, ``template``,
     ``forge``, ``shadow``, ``account``.
 
+    Two transparent reliability tweaks are applied around the raw
+    subprocess call:
+
+      * **LDAPS auto-retry** — if the first attempt fails with an LDAPS
+        TLS handshake error (common against lab DCs whose 636/tcp port
+        accepts connections but resets the handshake), the command is
+        retried with ``-ldap-scheme ldap`` injected.  The first
+        attempt's error summary is preserved on the result as
+        ``ldaps_first_error`` and ``ldaps_retry=True``.
+
+      * **Silent-failure reclassification** — certipy v5 sometimes exits
+        0 even when the operation it wrapped (Kerberos pre-auth, LDAPS
+        bind, RPC call) actually failed.  When known failure markers
+        appear in the output (clock skew, PKINIT-unsupported, SSL
+        reset, generic ``[-] Got error``), the wrapper marks
+        ``success=False`` so handlers fall through to alternate
+        strategies (e.g. bloodyAD shadow credentials in ACLHandler).
+
     Args:
         subcommand: The certipy subcommand to invoke.
         args: Additional CLI arguments for the subcommand.
@@ -70,6 +198,42 @@ async def run_certipy(
     Returns:
         Standardised result dict with ``success``, ``output``, ``parsed``,
         and ``error`` keys.
+    """
+    result = await _run_certipy_once(subcommand, args, timeout=timeout)
+
+    # LDAPS → plain-LDAP auto-retry, but only when the caller hasn't
+    # already pinned a scheme.
+    if _is_ldaps_handshake_error(result) and not _args_specify_ldap_scheme(args):
+        first_error = _ldaps_error_summary(result) or "LDAPS handshake failed"
+        logger.warning(
+            "certipy %s LDAPS attempt failed (%s); retrying with -ldap-scheme ldap",
+            subcommand, first_error,
+        )
+        retry_args = ["-ldap-scheme", "ldap"] + list(args)
+        retry_result = await _run_certipy_once(
+            subcommand, retry_args, timeout=timeout,
+        )
+        retry_result["ldaps_retry"] = True
+        retry_result["ldaps_first_error"] = first_error
+        if retry_result.get("success"):
+            logger.info(
+                "certipy %s succeeded after falling back to plain LDAP",
+                subcommand,
+            )
+        result = retry_result
+
+    return result
+
+
+async def _run_certipy_once(
+    subcommand: str,
+    args: list[str],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Execute a single certipy invocation. Caller orchestrates retries.
+
+    See :func:`run_certipy` for the public entrypoint that adds LDAPS
+    auto-retry and silent-failure reclassification on top of this.
     """
     from pathstrike.engine.time_sync import get_faketime_prefix
 
@@ -118,8 +282,35 @@ async def run_certipy(
             )
             return result
 
-        # certipy-ad writes all status lines to stderr (Python logging default);
-        # combine both streams so the parsers see the full output.
+        # rc=0, but inspect the captured output for silent-failure markers
+        # before claiming success.  certipy v5 exits 0 on several real
+        # failure modes (clock skew, PKINIT unsupported, LDAPS reset)
+        # and we want handlers to see those as failures so they fall
+        # through to alternate strategies.
+        silent_err = _detect_silent_failure(stdout, stderr)
+        if silent_err:
+            result["error"] = silent_err
+            result["error_type"] = "silent_failure"
+            result["full_stderr"] = stderr
+            # Annotate whether certipy printed its own "Successfully
+            # restored" marker — handlers can use this to decide whether
+            # AD state is clean enough to retry with a different tool.
+            combined = f"{stdout}\n{stderr}"
+            result["ad_state_restored"] = "Successfully restored" in combined
+            logger.warning(
+                "certipy %s exited 0 but output indicates failure: %s",
+                subcommand, silent_err,
+            )
+            logger.debug(
+                "certipy %s silent-failure full output:\n--- stdout ---\n%s\n"
+                "--- stderr ---\n%s",
+                subcommand, stdout, stderr,
+            )
+            return result
+
+        # Genuine success.  certipy-ad writes status lines to stderr by
+        # default (Python logging convention); combine both streams so
+        # the parsers see everything.
         parse_source = "\n".join(filter(None, [stdout, stderr]))
         result["parsed"] = _parse_certipy_output(subcommand, parse_source)
         result["success"] = True
