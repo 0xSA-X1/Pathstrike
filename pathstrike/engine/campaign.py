@@ -256,8 +256,7 @@ class CampaignOrchestrator:
                 selected = self._interactive_select(all_scored)
                 if selected is None:
                     console.print("[yellow]Campaign aborted by user.[/]")
-                    result.duration_seconds = time.time() - start_time
-                    return result
+                    break
                 execution_queue = [selected]
             elif self.mode == ExecutionMode.auto:
                 execution_queue = all_scored[:self.max_targets]
