@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from typer.testing import CliRunner
@@ -14,11 +17,30 @@ runner = CliRunner()
 class TestCLIEdges:
     """Tests for the 'edges' command."""
 
+    def test_cli_import_populates_registry(self):
+        """Importing pathstrike.cli must populate the edge registry as a side effect.
+
+        Run in a fresh subprocess so the assertion is not satisfied by another
+        test having previously imported pathstrike.handlers.  Regression guard
+        for the silent-empty-registry bug where `pathstrike edges` reported
+        zero handlers because cli.py never triggered handler registration.
+        """
+        code = (
+            "import pathstrike.cli;"
+            "from pathstrike.engine.edge_registry import list_handlers;"
+            "import sys; sys.exit(0 if len(list_handlers()) > 0 else 1)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, timeout=30,
+        )
+        assert result.returncode == 0, (
+            "importing pathstrike.cli left the edge registry empty.\n"
+            f"stdout: {result.stdout.decode(errors='replace')}\n"
+            f"stderr: {result.stderr.decode(errors='replace')}"
+        )
+
     def test_edges_shows_supported_types(self):
         """edges command should list registered handler edge types."""
-        # Import handlers to trigger registration
-        import pathstrike.handlers  # noqa: F401
-
         result = runner.invoke(app, ["edges"])
         assert result.exit_code == 0
         assert "Supported Edge Types" in result.output or "edge type" in result.output.lower()

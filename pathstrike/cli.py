@@ -24,6 +24,12 @@ from pathstrike.engine.rollback import RollbackManager
 from pathstrike.logging_setup import print_log_summary, setup_logging
 from pathstrike.models import Credential, CredentialType, ExecutionMode
 
+# Importing the handlers package runs every @register_handler decorator,
+# populating the edge registry.  Done at CLI import time so that read-only
+# commands like `pathstrike edges` see the full registry without first
+# having to load the orchestrator/campaign modules.
+import pathstrike.handlers  # noqa: F401, E402
+
 app = typer.Typer(
     name="pathstrike",
     help="AD Attack Path Automation via BloodHound CE",

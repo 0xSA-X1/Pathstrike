@@ -40,14 +40,6 @@ from pathstrike.engine.time_sync import (
 )
 from pathstrike.models import AttackPath, Credential, ExecutionMode, PathStep
 
-# Trigger handler registration by importing the handlers package.
-# Concrete handler modules use @register_handler which populates the registry
-# at import time.
-try:
-    import pathstrike.handlers  # noqa: F401
-except ImportError:
-    pass
-
 logger = logging.getLogger("pathstrike")
 console = Console()
 

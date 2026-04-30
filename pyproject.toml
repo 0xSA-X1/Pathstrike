@@ -21,4 +21,5 @@ dependencies = [
 pathstrike = "pathstrike.cli:app"
 
 [tool.setuptools.packages.find]
-where = ["."]
+include = ["pathstrike*"]
+namespaces = false
