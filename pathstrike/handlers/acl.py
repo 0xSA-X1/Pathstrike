@@ -80,9 +80,15 @@ class GenericAllHandler(BaseEdgeHandler):
         # so the rollback entry matches what was done at runtime.
         self._successful_strategy: str | None = None
 
+    # Structural targets: GenericAll/Write here is a precondition for the
+    # NEXT edge in the path (e.g. GenericAll on a GPO enables the GPLink
+    # step that runs pyGPOAbuse; GenericAll on an OU enables creating
+    # objects inside it). Pathstrike treats these as pass-through.
+    _STRUCTURAL_TARGETS = frozenset({"gpo", "ou", "container"})
+
     async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
         target_type = edge.target.label.lower()
-        supported = {"user", "group", "computer", "domain"}
+        supported = {"user", "group", "computer", "domain"} | self._STRUCTURAL_TARGETS
         if target_type not in supported:
             return False, f"Unsupported target type for GenericAll: {edge.target.label}"
         return True, f"GenericAll on {edge.target.label} target is supported"
@@ -150,6 +156,18 @@ class GenericAllHandler(BaseEdgeHandler):
                 if not result["success"]:
                     return False, f"Failed to grant DCSync: {result.get('error', 'unknown')}", []
                 return True, f"DCSync rights granted to {principal}", []
+
+            # ----- Structural targets (GPO / OU / Container): pass-through.
+            # No LDAP write needed here — the capability is the precondition
+            # for the next edge (e.g. GPLink runs pyGPOAbuse, Contains-then-X
+            # operates on a child object) which performs the real exploit.
+            case label if label in self._STRUCTURAL_TARGETS:
+                return (
+                    True,
+                    f"GenericAll on {edge.target.label} '{target}' verified — "
+                    f"exploitation deferred to next edge in path.",
+                    [],
+                )
 
             case _:
                 return False, f"Unsupported target type: {edge.target.label}", []
