@@ -1275,9 +1275,9 @@ def adcs(
             else:
                 console.print(
                     "[bold yellow]No vulnerable templates found.[/]\n"
-                    "[dim]Re-run with [bold]--all[/dim] to inventory every "
+                    "[dim]Re-run with [bold]--all[/bold] to inventory every "
                     "template (including non-vulnerable ones), or with a "
-                    "different [bold]--user[/dim] — different principals see "
+                    "different [bold]--user[/bold] — different principals see "
                     "different templates based on their enrollment rights.[/]"
                 )
             return
@@ -1296,7 +1296,8 @@ def adcs(
     except typer.Exit:
         raise
     except Exception as exc:
-        console.print(f"[bold red]Error:[/] {exc}")
+        from rich.markup import escape as _markup_escape
+        console.print(f"[bold red]Error:[/] {_markup_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 
