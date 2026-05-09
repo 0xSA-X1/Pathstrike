@@ -704,8 +704,18 @@ def _parse_req_output(stdout: str) -> dict[str, Any] | None:
     """Parse ``certipy req`` output to extract the PFX path."""
     parsed: dict[str, Any] = {}
 
-    # certipy req writes: "Saved certificate and private key to '<name>.pfx'"
-    pfx_match = re.search(r"Saved certificate and private key to '(.+?\.pfx)'", stdout)
+    # Certipy versions vary in which message they print:
+    #   v4 / older v5: "Saved certificate and private key to 'X.pfx'"
+    #   v5.0.4+:       "Saving certificate and private key to 'X.pfx'"
+    #                  "Wrote certificate and private key to 'X.pfx'"
+    # Match all three so the parser doesn't silently lose the PFX path
+    # on the user's actual installed version — that bug manifested as
+    # `Certificate request succeeded but no PFX path in output` even
+    # when the cert had been issued correctly.
+    pfx_match = re.search(
+        r"(?:Saved|Saving|Wrote) certificate and private key to '(.+?\.pfx)'",
+        stdout,
+    )
     if pfx_match:
         parsed["pfx_path"] = pfx_match.group(1)
 
@@ -740,8 +750,10 @@ def _parse_auth_output(stdout: str) -> dict[str, Any] | None:
     if nt_match:
         parsed["nt_hash"] = nt_match.group(1).lower()
 
-    # ccache file path
-    ccache_match = re.search(r"Saved credential cache to '(.+?\.ccache)'", stdout)
+    # ccache file path — certipy v5.0.4 says "Saving"/"Wrote", not "Saved"
+    ccache_match = re.search(
+        r"(?:Saved|Saving|Wrote) credential cache to '(.+?\.ccache)'", stdout,
+    )
     if ccache_match:
         parsed["ccache_path"] = ccache_match.group(1)
 
@@ -766,8 +778,11 @@ def _parse_shadow_output(stdout: str) -> dict[str, Any] | None:
     if device_match:
         parsed["device_id"] = device_match.group(1)
 
-    # PFX path from shadow auto/add
-    pfx_match = re.search(r"Saved certificate and private key to '(.+?\.pfx)'", stdout)
+    # PFX path from shadow auto/add — see _parse_req_output comment.
+    pfx_match = re.search(
+        r"(?:Saved|Saving|Wrote) certificate and private key to '(.+?\.pfx)'",
+        stdout,
+    )
     if pfx_match:
         parsed["pfx_path"] = pfx_match.group(1)
 
@@ -784,8 +799,10 @@ def _parse_shadow_output(stdout: str) -> dict[str, Any] | None:
     if nt_match:
         parsed["nt_hash"] = nt_match.group(1).lower()
 
-    # ccache from shadow auto
-    ccache_match = re.search(r"Saved credential cache to '(.+?\.ccache)'", stdout)
+    # ccache from shadow auto — see _parse_req_output comment.
+    ccache_match = re.search(
+        r"(?:Saved|Saving|Wrote) credential cache to '(.+?\.ccache)'", stdout,
+    )
     if ccache_match:
         parsed["ccache_path"] = ccache_match.group(1)
 
@@ -796,8 +813,14 @@ def _parse_template_output(stdout: str) -> dict[str, Any] | None:
     """Parse ``certipy template`` output for saved configuration."""
     parsed: dict[str, Any] = {}
 
-    # Old template config backup path
-    old_match = re.search(r"Saved old configuration.*?'(.+?\.json)'", stdout)
+    # Old template config backup path.  certipy v5 wording varies:
+    # "Saved old configuration to ..." (older), "Saving configuration to ..."
+    # (v5.0.4), "Wrote configuration to ...".  Match all three so the
+    # restore step always has a path to roll back from.
+    old_match = re.search(
+        r"(?:Saved|Saving|Wrote)\s+(?:old\s+)?configuration.*?'(.+?\.json)'",
+        stdout,
+    )
     if old_match:
         parsed["old_config_path"] = old_match.group(1)
 
