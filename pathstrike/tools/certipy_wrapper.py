@@ -650,9 +650,19 @@ def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
                         ca_name = s
                         break
 
-        # Iterate ESC lines within the block
+        # Iterate ESC lines within the block.
+        #
+        # Lookahead variants:
+        #   * ``\n\s*(?:ESC\d|\[|Template|$)`` — next section header,
+        #     or end-of-block following a trailing newline.
+        #   * ``$`` (outer) — end-of-string with NO preceding newline,
+        #     which is what we get when the captured stdout has been
+        #     ``.strip()``-ed by ``_run_certipy_once``.  Without this
+        #     alternative the LAST ESC finding in the LAST template is
+        #     silently dropped — see the bug where stripped stdout
+        #     ending in ``permissions.`` produced zero findings.
         for m in re.finditer(
-            r"ESC(\d+[a-z]?)\s*:\s*(.+?)(?=\n\s*(?:ESC\d|\[|Template|$))",
+            r"ESC(\d+[a-z]?)\s*:\s*(.+?)(?=\n\s*(?:ESC\d|\[|Template|$)|$)",
             block, re.DOTALL,
         ):
             esc = f"ESC{m.group(1).upper()}"
