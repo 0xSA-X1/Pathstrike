@@ -262,11 +262,15 @@ async def _run_certipy_once(
     try:
         # When auto-confirming a prompt (input_data set), open stdin
         # as a pipe so communicate() can write to it.  Otherwise leave
-        # stdin attached to the parent's null device so certipy gets
-        # an immediate EOF on any unexpected read.
+        # stdin inherited from the parent process — pinning it to
+        # ``DEVNULL`` causes certipy v5 ``req`` to bail with
+        # ``EOFError: EOF when reading a line`` because some of its
+        # internal flows call ``input()`` (e.g. during auth fallback)
+        # and a closed stdin trips that immediately even when no
+        # prompt is actually shown to the user.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if input_data is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
