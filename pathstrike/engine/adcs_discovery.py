@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from rich.table import Table
 
@@ -27,6 +27,9 @@ from pathstrike.config import PathStrikeConfig
 from pathstrike.engine.credential_store import CredentialStore
 from pathstrike.models import CredentialType
 from pathstrike.tools.certipy_wrapper import certipy_find
+
+if TYPE_CHECKING:
+    from pathstrike.bloodhound.client import BloodHoundClient
 
 logger = logging.getLogger("pathstrike.engine.adcs_discovery")
 
@@ -67,6 +70,14 @@ class AdcsDiscoveryResult:
     discovered during enumeration — useful even when no vulnerabilities
     are found, as a smoke test that ADCS is even installed.
 
+    ``impersonate_user`` / ``impersonate_sid`` describe the principal
+    PathStrike would use as the certipy ``-upn`` / ``-sid`` arguments
+    if the caller proceeded to exploitation.  Populated when the caller
+    requested impersonation resolution (CLI ``--impersonate``, campaign
+    config, …) so the table can show what *would* happen alongside
+    discovery.  ``None`` for both means "discovery only — no
+    impersonation resolved."
+
     ``raw`` is the underlying certipy_find result dict — preserved so
     debug callers can inspect ``json_path`` / ``stderr`` / etc. without
     needing a second roundtrip.
@@ -77,6 +88,8 @@ class AdcsDiscoveryResult:
     findings: list[AdcsFinding] = field(default_factory=list)
     cas: list[str] = field(default_factory=list)
     identity: str = ""
+    impersonate_user: str | None = None
+    impersonate_sid: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -236,6 +249,93 @@ async def discover_adcs(
     )
 
 
+async def resolve_impersonation_for_result(
+    result: AdcsDiscoveryResult,
+    *,
+    config: PathStrikeConfig,
+    bh_client: "BloodHoundClient | None",
+    impersonate_override: str | None = None,
+) -> AdcsDiscoveryResult:
+    """Populate ``impersonate_user`` / ``impersonate_sid`` on a discovery result.
+
+    Resolution chain for the username:
+
+    1. *impersonate_override* — what the user passed via CLI ``--impersonate``.
+    2. ``config.target.adcs_impersonate`` from pathstrike.yaml.
+    3. ``"administrator"`` as a final default.
+
+    SID lookup goes to BloodHound (fail-soft — see :func:`lookup_principal_sid`).
+
+    Mutates and returns the same result for chaining.  Safe to call
+    even when *result.ok* is ``False`` — we just skip the lookup.
+    """
+    if not result.ok:
+        return result
+
+    user = (
+        impersonate_override
+        or getattr(config.target, "adcs_impersonate", None)
+        or "administrator"
+    )
+    user = str(user).split("@", 1)[0]
+    domain = config.domain.name
+
+    sid = await lookup_principal_sid(bh_client, user, domain)
+
+    result.impersonate_user = user
+    result.impersonate_sid = sid
+    return result
+
+
+# ---------------------------------------------------------------------------
+# SID lookup (BloodHound, fail-soft)
+# ---------------------------------------------------------------------------
+
+
+async def lookup_principal_sid(
+    bh_client: "BloodHoundClient | None",
+    name: str,
+    domain: str,
+) -> str | None:
+    """Resolve an AD principal's SID via BloodHound — fail-soft.
+
+    Returns ``None`` rather than raising when:
+      * *bh_client* is ``None`` (no BH configured / no connection available).
+      * BloodHound has no node with the given name (was never collected,
+        or stale ingest).
+      * The Cypher request errors out for any reason.
+
+    Callers should treat ``None`` as "skip the ``-sid`` arg" — certipy
+    will succeed against environments that don't enforce the May 2022
+    ``szOID_NTDS_CA_SECURITY_EXT`` mitigation, which is most labs.
+    Modern hardened AD requires the SID; in that case the ESC handler's
+    PKINIT step will surface a clear ``KDC_ERR_CLIENT_NOT_TRUSTED``
+    error and the user can rerun once BH has the principal.
+    """
+    if bh_client is None:
+        return None
+
+    from pathstrike.bloodhound.cypher import build_object_id_lookup_query
+
+    if "@" in name:
+        fq_name = name
+    else:
+        fq_name = f"{name}@{domain}"
+
+    query, _ = build_object_id_lookup_query(fq_name)
+    try:
+        response = await bh_client.cypher_query(query)
+    except Exception as exc:
+        logger.debug("BH SID lookup failed for %s: %s", fq_name, exc)
+        return None
+
+    literals = (response or {}).get("data", {}).get("literals", []) or []
+    for lit in literals:
+        if lit.get("key") == "sid" and lit.get("value"):
+            return str(lit["value"])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -247,9 +347,26 @@ def render_findings_table(result: AdcsDiscoveryResult) -> Table:
     The table is empty (zero rows) when no findings were produced — the
     caller should print a separate "no vulnerabilities found" message
     in that case so the user gets a clear signal.
+
+    The title surfaces the resolved impersonation target + SID-lookup
+    status when those are populated, so users can verify ahead of
+    exploit which principal PathStrike will impersonate via SAN.
     """
+    title = f"ADCS Findings ({result.identity})"
+    if result.impersonate_user:
+        if result.impersonate_sid:
+            title += (
+                f" — impersonating {result.impersonate_user.upper()} "
+                f"(SID: {result.impersonate_sid})"
+            )
+        else:
+            title += (
+                f" — impersonating {result.impersonate_user.upper()} "
+                "(SID: not in BH; -sid omitted)"
+            )
+
     table = Table(
-        title=f"ADCS Findings ({result.identity})",
+        title=title,
         show_header=True,
         header_style="bold cyan",
     )

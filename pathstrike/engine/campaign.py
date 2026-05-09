@@ -935,7 +935,10 @@ class CampaignOrchestrator:
         if identity in self._adcs_enumerated_identities:
             return
 
-        from pathstrike.engine.adcs_discovery import discover_adcs
+        from pathstrike.engine.adcs_discovery import (
+            discover_adcs,
+            lookup_principal_sid,
+        )
 
         logger.info(
             "Live-enum (ADCS): running `certipy find -vulnerable` as %s", identity,
@@ -964,6 +967,32 @@ class CampaignOrchestrator:
             )
             return
 
+        # Resolve the impersonation target ONCE per ADCS enum pass —
+        # most labs use a single config-driven principal (Administrator
+        # by default).  BH SID lookup is fail-soft: when BH doesn't know
+        # the principal we omit `-sid` and certipy works on
+        # un-mitigated environments anyway.  See
+        # ``_resolve_adcs_impersonation_target`` in adcs.py for the
+        # full resolution chain.
+        impersonate_user = (
+            self.config.target.adcs_impersonate or "administrator"
+        ).split("@", 1)[0]
+        impersonate_sid = await lookup_principal_sid(
+            self.bh_client, impersonate_user, domain,
+        )
+        if impersonate_sid:
+            logger.info(
+                "Live-enum (ADCS): impersonation target=%s, SID=%s",
+                impersonate_user, impersonate_sid,
+            )
+        else:
+            logger.info(
+                "Live-enum (ADCS): impersonation target=%s, SID=<not found in BH> "
+                "— certipy req will be invoked without -sid (works on labs "
+                "without the May 2022 PKINIT mitigation).",
+                impersonate_user,
+            )
+
         domain_node = domain.upper()  # BH domain nodes use the FQDN as `name`
 
         added = 0
@@ -982,15 +1011,19 @@ class CampaignOrchestrator:
             if not source:
                 source = identity
 
-            # ADCS handlers (adcs.py) require ca_name + template_name in
-            # edge.properties — without them check_prerequisites bails
-            # before exploitation.  Pass them through so synthetic edges
-            # are exploitable, not just discoverable.
+            # ADCS handlers (adcs.py) read these from edge.properties.
+            # Without ca_name + template_name the prereq check fails;
+            # without impersonate_user the handler builds a UPN from
+            # the edge target (which is the domain for synthetic edges
+            # → broken UPN like ``SENDAI.VL@sendai.vl``).
             properties = {
                 "ca_name": finding.ca_name,
                 "template_name": finding.template,
                 "esc": finding.esc,
+                "impersonate_user": impersonate_user,
             }
+            if impersonate_sid:
+                properties["impersonate_sid"] = impersonate_sid
 
             # Target of an ADCS escalation is the domain (→ DA in practice).
             if self.capability_graph.add_edge(

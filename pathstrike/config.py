@@ -41,6 +41,13 @@ class TargetConfig(BaseModel):
     group: str = "DOMAIN ADMINS"
     custom_target: str | None = None
 
+    # Principal to impersonate when an ADCS escalation lets us pick any
+    # target (ESC1, ESC4, ESC6, ESC9, ESC10, ESC2, ESC5).  Defaults to
+    # the well-known Administrator account.  Override via
+    # ``target.adcs_impersonate: alice`` in pathstrike.yaml or with
+    # ``--impersonate alice`` on ``pathstrike adcs`` / ``pathstrike campaign``.
+    adcs_impersonate: str = "administrator"
+
 
 class ExecutionConfig(BaseModel):
     """Runtime behavior settings."""

