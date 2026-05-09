@@ -936,7 +936,17 @@ async def certipy_request(
     if sid:
         args.extend(["-sid", sid])
 
-    return await run_certipy("req", args, timeout=timeout)
+    # Auto-confirm certipy v5's file-overwrite prompt — when the output
+    # PFX already exists from a previous run, certipy asks
+    # ``File 'x.pfx' already exists. Overwrite? (y/n - saying no will save
+    # with a unique filename)``.  In subprocess mode that prompt reads
+    # from stdin and trips ``EOFError: EOF when reading a line`` which
+    # certipy's higher-level error handler sometimes surfaces as the
+    # cryptic ``The NETBIOS connection with the remote host timed out``
+    # — both end the same way: cert request silently fails after the
+    # cert was actually issued.  ``y`` overwrites the file and lets the
+    # parser pick up the PFX path normally.
+    return await run_certipy("req", args, timeout=timeout, input_data=b"y\n")
 
 
 async def certipy_auth(
