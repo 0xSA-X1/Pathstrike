@@ -402,11 +402,15 @@ def _parse_find_output(stdout: str) -> dict[str, Any] | None:
         certipy saved them)
       * ``vulnerabilities``: deduplicated list of ESC labels seen
         (``["ESC1", "ESC4", ...]``)
+      * ``cas``: deduplicated list of Certificate Authority names
+        observed in the output (only populated when JSON output is
+        available — text-mode parsing rarely sees CAs by name)
       * ``findings``: list of per-template dicts
         ``{"template": str, "esc": str, "edge_type": str,
-           "principal": str}`` — one entry per (template × ESC × principal)
-        tuple.  ``edge_type`` is the BloodHound-compatible label
-        (e.g. ``"ADCSESC1"``).
+           "ca_name": str, "principal": str}`` — one entry per
+        (template × ESC × principal) tuple.  ``edge_type`` is the
+        BloodHound-compatible label (e.g. ``"ADCSESC1"``).  ``ca_name``
+        is the Enabled-on CA when known and an empty string otherwise.
     """
     parsed: dict[str, Any] = {}
 
@@ -430,12 +434,15 @@ def _parse_find_output(stdout: str) -> dict[str, Any] | None:
 
     # Structured findings: prefer the JSON file if available.
     findings: list[dict[str, str]] = []
+    cas: list[str] = []
     if "json_path" in parsed:
-        findings = _extract_findings_from_json(parsed["json_path"])
+        findings, cas = _extract_findings_and_cas_from_json(parsed["json_path"])
     if not findings:
         findings = _extract_findings_from_text(stdout)
     if findings:
         parsed["findings"] = findings
+    if cas:
+        parsed["cas"] = cas
 
     return parsed if parsed else None
 
@@ -464,24 +471,89 @@ _ESC_TO_BH_EDGE: dict[str, str] = {
 }
 
 
-def _extract_findings_from_json(json_path: str) -> list[dict[str, str]]:
-    """Load certipy's JSON output and extract ESC findings.
+def _extract_template_ca_names(tpl: dict[str, Any]) -> list[str]:
+    """Pull the CA name(s) a template is enabled on from a JSON template entry.
 
-    certipy's JSON schema (v4 / v5) contains a ``Certificate Templates``
-    section keyed by template index, each template having an optional
-    ``[!] Vulnerabilities`` sub-dict keyed by ESC name.  Values are
-    human-readable strings that usually quote the principal(s) that can
-    exploit the finding.
+    Certipy's JSON layout has shifted between releases — different
+    versions surface the enabled-on CAs under different keys.  We try
+    every known shape and dedup the result so consumers get a stable
+    list regardless of certipy version.
+    """
+    candidates: list[str] = []
+    for key in (
+        "Certificate Authorities",  # v4 with -json
+        "Enabled",                   # some v5 builds use this for CA list
+        "CA Name",                   # rare single-string field
+        "CAs",
+    ):
+        val = tpl.get(key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, str) and item.strip():
+                    candidates.append(item.strip())
+        elif isinstance(val, str) and val.strip():
+            candidates.append(val.strip())
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for ca in candidates:
+        if ca not in seen:
+            seen.add(ca)
+            unique.append(ca)
+    return unique
+
+
+def _extract_cas_from_json_root(data: dict[str, Any]) -> list[str]:
+    """Pull all CA names from the top-level ``Certificate Authorities`` section."""
+    cas_section = data.get("Certificate Authorities") or {}
+    if isinstance(cas_section, dict):
+        iterator = cas_section.values()
+    elif isinstance(cas_section, list):
+        iterator = cas_section
+    else:
+        return []
+
+    seen: set[str] = set()
+    names: list[str] = []
+    for entry in iterator:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("CA Name") or entry.get("Name") or ""
+        if name and name not in seen:
+            seen.add(name)
+            names.append(str(name))
+    return names
+
+
+def _extract_findings_and_cas_from_json(
+    json_path: str,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Load certipy's JSON output and extract ESC findings + CA name list.
+
+    certipy's JSON schema (v4 / v5) contains:
+      * a top-level ``Certificate Authorities`` section listing every CA
+        the enumeration discovered.
+      * a ``Certificate Templates`` section keyed by template index, each
+        template having an optional ``[!] Vulnerabilities`` sub-dict
+        keyed by ESC name and per-template ``Certificate Authorities``
+        (the CAs the template is enabled on).
+
+    Returns ``(findings, cas)`` — findings carry ``ca_name`` so handlers
+    can dispatch directly, and cas is the deduplicated set of all CA
+    names observed (useful for the standalone ``pathstrike adcs``
+    discovery command).
     """
     from pathlib import Path as _Path
 
     p = _Path(json_path)
     if not p.exists():
-        return []
+        return [], []
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return []
+        return [], []
+
+    cas_top = _extract_cas_from_json_root(data)
 
     findings: list[dict[str, str]] = []
     templates = data.get("Certificate Templates", {}) or {}
@@ -492,10 +564,24 @@ def _extract_findings_from_json(json_path: str) -> list[dict[str, str]]:
     else:
         iterator = []
 
+    seen_cas: set[str] = set(cas_top)
+    all_cas: list[str] = list(cas_top)
+
     for tpl in iterator:
         if not isinstance(tpl, dict):
             continue
         name = tpl.get("Template Name") or tpl.get("Display Name") or ""
+        tpl_cas = _extract_template_ca_names(tpl)
+        # Pick the first CA the template is enabled on as the canonical
+        # one for this finding — handlers only need a single CA name to
+        # request a cert.  Templates enabled on multiple CAs are rare
+        # but harmless: picking any enabled CA still works.
+        primary_ca = tpl_cas[0] if tpl_cas else ""
+        for ca in tpl_cas:
+            if ca not in seen_cas:
+                seen_cas.add(ca)
+                all_cas.append(ca)
+
         vulns = tpl.get("[!] Vulnerabilities") or tpl.get("Vulnerabilities") or {}
         if not isinstance(vulns, dict):
             continue
@@ -503,23 +589,27 @@ def _extract_findings_from_json(json_path: str) -> list[dict[str, str]]:
             esc_clean = esc.strip().upper()
             edge_type = _ESC_TO_BH_EDGE.get(esc_clean, f"ADCS{esc_clean}")
             desc_str = str(description)
-            for principal in _extract_principals(desc_str):
-                findings.append({
-                    "template": str(name),
-                    "esc": esc_clean,
-                    "edge_type": edge_type,
-                    "principal": principal,
-                })
-            if not _extract_principals(desc_str):
+            principals = _extract_principals(desc_str)
+            if principals:
+                for principal in principals:
+                    findings.append({
+                        "template": str(name),
+                        "esc": esc_clean,
+                        "edge_type": edge_type,
+                        "ca_name": primary_ca,
+                        "principal": principal,
+                    })
+            else:
                 # Record without principal — the handler may still match
                 # via its own enumeration, and at minimum we note the ESC.
                 findings.append({
                     "template": str(name),
                     "esc": esc_clean,
                     "edge_type": edge_type,
+                    "ca_name": primary_ca,
                     "principal": "",
                 })
-    return findings
+    return findings, all_cas
 
 
 def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
@@ -527,7 +617,9 @@ def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
 
     Splits stdout on ``Template Name`` markers to get per-template blocks,
     then looks for ``ESC<N>`` lines within each block and captures any
-    quoted principal names from the description.
+    quoted principal names from the description.  Best-effort scrapes
+    the ``Certificate Authorities`` line within the block to populate
+    ``ca_name`` — empty when absent.
     """
     findings: list[dict[str, str]] = []
     # Split on the "Template Name" field — the preamble before the first
@@ -536,6 +628,28 @@ def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
     for block in blocks[1:]:
         lines = block.splitlines()
         template = lines[0].strip() if lines else ""
+
+        # Best-effort CA name scrape from this template's block.
+        ca_match = re.search(
+            r"\n\s*Certificate Authorities\s*:\s*(.+)", block,
+        )
+        ca_name = ""
+        if ca_match:
+            # certipy prints either a single CA on the same line or a
+            # bullet list on subsequent lines — take the first non-empty
+            # token from either shape.
+            first = ca_match.group(1).strip().splitlines()[0].strip()
+            if first:
+                ca_name = first.lstrip("- ").strip()
+            else:
+                # Look one line down for the first bullet
+                tail = block[ca_match.end():].splitlines()
+                for ln in tail:
+                    s = ln.strip().lstrip("- ").strip()
+                    if s and not s.endswith(":"):
+                        ca_name = s
+                        break
+
         # Iterate ESC lines within the block
         for m in re.finditer(
             r"ESC(\d+[a-z]?)\s*:\s*(.+?)(?=\n\s*(?:ESC\d|\[|Template|$))",
@@ -550,6 +664,7 @@ def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
                     "template": template,
                     "esc": esc,
                     "edge_type": edge_type,
+                    "ca_name": ca_name,
                     "principal": principal,
                 })
     return findings

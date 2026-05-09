@@ -1119,6 +1119,197 @@ def trusts(
 
 
 @app.command()
+def adcs(
+    config: ConfigOption = None,
+    user: Annotated[
+        Optional[str],
+        typer.Option(
+            "--user",
+            "-u",
+            help="Authenticate as this user (sAMAccountName). Defaults to credentials.username from config.",
+        ),
+    ] = None,
+    all_templates: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="Run `certipy find` without `-vulnerable` (lists every template/CA, not just exploitable ones).",
+        ),
+    ] = False,
+    fmt: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: table (default), json, or csv.",
+        ),
+    ] = "table",
+    timeout: Annotated[
+        int,
+        typer.Option("--timeout", help="certipy subprocess timeout in seconds"),
+    ] = 120,
+    verbose: VerboseOption = False,
+) -> None:
+    """Discover ADCS Certificate Authorities and vulnerable templates via certipy.
+
+    Runs ``certipy find -vulnerable`` against the configured DC using
+    the credentials in ``pathstrike.yaml`` (or ``--user`` when you want
+    to enumerate from a different acquired identity already in the
+    credential store), then renders every (CA × template × ESC class)
+    finding it surfaces.
+
+    Useful when BloodHound's ADCS coverage is missing — SharpHound
+    needs ``-c CertServices`` to populate certificate templates and many
+    collection runs skip it.  This command works directly against AD CS
+    so it sees every template the authenticated principal can enroll
+    against, regardless of BH ingest state.
+
+    The output mirrors what you'd see from ``certipy find -vulnerable``
+    on the command line but with PathStrike's edge-type mapping
+    applied, so the ``Edge Type`` column tells you exactly which
+    handler would exploit each finding (e.g. ``ADCSESC1``,
+    ``ADCSESC9a``).
+
+    Use [bold]--all[/] to inventory every CA/template (no
+    ``-vulnerable`` filter), useful for spotting templates that
+    BloodHound missed entirely.
+
+    [dim]This command is read-only — it does not request certificates,
+    modify templates, or change AD state.  Exploitation comes from the
+    matching ESC handler invoked by ``pathstrike attack`` /
+    ``pathstrike campaign``.[/]
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    fmt = fmt.lower()
+    if fmt not in {"table", "json", "csv"}:
+        console.print(
+            f"[bold red]Invalid --format:[/] {fmt} (expected table, json, or csv)"
+        )
+        raise typer.Exit(code=1)
+
+    if not shutil.which("certipy"):
+        console.print(
+            "[bold red]certipy not found on PATH.[/]\n"
+            "[dim]Install via:  pip install certipy-ad[/]"
+        )
+        raise typer.Exit(code=1)
+
+    cred_store = _seed_credential_store(cfg)
+    target_user = user or cfg.credentials.username
+
+    async def _run():
+        from pathstrike.engine.adcs_discovery import (
+            discover_adcs,
+            render_findings_table,
+        )
+
+        # Quiet status banner — keep the table itself center stage.
+        if fmt == "table":
+            console.print(
+                f"[bold]Running ADCS discovery as[/] [cyan]"
+                f"{target_user}@{cfg.domain.name.upper()}[/] "
+                f"[dim](certipy find{' -vulnerable' if not all_templates else ''}, "
+                f"target {cfg.domain.dc_fqdn or cfg.domain.dc_host})[/]\n"
+            )
+
+        result = await discover_adcs(
+            cfg,
+            cred_store,
+            username=target_user,
+            vulnerable=not all_templates,
+            timeout=timeout,
+        )
+
+        if not result.ok:
+            console.print(f"[bold red]ADCS discovery failed:[/] {result.error}")
+            raise typer.Exit(code=1)
+
+        if fmt == "json":
+            import json as _json
+            payload = {
+                "identity": result.identity,
+                "cas": result.cas,
+                "findings": [
+                    {
+                        "template": f.template,
+                        "esc": f.esc,
+                        "edge_type": f.edge_type,
+                        "ca_name": f.ca_name,
+                        "principal": f.principal,
+                    }
+                    for f in result.findings
+                ],
+            }
+            console.print(_json.dumps(payload, indent=2))
+            return
+
+        if fmt == "csv":
+            console.print("esc,template,ca_name,edge_type,principal")
+            for f in result.findings:
+                row = ",".join(
+                    _csv_escape(v) for v in
+                    (f.esc, f.template, f.ca_name, f.edge_type, f.principal)
+                )
+                console.print(row)
+            return
+
+        # table format
+        if result.cas:
+            ca_table = Table(title="Certificate Authorities", show_header=True, header_style="bold cyan")
+            ca_table.add_column("CA Name", style="yellow")
+            for ca in result.cas:
+                ca_table.add_row(ca)
+            console.print(ca_table)
+            console.print()
+
+        if not result.findings:
+            if all_templates:
+                console.print(
+                    "[bold yellow]No certificate templates returned.[/]\n"
+                    "[dim]Either AD CS is not deployed in the target domain, "
+                    "the authenticated principal cannot enumerate templates, "
+                    "or certipy returned an empty inventory.[/]"
+                )
+            else:
+                console.print(
+                    "[bold yellow]No vulnerable templates found.[/]\n"
+                    "[dim]Re-run with [bold]--all[/dim] to inventory every "
+                    "template (including non-vulnerable ones), or with a "
+                    "different [bold]--user[/dim] — different principals see "
+                    "different templates based on their enrollment rights.[/]"
+                )
+            return
+
+        console.print(render_findings_table(result))
+        console.print(
+            f"\n[dim]{len(result.findings)} finding(s) across "
+            f"{len(result.cas) or '?'} CA(s).  Exploit via "
+            "[bold]pathstrike campaign[/] (the matching ADCS handler "
+            "fires automatically once BloodHound or live discovery "
+            "surfaces the edge to the orchestrator).[/]"
+        )
+
+    try:
+        asyncio.run(_run())
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _csv_escape(value: str) -> str:
+    """Quote-escape a CSV field if it contains commas or quotes."""
+    if not value:
+        return ""
+    if any(ch in value for ch in (",", '"', "\n")):
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
+@app.command()
 def campaign(
     source: SourceOption = None,
     config: ConfigOption = None,

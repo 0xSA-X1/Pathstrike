@@ -180,6 +180,16 @@ class CampaignOrchestrator:
             f"[green]{initial_identity}[/]\n"
         )
 
+        # Live-enum the initial identity BEFORE the first discovery
+        # round so writeable objects, ADCS findings, and tombstoned
+        # privileged accounts visible to that principal surface into
+        # the capability graph from iteration 1.  Without this, the
+        # post-success hook (after :meth:`_execute_path`) only kicks
+        # in once a BH-known path has been exploited — fatal in
+        # environments where the only path to DA goes through ADCS
+        # and SharpHound was run without ``-c CertServices``.
+        await self._enumerate_live_capabilities()
+
         max_iterations = 20  # Safety limit to prevent infinite loops
         iteration = 0
         while iteration < max_iterations:
@@ -915,55 +925,50 @@ class CampaignOrchestrator:
         capability graph as synthetic ``ADCSESCx`` edges pointing at the
         domain root, so existing ADCS handlers (adcs.py) can exploit
         them during the next discovery round.
+
+        Each synthetic edge carries ``ca_name`` and ``template_name`` in
+        its ``properties`` payload — the ADCS handlers refuse to run
+        without these (see :meth:`ADCSESC1Handler.check_prerequisites`),
+        so propagating them is what lets BH-invisible ADCS findings
+        actually fire during the campaign.
         """
         if identity in self._adcs_enumerated_identities:
             return
 
-        certipy_auth = self._build_certipy_auth_args_for_identity(user, domain)
-        if not certipy_auth:
-            self._adcs_enumerated_identities.add(identity)
-            return
+        from pathstrike.engine.adcs_discovery import discover_adcs
 
-        from pathstrike.tools.certipy_wrapper import certipy_find
-
-        dc = self.config.domain.dc_fqdn or self.config.domain.dc_host
-        logger.info("Live-enum (ADCS): running `certipy find -vulnerable` as %s", identity)
-        try:
-            result = await certipy_find(
-                target=dc,
-                auth_args=certipy_auth,
-                vulnerable=True,
-                stdout=False,
-                timeout=120,
-            )
-        except Exception as exc:
-            logger.debug("certipy find failed for %s: %s", identity, exc)
-            self._adcs_enumerated_identities.add(identity)
-            return
+        logger.info(
+            "Live-enum (ADCS): running `certipy find -vulnerable` as %s", identity,
+        )
+        result = await discover_adcs(
+            self.config,
+            self.cred_store,
+            username=user,
+            domain=domain,
+            vulnerable=True,
+            timeout=120,
+        )
 
         self._adcs_enumerated_identities.add(identity)
 
-        if not result.get("success"):
+        if not result.ok:
             logger.debug(
                 "certipy find returned no data for %s: %s",
-                identity, result.get("error", "unknown"),
+                identity, result.error,
             )
             return
 
-        parsed = result.get("parsed") or {}
-        findings = parsed.get("findings", []) or []
-        if not findings:
-            logger.debug("certipy find: no vulnerable templates visible to %s", identity)
+        if not result.findings:
+            logger.debug(
+                "certipy find: no vulnerable templates visible to %s", identity,
+            )
             return
 
-        domain_upper = domain.upper()
-        domain_node = domain_upper  # BH domain nodes use the FQDN as `name`
+        domain_node = domain.upper()  # BH domain nodes use the FQDN as `name`
 
         added = 0
-        for finding in findings:
-            edge_type = finding.get("edge_type")
-            principal = finding.get("principal") or ""
-            if not edge_type:
+        for finding in result.findings:
+            if not finding.edge_type:
                 continue
 
             # Resolve the ESC's source principal:
@@ -971,18 +976,29 @@ class CampaignOrchestrator:
             # Otherwise fall back to the enumerating identity — since they
             # can see this vulnerability, it's actionable from their POV.
             source = (
-                _normalise_certipy_principal(principal, domain)
-                if principal else identity
+                _normalise_certipy_principal(finding.principal, domain)
+                if finding.principal else identity
             )
             if not source:
                 source = identity
 
+            # ADCS handlers (adcs.py) require ca_name + template_name in
+            # edge.properties — without them check_prerequisites bails
+            # before exploitation.  Pass them through so synthetic edges
+            # are exploitable, not just discoverable.
+            properties = {
+                "ca_name": finding.ca_name,
+                "template_name": finding.template,
+                "esc": finding.esc,
+            }
+
             # Target of an ADCS escalation is the domain (→ DA in practice).
             if self.capability_graph.add_edge(
                 source=source,
-                edge_type=edge_type,
+                edge_type=finding.edge_type,
                 target=domain_node,
-                source_method=f"certipy:find-vulnerable/{finding.get('esc', '?')}",
+                source_method=f"certipy:find-vulnerable/{finding.esc or '?'}",
+                properties=properties,
             ):
                 added += 1
 
