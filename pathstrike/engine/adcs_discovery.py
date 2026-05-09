@@ -179,11 +179,19 @@ async def discover_adcs(
     )
 
     try:
+        # Pass ``-stdout`` so certipy prints the full enumeration to
+        # stdout instead of writing it to a JSON file in cwd.  The
+        # JSON-file path certipy prints varies between v4 and v5
+        # (different "Saved JSON output to ..." wording), and missing
+        # the path means the parser silently sees zero findings.  Text
+        # parsing of the ``-stdout`` output is robust across versions
+        # and matches exactly what users see when they run certipy
+        # manually for verification.
         result = await certipy_find(
             target=dc_host,
             auth_args=auth_args,
             vulnerable=vulnerable,
-            stdout=False,
+            stdout=True,
             timeout=timeout,
         )
     except Exception as exc:
