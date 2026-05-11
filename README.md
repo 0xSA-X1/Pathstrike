@@ -28,6 +28,7 @@ PathStrike discovers and executes AD privilege escalation paths identified by Bl
 - **Kerberos Time Sync** — auto-detects clock skew against the DC; syncs system clock via `ntpdate/chronyd/net time/rdate`, and falls back to wrapping subprocesses with **libfaketime** when system sync fails (e.g. no sudo)
 - **Clean Console + Session Logs** — default output is terse; every run writes a full DEBUG log to `~/.pathstrike/logs/session_<timestamp>.log` and prints a one-line hint pointing at it if any warnings/errors occurred
 - **Reporting** — JSON and HTML attack reports with full step-by-step details
+- **ADCS** — Discover ADCS Certificate Authorities and vulnerable templates via `certipy` then exploit via `pathstrike campaign`
 
 ## Supported Edge Types
 
@@ -115,6 +116,8 @@ pathstrike auto
 | `pathstrike timesync` | Check or sync Kerberos clock offset against the DC |
 | `pathstrike rollback` | Reverse AD changes from a previous attack (reads rollback log JSON) |
 | `pathstrike checkpoints` | List and manage saved attack checkpoints |
+| `pathstrike trusts` | Enumerate domain trust relationships |
+| `pathstrike adcs` | Discover ADCS Certificate Authorities and vulnerable templates via `certipy` |
 
 ### When to use `auto` vs `campaign`
 
