@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -61,6 +63,18 @@ class BloodHoundClient:
             await instance._client.aclose()
             instance._client = None
 
+    # ------------------------------------------------------------------
+    # Rate-limit retry tunables
+    # ------------------------------------------------------------------
+    # BH CE returns 429 when its per-IP cypher rate limiter trips.  This
+    # is normal during a campaign — every successful compromise fans
+    # out into ~50 parallel path-discovery queries from the new owned
+    # identity.  Without retry, those queries fail and we miss the
+    # next round of attack paths.
+    _RATE_LIMIT_MAX_RETRIES: int = 6
+    _RATE_LIMIT_BASE_DELAY: float = 0.5   # seconds — first retry wait
+    _RATE_LIMIT_MAX_DELAY: float = 30.0   # cap for any single retry
+
     async def _request(
         self,
         method: str,
@@ -80,8 +94,19 @@ class BloodHoundClient:
             Parsed JSON response as a dict.
 
         Raises:
-            BloodHoundClientError: On non-2xx responses.
+            BloodHoundClientError: On non-2xx responses (after retry-eligible
+                statuses like 429 have exhausted their retry budget).
             RuntimeError: If called outside the async context manager.
+
+        Notes:
+            **HTTP 429 (rate-limited) retry**: BH CE's per-IP rate
+            limiter trips during the high-fanout discovery phase that
+            kicks in after every compromise (round 2 of a campaign
+            often issues 50+ parallel cypher queries from a newly
+            owned identity).  This method transparently retries those
+            with exponential backoff, honouring the ``Retry-After``
+            response header when the server provides one.  See
+            :attr:`_RATE_LIMIT_MAX_RETRIES` for the budget.
         """
         if self._client is None:
             raise RuntimeError(
@@ -97,27 +122,78 @@ class BloodHoundClient:
 
             body = _json.dumps(json_data).encode("utf-8")
 
-        headers = self._auth.sign_request(method=method, uri=uri, body=body)
-
         logger.debug("BH API %s %s", method, endpoint)
 
-        response = await self._client.request(
-            method=method,
-            url=endpoint,
-            headers=headers,
-            content=body if body else None,
-            params=params,
-        )
+        response: httpx.Response | None = None
+        delay = self._RATE_LIMIT_BASE_DELAY
+        for attempt in range(self._RATE_LIMIT_MAX_RETRIES + 1):
+            # Re-sign every attempt — the HMAC envelope embeds a fresh
+            # timestamp, so reusing headers across retries would risk
+            # the server rejecting subsequent attempts as stale.
+            headers = self._auth.sign_request(method=method, uri=uri, body=body)
+
+            response = await self._client.request(
+                method=method,
+                url=endpoint,
+                headers=headers,
+                content=body if body else None,
+                params=params,
+            )
+
+            if response.status_code != 429:
+                break
+
+            # 429: rate-limited.  Honour ``Retry-After`` if the server
+            # provides one (per RFC 7231 it's either a delta-seconds
+            # integer or an HTTP-date — BH CE sends the integer form).
+            # Otherwise back off exponentially with a small jitter so a
+            # batch of concurrent callers don't synchronise on the
+            # retry instant.
+            if attempt >= self._RATE_LIMIT_MAX_RETRIES:
+                # Exhausted — fall through to the error-handling block
+                # so the caller sees a 429 BloodHoundClientError.
+                break
+
+            retry_after_hdr = response.headers.get("Retry-After")
+            wait: float
+            if retry_after_hdr is not None:
+                try:
+                    wait = float(retry_after_hdr)
+                except ValueError:
+                    wait = delay
+            else:
+                wait = delay
+
+            wait = min(wait, self._RATE_LIMIT_MAX_DELAY)
+            # Add up to 25% jitter so concurrent retriers desync.
+            wait = wait + random.uniform(0, wait * 0.25)
+
+            logger.debug(
+                "BH API rate-limited (429) on %s %s — retry %d/%d in %.1fs",
+                method, endpoint, attempt + 1,
+                self._RATE_LIMIT_MAX_RETRIES, wait,
+            )
+
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, self._RATE_LIMIT_MAX_DELAY)
+
+        # ``response`` is guaranteed non-None: every loop iteration
+        # assigns it before any branch that might break.
+        assert response is not None
 
         if response.status_code >= 400:
             detail = response.text[:500]
             # Log level matches severity: 5xx = real server problems;
             # 404 = routine empty-result or missing optional endpoint (callers
-            # handle these); other 4xx = auth/permission issues worth flagging.
+            # handle these); 429 = rate-limit exhaustion (worth seeing but
+            # we already retried); other 4xx = auth/permission issues
+            # worth flagging.
             if response.status_code >= 500:
                 log_level = logging.ERROR
             elif response.status_code == 404:
                 log_level = logging.DEBUG
+            elif response.status_code == 429:
+                log_level = logging.WARNING
             else:
                 log_level = logging.WARNING
             logger.log(

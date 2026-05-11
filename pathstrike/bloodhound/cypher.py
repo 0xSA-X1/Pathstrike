@@ -105,6 +105,28 @@ def build_node_lookup_query(
     return query, None
 
 
+def build_object_id_lookup_query(name: str) -> tuple[str, None]:
+    """Build a Cypher query that returns just the objectid (SID) for a node.
+
+    Used by ADCS exploitation to populate ``-sid`` for ``certipy req`` —
+    fetching the full node would be wasteful when we only need the SID.
+
+    Args:
+        name: Fully-qualified node name (``USER@DOMAIN.FQDN``), case-insensitive.
+
+    Returns:
+        Tuple of (cypher_query, None).  The query returns a single literal
+        keyed ``sid`` containing the node's ``objectid``.  When the node
+        does not exist, the response's ``literals`` list is empty.
+    """
+    query = (
+        f"MATCH (n) "
+        f"WHERE toUpper(n.name) = '{_escape(name.upper())}' "
+        f"RETURN n.objectid AS sid LIMIT 1"
+    )
+    return query, None
+
+
 # ---------------------------------------------------------------------------
 # Kerberos attack discovery queries
 # ---------------------------------------------------------------------------

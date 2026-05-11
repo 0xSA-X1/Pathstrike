@@ -860,6 +860,18 @@ def auto(
         bool,
         typer.Option("--no-time-sync", help="Disable automatic ntpdate clock sync"),
     ] = False,
+    impersonate: Annotated[
+        Optional[str],
+        typer.Option(
+            "--impersonate",
+            help=(
+                "Principal to impersonate via SAN when an ADCS edge fires. "
+                "Overrides ``target.adcs_impersonate`` from the config. "
+                "Defaults to the configured value (which itself defaults to "
+                "``administrator``)."
+            ),
+        ),
+    ] = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Greedy reachable-targets exploitation — escalate as far as possible.
@@ -880,6 +892,9 @@ def auto(
     setup_logging(verbose=verbose)
     cfg = _load_config_or_exit(config)
 
+    if impersonate:
+        cfg.target.adcs_impersonate = impersonate
+
     source_name = _build_source_name(source, cfg)
 
     retry_policy = _build_retry_policy(cfg)
@@ -899,6 +914,7 @@ def auto(
         f"[bold]Max path depth:[/] {max_depth}\n"
         f"[bold]Max retries:[/] {retry_policy.max_retries}\n"
         f"[bold]Auto time sync:[/] {'disabled' if no_time_sync else 'enabled'}\n"
+        f"[bold]ADCS impersonate:[/] {cfg.target.adcs_impersonate}\n"
     )
 
     async def _run():
@@ -1129,6 +1145,18 @@ def adcs(
             help="Authenticate as this user (sAMAccountName). Defaults to credentials.username from config.",
         ),
     ] = None,
+    impersonate: Annotated[
+        Optional[str],
+        typer.Option(
+            "--impersonate",
+            help=(
+                "Principal to impersonate via SAN when an ADCS exploit fires. "
+                "Overrides ``target.adcs_impersonate`` from the config. "
+                "Defaults to the configured value (which itself defaults to "
+                "``administrator``)."
+            ),
+        ),
+    ] = None,
     all_templates: Annotated[
         bool,
         typer.Option(
@@ -1203,6 +1231,7 @@ def adcs(
         from pathstrike.engine.adcs_discovery import (
             discover_adcs,
             render_findings_table,
+            resolve_impersonation_for_result,
         )
 
         # Quiet status banner — keep the table itself center stage.
@@ -1223,8 +1252,38 @@ def adcs(
         )
 
         if not result.ok:
-            console.print(f"[bold red]ADCS discovery failed:[/] {result.error}")
+            from rich.markup import escape as _markup_escape
+            console.print(
+                f"[bold red]ADCS discovery failed:[/] "
+                f"{_markup_escape(str(result.error))}"
+            )
             raise typer.Exit(code=1)
+
+        # Resolve impersonation target + SID via BloodHound (fail-soft —
+        # we still render the table without -sid info if BH is unreachable
+        # or doesn't know the principal).  Done inside a try/except around
+        # the BH context manager so an unreachable / mis-configured BH
+        # never breaks pure-discovery flow.
+        from pathstrike.bloodhound.client import BloodHoundClient
+        try:
+            async with BloodHoundClient.connect(cfg.bloodhound) as bh_client:
+                await resolve_impersonation_for_result(
+                    result,
+                    config=cfg,
+                    bh_client=bh_client,
+                    impersonate_override=impersonate,
+                )
+        except Exception as exc:
+            console.print(
+                f"[dim]BH unavailable for SID lookup ({exc}); "
+                "rendering without SID.[/]"
+            )
+            await resolve_impersonation_for_result(
+                result,
+                config=cfg,
+                bh_client=None,
+                impersonate_override=impersonate,
+            )
 
         if fmt == "json":
             import json as _json
@@ -1275,9 +1334,9 @@ def adcs(
             else:
                 console.print(
                     "[bold yellow]No vulnerable templates found.[/]\n"
-                    "[dim]Re-run with [bold]--all[/dim] to inventory every "
+                    "[dim]Re-run with [bold]--all[/bold] to inventory every "
                     "template (including non-vulnerable ones), or with a "
-                    "different [bold]--user[/dim] — different principals see "
+                    "different [bold]--user[/bold] — different principals see "
                     "different templates based on their enrollment rights.[/]"
                 )
             return
@@ -1296,7 +1355,8 @@ def adcs(
     except typer.Exit:
         raise
     except Exception as exc:
-        console.print(f"[bold red]Error:[/] {exc}")
+        from rich.markup import escape as _markup_escape
+        console.print(f"[bold red]Error:[/] {_markup_escape(str(exc))}")
         raise typer.Exit(code=1) from exc
 
 
@@ -1340,6 +1400,18 @@ def campaign(
         bool,
         typer.Option("--no-time-sync", help="Disable automatic ntpdate clock sync"),
     ] = False,
+    impersonate: Annotated[
+        Optional[str],
+        typer.Option(
+            "--impersonate",
+            help=(
+                "Principal to impersonate via SAN when an ADCS edge fires "
+                "during the campaign.  Overrides ``target.adcs_impersonate`` "
+                "from the config.  Defaults to the configured value (which "
+                "itself defaults to ``administrator``)."
+            ),
+        ),
+    ] = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Interactive step-through attack campaign — exploit, requery, repeat.
@@ -1374,6 +1446,12 @@ def campaign(
     setup_logging(verbose=verbose)
     cfg = _load_config_or_exit(config)
 
+    # CLI-level override: stamp ``--impersonate`` onto the loaded config
+    # so every ADCS handler sees the same impersonation target via the
+    # config object (no separate plumbing path required).
+    if impersonate:
+        cfg.target.adcs_impersonate = impersonate
+
     source_name = _build_source_name(source, cfg)
 
     retry_policy = _build_retry_policy(cfg)
@@ -1395,6 +1473,7 @@ def campaign(
         f"[bold]Max path depth:[/] {max_depth}\n"
         f"[bold]Max retries:[/] {retry_policy.max_retries}\n"
         f"[bold]Auto time sync:[/] {'disabled' if no_time_sync else 'enabled'}\n"
+        f"[bold]ADCS impersonate:[/] {cfg.target.adcs_impersonate}\n"
     )
 
     async def _run():
