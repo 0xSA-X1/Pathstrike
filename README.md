@@ -28,7 +28,6 @@ PathStrike discovers and executes AD privilege escalation paths identified by Bl
 - **Kerberos Time Sync** — auto-detects clock skew against the DC; syncs system clock via `ntpdate/chronyd/net time/rdate`, and falls back to wrapping subprocesses with **libfaketime** when system sync fails (e.g. no sudo)
 - **Clean Console + Session Logs** — default output is terse; every run writes a full DEBUG log to `~/.pathstrike/logs/session_<timestamp>.log` and prints a one-line hint pointing at it if any warnings/errors occurred
 - **Reporting** — JSON and HTML attack reports with full step-by-step details
-- **ADCS** — Discover ADCS Certificate Authorities and vulnerable templates via `certipy` then exploit via `pathstrike campaign`
 
 ## Supported Edge Types
 
@@ -50,6 +49,8 @@ PathStrike discovers and executes AD privilege escalation paths identified by Bl
 | **Extended Access** | `AddAllowedToAct`, `WriteSPN`, `SyncLAPSPassword`, `HasSession` |
 | **Containment** | `Contains`, `ClaimSpecialIdentity` |
 | **Live-Enum Synthetic** | `RestorableFrom` (discovered by Pathstrike's live LDAP scan of `CN=Deleted Objects` — reanimates tombstoned privileged accounts) |
+
+> **Edge status:** all handlers are implemented. Two are environment-gated and may not complete against a hardened target: **`CoerceToTGT`** — coercion fires, but the SMB→LDAP relay is blocked by modern DC hardening (CVE-2019-1040 mitigation); and **`ADCSESC8`** — NTLM relay to AD CS HTTP web enrollment, which requires the web-enrollment endpoint to be present and reachable.
 
 ---
 
@@ -116,8 +117,6 @@ pathstrike auto
 | `pathstrike timesync` | Check or sync Kerberos clock offset against the DC |
 | `pathstrike rollback` | Reverse AD changes from a previous attack (reads rollback log JSON) |
 | `pathstrike checkpoints` | List and manage saved attack checkpoints |
-| `pathstrike trusts` | Enumerate domain trust relationships |
-| `pathstrike adcs` | Discover ADCS Certificate Authorities and vulnerable templates via `certipy` |
 
 ### When to use `auto` vs `campaign`
 

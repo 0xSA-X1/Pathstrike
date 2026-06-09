@@ -183,19 +183,38 @@ async def check_time_offset(
 def _parse_ntpdate_offset(output: str) -> float | None:
     """Extract the time offset from ntpdate output.
 
-    ntpdate output format includes lines like::
+    Two output dialects are supported:
+
+    * Classic ``ntpdate`` (ntp / busybox)::
 
         server 10.10.10.10, stratum 3, offset -14402.948451, delay 0.02580
         19 Mar 12:34:56 ntpdate[1234]: adjust time server 10.10.10.10 offset -14402.948451 sec
+
+    * ntpsec ``ntpdate`` (the build shipped on current Kali) — no ``offset``
+      keyword; the signed offset is the field right after the parenthesised
+      local-timezone column::
+
+        2026-06-03 15:04:11.946144 (-0400) +0.728672 +/- 0.000405 dc.example.local 10.10.10.10 s2 no-leap
     """
     import re
 
-    match = re.search(r"offset\s+(-?[\d.]+)", output)
+    # Classic format: explicit "offset <value>".
+    match = re.search(r"offset\s+([-+]?[\d.]+)", output)
     if match:
         try:
             return float(match.group(1))
         except ValueError:
             pass
+
+    # ntpsec format: "... (<tz>) <signed-offset> +/- <error> ...". The signed
+    # offset is the token immediately following the "(±HHMM)" timezone column.
+    match = re.search(r"\([-+]\d{3,4}\)\s+([-+]?[\d.]+)\s+\+/-", output)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+
     return None
 
 

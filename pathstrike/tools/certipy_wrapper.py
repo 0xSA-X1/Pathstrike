@@ -250,6 +250,10 @@ async def _run_certipy_once(
     cmd = get_faketime_prefix() + ["certipy", subcommand] + args
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
+    from pathstrike.engine.command_emitter import placeholder_result, record_command
+    if record_command("certipy", cmd, redacted=_redact_cmd(cmd)):
+        return placeholder_result("certipy", cmd, subcommand=subcommand)
+
     result: dict[str, Any] = {
         "success": False,
         "output": "",
@@ -817,12 +821,15 @@ def _parse_template_output(stdout: str) -> dict[str, Any] | None:
     """Parse ``certipy template`` output for saved configuration."""
     parsed: dict[str, Any] = {}
 
-    # Old template config backup path.  certipy v5 wording varies:
-    # "Saved old configuration to ..." (older), "Saving configuration to ..."
-    # (v5.0.4), "Wrote configuration to ...".  Match all three so the
-    # restore step always has a path to roll back from.
+    # Old template config backup path.  certipy v5.0.4 prints e.g.
+    # "Saving current configuration to 'ESC4_backup.json'" / "Wrote current
+    # configuration for 'ESC4' to 'ESC4_backup.json'"; older builds said
+    # "Saved old configuration to ...".  Allow an optional qualifier word
+    # ("current"/"old"/…) between the verb and "configuration" so the restore
+    # step always recovers the backup path — without it the regex missed the
+    # v5 wording and the template was left modified (security-relevant).
     old_match = re.search(
-        r"(?:Saved|Saving|Wrote)\s+(?:old\s+)?configuration.*?'(.+?\.json)'",
+        r"(?:Saved|Saving|Wrote)\s+(?:\w+\s+)?configuration\b[^\n]*?'([^'\n]+?\.json)'",
         stdout,
     )
     if old_match:
@@ -884,6 +891,39 @@ async def certipy_find(
         args.append("-stdout")
 
     return await run_certipy("find", args, timeout=timeout)
+
+
+def build_certipy_auth(
+    domain: str,
+    username: str,
+    password: str | None = None,
+    nt_hash: str | None = None,
+    aes_key: str | None = None,
+    ccache_path: str | None = None,
+    dc_ip: str | None = None,
+) -> list[str]:
+    """Build certipy-style authentication flags.
+
+    certipy differs from bloodyAD/impacket: the username carries the realm
+    (``-u user@domain``), the NT hash goes via ``-hashes`` (NOT ``-p``), and
+    the DC is given with ``-dc-ip``.  Passing bloodyAD-style ``-u user -p :nt``
+    makes certipy read ``:nt`` as a literal password → ``rpc_s_access_denied``.
+    """
+    user = username if "@" in username else f"{username}@{domain}"
+    args = ["-u", user]
+    if ccache_path:
+        args.append("-k")
+        args.append("-no-pass")
+    elif aes_key:
+        args.extend(["-aes", aes_key])
+    elif nt_hash:
+        # certipy accepts ``[lmhash:]nthash``; an empty LM half is fine.
+        args.extend(["-hashes", nt_hash if ":" in nt_hash else f":{nt_hash}"])
+    elif password is not None:
+        args.extend(["-p", password])
+    if dc_ip:
+        args.extend(["-dc-ip", dc_ip])
+    return args
 
 
 async def certipy_request(
@@ -975,7 +1015,11 @@ async def certipy_auth(
     if domain:
         args.extend(["-domain", domain])
 
-    return await run_certipy("auth", args, timeout=timeout)
+    # Auto-confirm certipy v5's overwrite prompt for the output ``.ccache``
+    # (e.g. ``administrator.ccache`` from a prior ESC run in the same CWD).
+    # Without it the prompt reads stdin, hits EOF, and the auth fails rc=1
+    # even though PKINIT itself would have succeeded.
+    return await run_certipy("auth", args, timeout=timeout, input_data=b"y\n")
 
 
 async def certipy_shadow(

@@ -34,6 +34,12 @@ class CredentialsConfig(BaseModel):
     nt_hash: str | None = None
     ccache_path: str | None = None
 
+    # Optional path to a bulk credential artefact (secretsdump/NTDS dump, hash
+    # list, or YAML/JSON) used for comprehensive edge VALIDATION runs — every
+    # parsed credential is seeded so each edge can be tested as its true source.
+    # See pathstrike.engine.credential_vault for supported formats.
+    vault_file: str | None = None
+
 
 class TargetConfig(BaseModel):
     """Target specification for path discovery."""

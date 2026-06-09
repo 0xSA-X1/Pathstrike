@@ -122,8 +122,17 @@ def _build_source_name(source: Optional[str], cfg: PathStrikeConfig) -> str:
     return f"{source.upper()}@{cfg.domain.name.upper()}"
 
 
-def _seed_credential_store(cfg: PathStrikeConfig) -> CredentialStore:
-    """Create a CredentialStore and seed it with the config's initial credentials."""
+def _seed_credential_store(
+    cfg: PathStrikeConfig,
+    extra_vault: Path | None = None,
+) -> CredentialStore:
+    """Create a CredentialStore and seed it with the config's initial credentials.
+
+    If ``cfg.credentials.vault_file`` is set (or *extra_vault* is supplied), the
+    referenced credential artefact (secretsdump/NTDS dump, hash list, or
+    YAML/JSON) is also loaded — every parsed credential is added under the
+    config target domain so edges can be tested as their true source principal.
+    """
     store = CredentialStore()
 
     if cfg.credentials.password:
@@ -156,6 +165,20 @@ def _seed_credential_store(cfg: PathStrikeConfig) -> CredentialStore:
                 obtained_from="config",
             )
         )
+
+    # Optional bulk credential vault for validation runs.
+    vault = extra_vault or (Path(cfg.credentials.vault_file) if cfg.credentials.vault_file else None)
+    if vault is not None:
+        from pathstrike.engine.credential_vault import load_into_store
+
+        if not vault.is_file():
+            console.print(f"[yellow]Credential vault not found:[/] {vault}")
+        else:
+            n = load_into_store(store, vault, cfg.domain.name)
+            console.print(
+                f"[green]Loaded {n} credential(s)[/] from vault {vault} "
+                f"[dim]({len(store)} total in store)[/]"
+            )
 
     return store
 
@@ -250,6 +273,289 @@ def edges(
 
     console.print(table)
     console.print(f"\n[dim]Total: {len(supported)} edge type(s)[/]")
+
+
+_OUTCOME_ROW = {
+    "success": "[green]✅ success[/]",
+    "failed": "[red]❌ failed[/]",
+    "exception": "[red]💥 exception[/]",
+    "prereq_failed": "[yellow]🟡 prereq[/]",
+    "no_handler": "[dim]🚫 no handler[/]",
+}
+
+# Exit code per outcome, used so `test-edge` is scriptable.
+_OUTCOME_EXIT = {
+    "success": 0,
+    "failed": 1,
+    "exception": 1,
+    "no_handler": 1,
+    "prereq_failed": 2,
+}
+
+
+def _render_edge_result(result: dict, *, verbose: bool = False) -> None:
+    """Pretty-print a single :func:`execute_edge_test` result dict."""
+    src, tgt = result["source"], result["target"]
+    info = Table.grid(padding=(0, 2))
+    info.add_column(style="bold cyan", justify="right")
+    info.add_column()
+    info.add_row("Edge type", result["edge_type"])
+    info.add_row("Handler", result["handler"] or "[red]none[/]")
+    info.add_row(
+        "Source",
+        f"{src['name']} [dim]({src['label']}, "
+        f"{'resolved' if src['resolved'] else 'synthesised'})[/]",
+    )
+    info.add_row(
+        "Target",
+        f"{tgt['name']} [dim]({tgt['label']}, "
+        f"{'resolved' if tgt['resolved'] else 'synthesised'})[/]",
+    )
+    info.add_row("Mode", "[red]LIVE[/]" if result["mode"] == "live" else "[yellow]dry-run[/]")
+    if result["properties"]:
+        info.add_row(
+            "Properties",
+            ", ".join(f"{k}={v}" for k, v in result["properties"].items()),
+        )
+    console.print(info)
+    console.print()
+
+    outcome = result["outcome"]
+    if outcome == "no_handler":
+        console.print(f"[bold red]🚫 {result['result_msg']}[/]")
+        console.print("[dim]Run 'pathstrike edges' to list supported edge types.[/]")
+        return
+
+    if result["prereq_ok"]:
+        console.print(f"[bold green]✅ Prerequisites OK[/] — {result['prereq_msg']}")
+    elif result["prereq_ok"] is False:
+        console.print(f"[bold red]❌ Prerequisites failed[/] — {result['prereq_msg']}")
+    console.print()
+
+    if outcome == "prereq_failed":
+        console.print(
+            "[dim]Stopped before exploit. Pass [bold]--force[/] to run the exploit "
+            "anyway (useful for capturing the real tool error).[/]"
+        )
+        return
+    if outcome == "exception":
+        console.print(f"[bold red]💥 Handler raised:[/] {result['exception']}")
+        return
+    if outcome == "success":
+        console.print(f"[bold green]✅ Success[/] — {result['result_msg']}")
+        if result["credentials"]:
+            console.print(f"\n[bold]Captured {len(result['credentials'])} credential(s):[/]")
+            for c in result["credentials"]:
+                console.print(f"  • {c['username']}@{c['domain']} [dim]({c['cred_type']})[/]")
+    else:  # failed
+        console.print(f"[bold red]❌ Failed[/] — {result['result_msg']}")
+        console.print(
+            f"\n[bold]Diagnosis:[/] [{result['error_category']}]\n"
+            f"[bold]Remediation:[/] {result['remediation']} "
+            f"[dim](retryable: {result['retryable']})[/]"
+        )
+
+
+async def _run_revert(cmd: str, settle_seconds: int) -> None:
+    """Run the snapshot-revert hook command and wait for the lab to settle."""
+    console.print(f"[dim]↻ Reverting snapshot: {cmd}[/]")
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        console.print(
+            f"[yellow]Revert command exited {proc.returncode}: "
+            f"{out.decode(errors='replace')[:300]}[/]"
+        )
+    if settle_seconds > 0:
+        console.print(f"[dim]  waiting {settle_seconds}s for the lab to settle...[/]")
+        await asyncio.sleep(settle_seconds)
+
+
+def _template_config() -> PathStrikeConfig:
+    """A placeholder config for offline `learn` (no target/creds supplied).
+
+    Values are obvious fill-in tokens so emitted commands read as a template:
+    ``-u '<USER>@CORP.LOCAL' -hashes ':<NT-HASH>' -dc-ip '<DC-IP>'``.
+    """
+    return PathStrikeConfig(
+        bloodhound={"base_url": "http://localhost:8085", "token_id": "", "token_key": ""},
+        domain={"name": "CORP.LOCAL", "dc_host": "<DC-IP>", "dc_fqdn": "dc.corp.local"},
+        credentials={"username": "<USER>", "nt_hash": "<NT-HASH>"},
+    )
+
+
+@app.command(name="learn")
+def learn(
+    edges: Annotated[
+        str,
+        typer.Argument(
+            help="Edge type, or comma-separated path, e.g. 'GenericWrite,GenericAll,ReadGMSAPassword'."
+        ),
+    ],
+    source: SourceOption = None,
+    target: Annotated[
+        Optional[str],
+        typer.Option("--target", "-t", help="Target principal (resolved mode). Defaults to the domain."),
+    ] = None,
+    config: ConfigOption = None,
+    prop: Annotated[
+        Optional[list[str]],
+        typer.Option("--prop", "-p", help="Extra edge property as key=value (repeatable), e.g. -p template_name=ESC1."),
+    ] = None,
+    source_label: Annotated[
+        str, typer.Option("--source-label", help="Source node kind.")
+    ] = "User",
+    target_label: Annotated[
+        str, typer.Option("--target-label", help="Target node kind.")
+    ] = "User",
+    creds_file: Annotated[
+        Optional[Path],
+        typer.Option("--creds-file", help="Credential vault (resolved mode)."),
+    ] = None,
+    redact: Annotated[
+        bool,
+        typer.Option("--redact", help="Redact secrets (hashes/passwords) in the printed commands."),
+    ] = False,
+    steps: Annotated[
+        bool,
+        typer.Option("--steps", help="Annotated step-by-step output instead of a raw copy-paste block."),
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Print the commands PathStrike would run to exploit an edge (or a path).
+
+    A teaching / manual-ops view: it dry-runs the real handler logic but RECORDS
+    each tool command (certipy / bloodyAD / impacket / …) in order instead of
+    executing it.  So the same tool works for auto (campaign) and manual ops.
+
+    [bold]Resolution[/]: pass [bold]--config[/] (or [bold]--creds-file[/]) to get
+    fully-resolved commands with real values + secrets (connects to BloodHound).
+    Otherwise it prints an offline template with placeholders ([bold]<DC-IP>[/],
+    [bold]<TARGET>[/], [bold]<NT-HASH>[/]); [bold]-s/-t[/] just substitute into it.
+
+    Secrets are shown by default ([bold]--redact[/] to hide).  Raw copy-paste
+    block by default ([bold]--steps[/] for annotated).
+
+    [bold]Examples[/]:
+      pathstrike learn genericall
+      pathstrike learn genericwrite,genericall,ReadGMSAPassword
+      pathstrike learn ADCSESC1 -s 'BOB@CORP.LOCAL' -t CORP.LOCAL -p template_name=ESC1 -p ca_name=CORP-CA
+    """
+    setup_logging(verbose=verbose)
+
+    edge_list = [e.strip() for e in edges.split(",") if e.strip()]
+    if not edge_list:
+        console.print("[bold red]No edge types given.[/]")
+        raise typer.Exit(code=1)
+
+    edge_props: dict[str, str] = {}
+    for item in prop or []:
+        if "=" not in item:
+            console.print(f"[bold red]Invalid --prop (expected key=value):[/] {item}")
+            raise typer.Exit(code=1)
+        key, value = item.split("=", 1)
+        edge_props[key.strip()] = value
+
+    # Resolved mode is opt-in via --config or --creds-file (live values + real
+    # secrets, connects to BloodHound).  Bare `learn <edge>` — even with -s/-t —
+    # stays an offline template; -s/-t just substitute into the placeholders so
+    # a quick reference never silently connects to the lab.
+    want_resolved = bool(config) or creds_file is not None
+    config_path = config or (find_config() if want_resolved else None)
+    resolved_mode = config_path is not None
+    if resolved_mode:
+        cfg = load_config(Path(config_path))
+        tgt = target or cfg.domain.name.upper()
+        src = source
+    else:
+        if want_resolved:
+            console.print(
+                "[bold red]Resolved mode needs a config.[/] Pass [bold]--config[/], "
+                "or drop --creds-file for an offline template."
+            )
+            raise typer.Exit(code=1)
+        cfg = _template_config()
+        tgt = target or "<TARGET>"
+        src = source or "<SOURCE>"
+
+    from pathstrike.engine.edge_tester import emit_edge_commands
+
+    async def _run() -> list[dict]:
+        cred_store = (
+            _seed_credential_store(cfg, extra_vault=creds_file)
+            if resolved_mode
+            else CredentialStore()
+        )
+        results: list[dict] = []
+        if resolved_mode:
+            async with BloodHoundClient.connect(cfg.bloodhound) as client:
+                for et in edge_list:
+                    results.append(await emit_edge_commands(
+                        cfg, client, cred_store, edge_type=et, target=tgt, source=src,
+                        props=edge_props, source_label=source_label,
+                        target_label=target_label, redact=redact,
+                    ))
+        else:
+            for et in edge_list:
+                results.append(await emit_edge_commands(
+                    cfg, None, cred_store, edge_type=et, target=tgt, source=src,
+                    props=edge_props, source_label=source_label,
+                    target_label=target_label, redact=redact,
+                ))
+        return results
+
+    try:
+        results = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    _render_learn(results, edge_list, resolved_mode, steps)
+
+
+def _render_learn(
+    results: list[dict], edge_list: list[str], resolved_mode: bool, steps: bool
+) -> None:
+    """Print emitted commands as a raw copy-paste block (default) or steps."""
+    mode = "resolved" if resolved_mode else "template (placeholders — fill in <...>)"
+    console.print(f"[dim]# pathstrike learn — {' → '.join(edge_list)}  ({mode})[/]")
+    any_cmds = False
+    for res in results:
+        if res.get("error") and not res.get("commands"):
+            console.print(f"[bold red]# {res['edge_type']}: {res['error']}[/]")
+            continue
+        header = f"# === {res['edge_type']} ({res.get('handler') or 'no handler'}) "
+        if resolved_mode:
+            header += f"| {res.get('source')} -> {res.get('target')} "
+        console.print(f"\n[bold cyan]{header}===[/]")
+        cmds = res.get("commands") or []
+        if not cmds:
+            console.print("[dim]#   (no external tool commands — informational/traversal edge)[/]")
+            continue
+        any_cmds = True
+        multi_branch = len({c.get("branch") for c in cmds if c.get("branch")}) > 1
+        last_branch = object()
+        i = 0
+        for c in cmds:
+            branch = c.get("branch")
+            if multi_branch and branch != last_branch:
+                console.print(f"[bold magenta]## Option: {branch or 'core'}[/]")
+                last_branch = branch
+            if steps:
+                i += 1
+                note = f"  [dim]# {c['note']}[/]" if c.get("note") else ""
+                console.print(f"[bold]{i}.[/] [dim]({c['tool']})[/]{note}")
+                console.print(f"   {c['line']}")
+            else:
+                console.print(c["line"])
+        if res.get("error"):
+            console.print(f"[dim]#   (chain stopped early: {res['error']})[/]")
+    if not any_cmds and not steps:
+        console.print("[dim]# (no commands emitted)[/]")
 
 
 @app.command()
@@ -1412,6 +1718,17 @@ def campaign(
             ),
         ),
     ] = None,
+    learn: Annotated[
+        bool,
+        typer.Option(
+            "--learn",
+            help="Don't execute — print the ordered commands to exploit each selected path (manual-ops playbook).",
+        ),
+    ] = False,
+    redact: Annotated[
+        bool,
+        typer.Option("--redact", help="With --learn, redact secrets (hashes/passwords) in the printed commands."),
+    ] = False,
     verbose: VerboseOption = False,
 ) -> None:
     """Interactive step-through attack campaign — exploit, requery, repeat.
@@ -1495,10 +1812,14 @@ def campaign(
                 reachable_mode=not high_value_only,
                 max_depth=max_depth,
             )
+            campaign_orch.learn = learn
+            campaign_orch.learn_redact = redact
 
             result = await campaign_orch.run_campaign()
             _save_rollback_log(rollback_mgr, "campaign")
 
+            if learn:
+                return  # nothing executed; no compromise expectation
             if not result.targets_compromised and mode != ExecutionMode.dry_run:
                 raise typer.Exit(code=1)
 
