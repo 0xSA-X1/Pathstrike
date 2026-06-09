@@ -50,6 +50,8 @@ PathStrike discovers and executes AD privilege escalation paths identified by Bl
 | **Containment** | `Contains`, `ClaimSpecialIdentity` |
 | **Live-Enum Synthetic** | `RestorableFrom` (discovered by Pathstrike's live LDAP scan of `CN=Deleted Objects` — reanimates tombstoned privileged accounts) |
 
+> **Edge status:** all handlers are implemented. Two are environment-gated and may not complete against a hardened target: **`CoerceToTGT`** — coercion fires, but the SMB→LDAP relay is blocked by modern DC hardening (CVE-2019-1040 mitigation); and **`ADCSESC8`** — NTLM relay to AD CS HTTP web enrollment, which requires the web-enrollment endpoint to be present and reachable.
+
 ---
 
 ## Live Enumeration (supplements BH CE data)

@@ -36,6 +36,45 @@ class RelaySession:
     _reader_task: asyncio.Task | None = None
 
 
+_HELP_CACHE: dict[str, str] = {}
+
+
+def _port_in_use(port: int) -> bool:
+    """Return True if *port* is already bound on this host (any interface)."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", port))
+            return False
+        except OSError:
+            return True
+
+
+async def _ntlmrelayx_supports(flag: str) -> bool:
+    """Return True if the installed ntlmrelayx.py advertises *flag* in --help.
+
+    Impacket's CLI surface drifts between versions — e.g. ``--smb2support``
+    was removed once SMB2 became the default, and passing it to a newer build
+    aborts startup with "unrecognized arguments".  Probing --help once (cached)
+    lets us include version-specific flags only when they're actually accepted,
+    so the relay works across impacket versions.
+    """
+    if "help" not in _HELP_CACHE:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ntlmrelayx.py", "--help",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
+            _HELP_CACHE["help"] = (out + err).decode("utf-8", errors="replace")
+        except (asyncio.TimeoutError, FileNotFoundError, OSError):
+            _HELP_CACHE["help"] = ""
+    return flag in _HELP_CACHE["help"]
+
+
 async def start_relay(
     target_url: str,
     auth_flags: list[str] | None = None,
@@ -71,10 +110,22 @@ async def start_relay(
     if delegate_access:
         cmd.append("--delegate-access")
 
-    if remove_mic:
+    # ntlmrelayx starts an HTTP server on :80 by default. If something already
+    # holds :80 (e.g. a local web service / the BloodHound stack), that server
+    # thread crashes on bind and can take the whole relay down. SMB-based
+    # coercion only needs the SMB server, so when :80 is occupied we drop the
+    # HTTP listener instead of letting it fail.
+    if _port_in_use(80) and await _ntlmrelayx_supports("--no-http-server"):
+        cmd.append("--no-http-server")
+        logger.info("Local :80 in use — starting relay without the HTTP server")
+
+    if remove_mic and await _ntlmrelayx_supports("--remove-mic"):
         cmd.append("--remove-mic")
 
-    if smb2support:
+    # --smb2support only exists on older impacket; on modern builds SMB2 is the
+    # default and the flag is rejected ("unrecognized arguments"). Add it only
+    # when this ntlmrelayx actually advertises it.
+    if smb2support and await _ntlmrelayx_supports("--smb2support"):
         cmd.append("--smb2support")
 
     if auth_flags:
@@ -82,8 +133,24 @@ async def start_relay(
 
     logger.info("Starting relay: %s", " ".join(shlex.quote(c) for c in cmd))
 
+    from pathstrike.engine.command_emitter import record_command
+    if record_command("ntlmrelayx", cmd, redacted=" ".join(shlex.quote(c) for c in cmd)):
+        # Emit mode: record the relay command, don't spawn. Return a session
+        # with a stub process so stop_relay()/teardown are no-ops.
+        class _EmitProc:
+            returncode = 0
+            pid = 0
+        return RelaySession(process=_EmitProc(), command=cmd)
+
+    # ntlmrelayx runs an interactive "ntlmrelayx>" console on its main thread
+    # that reads from stdin.  Launched without a terminal, stdin hits EOF
+    # immediately, the console loop returns, and the process exits (rc 0) —
+    # tearing down the daemon server threads right after "Servers started".
+    # Handing it an *open* stdin pipe (that we never close until teardown)
+    # makes the console block instead of EOF-ing, so the relay stays up.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

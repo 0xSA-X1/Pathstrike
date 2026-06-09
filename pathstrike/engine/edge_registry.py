@@ -65,6 +65,16 @@ def list_handlers() -> dict[str, str]:
     return {edge_type: cls.__name__ for edge_type, cls in sorted(_REGISTRY.items())}
 
 
+def get_registry() -> dict[str, type[BaseEdgeHandler]]:
+    """Return a shallow copy of the edge-type → handler-class registry.
+
+    Useful for tooling that needs the handler classes themselves (e.g. to
+    group edges by their defining module), without importing the private
+    ``_REGISTRY`` global.
+    """
+    return dict(_REGISTRY)
+
+
 def get_supported_edges() -> list[str]:
     """Return a sorted list of all edge types that have registered handlers.
 

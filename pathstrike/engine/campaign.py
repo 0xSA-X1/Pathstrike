@@ -310,7 +310,12 @@ class CampaignOrchestrator:
                     # Check if we compromised a domain
                     self._check_domain_compromise(scored_path)
 
-                    if self.mode != ExecutionMode.dry_run:
+                    if getattr(self, "learn", False):
+                        console.print(
+                            f"[dim]#   (learn: playbook above — nothing executed; "
+                            f"continuing path discovery)[/]"
+                        )
+                    elif self.mode != ExecutionMode.dry_run:
                         console.print(
                             f"\n[bold green]Target compromised:[/] {target_name} "
                             f"(score: {scored_path.target_score:.0f} — "
@@ -342,7 +347,9 @@ class CampaignOrchestrator:
         self._captured_creds = self._snapshot_credentials()
 
         self._display_campaign_summary(result)
-        self._save_credentials_file()
+        if not getattr(self, "learn", False):
+            # Emit mode only stored placeholder creds — don't write a creds file.
+            self._save_credentials_file()
         return result
 
     # ------------------------------------------------------------------
@@ -766,6 +773,10 @@ class CampaignOrchestrator:
         """Execute a single scored path via the existing orchestrator."""
         path = scored.path
 
+        if getattr(self, "learn", False):
+            await self._emit_path_commands(scored)
+            return True
+
         if self.mode == ExecutionMode.dry_run:
             console.print(
                 f"  [dim][DRY RUN] Would execute {len(path.steps)} steps "
@@ -786,6 +797,55 @@ class CampaignOrchestrator:
         except Exception as exc:
             logger.error("Path execution failed: %s", exc)
             return False
+
+    async def _emit_path_commands(self, scored: ScoredPath) -> None:
+        """`--learn`: print the commands to exploit this path, don't execute.
+
+        Runs each step's handler in emit mode (see
+        :mod:`pathstrike.engine.command_emitter`) so the operator gets a
+        ready-to-run, ordered playbook for the selected path — using the edges
+        the campaign already resolved (CA host, templates, impersonation, etc.).
+        """
+        from pathstrike.engine.command_emitter import emit_mode
+        from pathstrike.engine.edge_registry import get_handler
+
+        path = scored.path
+        redact = getattr(self, "learn_redact", False)
+        console.print(
+            f"\n[bold cyan]# === Playbook: {len(path.steps)} steps → "
+            f"{path.target.name} ===[/]"
+        )
+        with emit_mode(redact=redact) as em:
+            for idx, step in enumerate(path.steps, 1):
+                edge = step.edge
+                handler_cls = get_handler(edge.edge_type)
+                if handler_cls is None:
+                    console.print(f"[dim]#   step {idx}: no handler for {edge.edge_type}[/]")
+                    continue
+                before = len(em.commands)
+                handler = handler_cls(config=self.config, credential_store=self.cred_store)
+                try:
+                    await handler.check_prerequisites(edge)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("learn prereq %s: %s", edge.edge_type, exc)
+                try:
+                    await handler.exploit(edge, dry_run=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("learn exploit %s: %s", edge.edge_type, exc)
+                console.print(
+                    f"[bold]# step {idx}: {edge.edge_type}[/] "
+                    f"[dim]({edge.source.name} -> {edge.target.name})[/]"
+                )
+                step_cmds = em.commands[before:]
+                multi_branch = len({c.branch for c in step_cmds if c.branch}) > 1
+                last_branch = object()
+                for c in step_cmds:
+                    if multi_branch and c.branch != last_branch:
+                        console.print(f"[magenta]#   -- Option: {c.branch or 'core'} --[/]")
+                        last_branch = c.branch
+                    console.print(c.render(redact))
+                if not step_cmds:
+                    console.print("[dim]#   (no external tool commands)[/]")
 
     # ------------------------------------------------------------------
     # State tracking
@@ -1286,18 +1346,20 @@ class CampaignOrchestrator:
                     if domain_upper not in self.domains_compromised:
                         self.domains_compromised.add(domain_upper)
                         self.completed_targets.add(step_target.name)
-                        console.print(
-                            f"  [bold red]Domain compromised:[/] [green]{domain}[/]"
-                        )
+                        if not getattr(self, "learn", False):
+                            console.print(
+                                f"  [bold red]Domain compromised:[/] [green]{domain}[/]"
+                            )
 
             if step_target.label and step_target.label.lower() == "domain":
                 name_upper = step_target.name.upper()
                 if name_upper not in self.domains_compromised:
                     self.domains_compromised.add(name_upper)
                     self.completed_targets.add(step_target.name)
-                    console.print(
-                        f"  [bold red]Domain compromised:[/] [green]{step_target.name}[/]"
-                    )
+                    if not getattr(self, "learn", False):
+                        console.print(
+                            f"  [bold red]Domain compromised:[/] [green]{step_target.name}[/]"
+                        )
 
     # ------------------------------------------------------------------
     # Selection
@@ -1422,6 +1484,24 @@ class CampaignOrchestrator:
     def _display_campaign_summary(self, result: CampaignResult) -> None:
         """Show final campaign results."""
         console.print("\n" + "═" * 60)
+        if getattr(self, "learn", False):
+            # Learn mode executes nothing — report playbooks, not compromise.
+            console.print("[bold]Learn Summary[/] [dim](nothing executed)[/]")
+            console.print("═" * 60)
+            n = len(result.targets_compromised)
+            console.print(
+                f"\n[bold cyan]Emitted command playbooks for {n} reachable "
+                f"path{'s' if n != 1 else ''}.[/]"
+            )
+            if result.targets_compromised:
+                for t in result.targets_compromised:
+                    console.print(f"  📓 {t}")
+            console.print(
+                "\n[dim]Nothing was executed and no credentials were captured — "
+                "copy the commands above to run them manually.[/]"
+            )
+            return
+
         console.print("[bold]Campaign Summary[/]")
         console.print("═" * 60)
 

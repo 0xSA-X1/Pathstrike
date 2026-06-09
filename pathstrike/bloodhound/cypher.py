@@ -127,6 +127,30 @@ def build_object_id_lookup_query(name: str) -> tuple[str, None]:
     return query, None
 
 
+def build_node_by_name_query(name: str) -> tuple[str, None]:
+    """Build a Cypher query that returns a full node by its (case-insensitive) name.
+
+    Used by ``pathstrike test-edge`` to resolve a principal name into a
+    complete graph node (``objectid``, ``kind``/label, ``domain`` and all
+    properties) so a realistic :class:`~pathstrike.models.EdgeInfo` can be
+    constructed for one-off handler testing.
+
+    Args:
+        name: Fully-qualified node name (``USER@DOMAIN.FQDN``), case-insensitive.
+
+    Returns:
+        Tuple of (cypher_query, None).  The query returns the matched node
+        ``n`` in BH CE's graph response shape (a ``nodes`` dict), or an empty
+        graph when the node does not exist.
+    """
+    query = (
+        f"MATCH (n) "
+        f"WHERE toUpper(n.name) = '{_escape(name.upper())}' "
+        f"RETURN n LIMIT 1"
+    )
+    return query, None
+
+
 # ---------------------------------------------------------------------------
 # Kerberos attack discovery queries
 # ---------------------------------------------------------------------------
@@ -299,5 +323,39 @@ def build_outbound_edges_query(node_name: str) -> tuple[str, None]:
     query = (
         f"MATCH (n {{name: '{_escape(node_name)}'}})-[r]->(m) "
         f"RETURN type(r) AS edge_type, count(*) AS cnt"
+    )
+    return query, None
+
+
+def build_outbound_exploitable_edges_query(node_name: str) -> tuple[str, None]:
+    """List a node's outbound edges of EXPLOITABLE (handler-backed) types.
+
+    Used by ``pathstrike discover-edges`` to enumerate, for a principal we hold
+    credentials for, every directly-testable escalation edge plus its concrete
+    target.  Only relationship types with a registered handler are traversed.
+
+    Args:
+        node_name: Fully qualified source node name (``USER@DOMAIN.FQDN``).
+
+    The query traverses group membership (``MemberOf*0..``) so it surfaces every
+    right the principal can exercise — both held *directly* and *inherited* via
+    the groups it belongs to.  The principal itself authenticates and exercises
+    the inherited right (AD evaluates effective permissions from the token's
+    group SIDs), so the caller emits *node_name* as the test source even when the
+    ACE technically sits on an intermediate group.
+
+    Returns:
+        Tuple of (cypher_query, None).  Each result row is a single packed
+        literal keyed ``edge_row`` with pipe-delimited fields:
+        ``edge_type|target_name|target_kind|target_objectid``.  Packing into one
+        column sidesteps BH CE's flat ``literals`` response, which otherwise
+        loses row grouping across multiple returned columns.
+    """
+    edge_filter = _edge_type_filter()
+    query = (
+        f"MATCH (s {{name: '{_escape(node_name)}'}})-[:MemberOf*0..4]->(g)-[r{edge_filter}]->(t) "
+        f"WHERE s <> t "
+        f"RETURN DISTINCT type(r) + '|' + t.name + '|' + head(labels(t)) "
+        f"+ '|' + coalesce(t.objectid, '') AS edge_row"
     )
     return query, None

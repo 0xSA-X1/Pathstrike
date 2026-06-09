@@ -34,8 +34,26 @@ pathstrike.yaml
 pathstrike.yml
 .pathstrike.yaml
 
+# Credential vaults (NTDS dumps / hash lists for validation runs)
+creds/
+*.ntds
+*.secrets
+
+# Edge-validation outputs (test-edges JSONL logs + summaries)
+test_results/
+
 # Checkpoints
 .pathstrike/
 
 # Rollback logs (auto-generated during attacks)
 rollback_logs/
+pathstrike.*.yaml
+
+# Engagement artifacts — local only, not part of the tool (lab IPs / validation narrative)
+DEV_NOTES.md
+SCOPE.md
+docs/EDGE_STATUS.md
+plan-north.yaml
+run.log
+pathstrike-dev.patch
+.claude/
