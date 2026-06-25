@@ -50,13 +50,20 @@ class AzureBaseHandler(BaseEdgeHandler):
 
     @staticmethod
     def _app_identifier(edge: EdgeInfo) -> str | None:
-        """Best-effort appId/client-id for the target App/SP from BH node props."""
+        """Best-effort appId/client-id for the target App/SP.
+
+        Checks, in order: an explicit ``-p appid=`` edge property (handy when
+        the bare node name is ambiguous between an AZApp and its AZServicePrincipal),
+        then the resolved BH node's properties, then the node objectid (BH's
+        AZApp objectid equals the appId).
+        """
         node = edge.target
         return (
-            node.properties.get("appid")
+            edge.properties.get("appid")
+            or edge.properties.get("appId")
+            or node.properties.get("appid")
             or node.properties.get("appId")
-            or node.object_id
-            or None
+            or (node.object_id or None)
         )
 
 

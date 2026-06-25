@@ -169,9 +169,11 @@ async def graph_request(
     Records an equivalent ``roadtx graphrequest`` invocation so ``learn`` mode
     emits a runnable command instead of an opaque HTTP call.
     """
-    learn_argv = ["roadtx", "graphrequest", "-m", method, "-u", f"{GRAPH_BASE}{path}"]
+    # roadtx graphrequest takes the URL as a positional arg (after options).
+    learn_argv = ["roadtx", "graphrequest", "-m", method]
     if body is not None:
         learn_argv += ["-d", json.dumps(body)]
+    learn_argv.append(f"{GRAPH_BASE}{path}")
 
     if record_command("roadtx", learn_argv, redacted=" ".join(learn_argv)):
         return placeholder_result("roadtx", learn_argv, subcommand="graphrequest")
