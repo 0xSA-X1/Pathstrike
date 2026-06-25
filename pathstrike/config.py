@@ -55,6 +55,23 @@ class TargetConfig(BaseModel):
     adcs_impersonate: str = "administrator"
 
 
+class AzureConfig(BaseModel):
+    """Azure / Entra ID tenant settings for the Azure edge handlers.
+
+    Authentication is ROPC (username/password) against the tenant — the
+    account must be cloud-only with MFA / Conditional Access disabled.
+    ``roadtx_path`` points at the roadtx binary (it usually lives in a
+    separate venv from PathStrike).
+    """
+
+    tenant_id: str
+    tenant_domain: str  # e.g. "phazon.onmicrosoft.com"
+    username: str  # ROPC source principal (without @domain)
+    password: str | None = None
+    client_id: str | None = None  # optional public-client appId for ROPC
+    roadtx_path: str = "roadtx"
+
+
 class ExecutionConfig(BaseModel):
     """Runtime behavior settings."""
 
@@ -83,6 +100,7 @@ class PathStrikeConfig(BaseModel):
     target: TargetConfig = Field(default_factory=TargetConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     campaign: CampaignConfig = Field(default_factory=CampaignConfig)
+    azure: AzureConfig | None = None
 
 
 # Default config search order (checked when ``-c`` is not supplied).

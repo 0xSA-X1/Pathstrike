@@ -29,6 +29,7 @@ from pathstrike.handlers import (  # noqa: F401 — imported for side-effect reg
     access,
     acl,
     adcs,
+    azure,
     coercion,
     container,
     credential,

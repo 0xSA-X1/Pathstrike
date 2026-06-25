@@ -10,13 +10,16 @@ from pydantic import BaseModel, Field, computed_field
 
 
 class CredentialType(StrEnum):
-    """Supported credential types for AD authentication."""
+    """Supported credential types for AD and Azure/Entra authentication."""
 
     password = "password"
     nt_hash = "nt_hash"
     aes_key = "aes_key"
     ccache = "ccache"
     certificate = "certificate"
+    # Azure / Entra ID (token-based)
+    azure_access_token = "azure_access_token"
+    azure_secret = "azure_secret"  # app/SP client secret
 
 
 class Credential(BaseModel):
