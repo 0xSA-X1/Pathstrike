@@ -38,13 +38,20 @@ class AzureBaseHandler(BaseEdgeHandler):
         az = self._azure_cfg()
         if az is None:
             if emitting():
-                return await roadtx.get_graph_token("<USER>", "<PASSWORD>", "<TENANT>")
+                return await roadtx.get_graph_token(
+                    auth_mode="ropc",
+                    username="<USER>",
+                    password="<PASSWORD>",
+                    tenant="<TENANT>",
+                )
             return None
-        password = az.password or ("<PASSWORD>" if emitting() else "")
+        password = az.password or ("<PASSWORD>" if emitting() else None)
         return await roadtx.get_graph_token(
-            az.username,
-            password,
-            az.tenant_domain,
+            auth_mode=getattr(az, "auth_mode", "ropc"),
+            username=az.username,
+            password=password,
+            tenant=az.tenant_domain,
+            client_id=az.client_id,
             roadtx_bin=az.roadtx_path,
         )
 

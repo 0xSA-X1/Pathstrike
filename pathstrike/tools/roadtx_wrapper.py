@@ -109,35 +109,36 @@ async def run_roadtx(
 
 
 async def get_graph_token(
-    username: str,
-    password: str,
-    tenant: str,
     *,
+    auth_mode: str = "ropc",
+    username: str | None = None,
+    password: str | None = None,
+    tenant: str | None = None,
+    client_id: str | None = None,
     roadtx_bin: str = "roadtx",
     token_file: str = ".roadtools_auth",
 ) -> str | None:
-    """Acquire an MS Graph access token via ROPC (cloud-only acct, no MFA).
+    """Acquire an MS Graph access token via roadtx.
+
+    ``auth_mode``:
+      * ``"ropc"`` — username/password (fails under MFA / Conditional Access).
+      * ``"refresh"`` — redeem the refresh token cached in *token_file* (seeded
+        once via an interactive ``roadtx gettokens --device-code`` login). Works
+        with MFA and stays non-interactive for ``campaign``.
 
     Returns the access token string, a placeholder while emitting, or ``None``
-    on failure.
-
-    NOTE: roadtx flag names should be confirmed against ``roadtx gettokens -h``;
-    ``-r msgraph`` is the resource alias for ``https://graph.microsoft.com``.
+    on failure. ``-r msgraph`` is the alias for ``https://graph.microsoft.com``.
     """
-    res = await run_roadtx(
-        [
-            "gettokens",
-            "-u",
-            f"{username}@{tenant}",
-            "-p",
-            password,
-            "-r",
-            "msgraph",
-            "--tokenfile",
-            token_file,
-        ],
-        roadtx_bin=roadtx_bin,
-    )
+    if auth_mode == "refresh":
+        args = ["gettokens", "--refresh-token", "file", "-r", "msgraph",
+                "--tokenfile", token_file]
+    else:  # ropc
+        args = ["gettokens", "-u", f"{username}@{tenant}", "-p", password or "",
+                "-r", "msgraph", "--tokenfile", token_file]
+    if client_id:
+        args += ["-c", client_id]
+
+    res = await run_roadtx(args, roadtx_bin=roadtx_bin)
     # In emit/learn mode the subprocess never ran; keep the chain going so the
     # subsequent Graph commands are emitted too.
     if res.get("emitted"):

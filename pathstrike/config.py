@@ -66,10 +66,14 @@ class AzureConfig(BaseModel):
 
     tenant_id: str
     tenant_domain: str  # e.g. "phazon.onmicrosoft.com"
-    username: str  # ROPC source principal (without @domain)
+    username: str  # source principal (without @domain)
     password: str | None = None
-    client_id: str | None = None  # optional public-client appId for ROPC
+    client_id: str | None = None  # public-client appId used for token requests
     roadtx_path: str = "roadtx"
+    # "ropc": username/password (fails when MFA/CA is enforced).
+    # "refresh": reuse a cached roadtx token (.roadtools_auth) acquired once via
+    #   an interactive device-code login — works with MFA, stays non-interactive.
+    auth_mode: str = "ropc"
 
 
 class ExecutionConfig(BaseModel):
