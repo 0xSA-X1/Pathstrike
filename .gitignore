@@ -57,3 +57,6 @@ plan-north.yaml
 run.log
 pathstrike-dev.patch
 .claude/
+pathstrike.phazon.yaml
+.roadtools_auth
+.roadtools_auth_sp
