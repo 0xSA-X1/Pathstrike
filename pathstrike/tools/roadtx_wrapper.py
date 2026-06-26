@@ -152,6 +152,37 @@ async def get_graph_token(
         return None
 
 
+async def get_sp_token(
+    app_id: str,
+    secret: str,
+    tenant: str,
+    *,
+    roadtx_bin: str = "roadtx",
+    token_file: str = ".roadtools_auth_sp",
+) -> str | None:
+    """Client-credentials: authenticate AS a service principal (appId + secret).
+
+    Returns an **app-only** MS Graph token carrying the SP's application
+    permissions (e.g. RoleManagement.ReadWrite.Directory) — the basis for the
+    AZMG* abuse edges. Uses a separate *token_file* so it doesn't clobber a
+    cached user (ROPC) token. Placeholder while emitting; ``None`` on failure.
+    """
+    args = [
+        "gettokens", "--as-app", "-c", app_id, "-p", secret,
+        "-r", "msgraph", "-t", tenant, "--tokenfile", token_file,
+    ]
+    res = await run_roadtx(args, roadtx_bin=roadtx_bin)
+    if res.get("emitted"):
+        return "<SP_GRAPH_TOKEN>"
+    if not res.get("success"):
+        return None
+    try:
+        with open(token_file, encoding="utf-8") as fh:
+            return json.load(fh).get("accessToken")
+    except (OSError, KeyError, json.JSONDecodeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Microsoft Graph request helper
 # ---------------------------------------------------------------------------
