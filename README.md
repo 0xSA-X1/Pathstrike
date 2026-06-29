@@ -90,7 +90,7 @@ All listed handlers are implemented. The table below summarises what has been ve
 
 ### Azure / Entra ID — ✅ Validated live
 
-Validated against a phazon test tenant (AzureHound CE ingest + live Graph API calls):
+Validated against a test tenant (AzureHound CE ingest + live Graph API calls):
 
 - **`AZAddSecret`** — inject a secret into an app registration via delegated Application Administrator rights; rollback via `removePassword` ✅
 - **`AZMGGrantRole`** — assign an Entra ID directory role to a principal using a SP with `RoleManagement.ReadWrite.Directory`; rollback via `roleAssignments` DELETE ✅
