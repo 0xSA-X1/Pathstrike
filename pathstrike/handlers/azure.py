@@ -795,9 +795,18 @@ class AZMGAddSecretHandler(AzureBaseHandler):
         if not token:
             return False, "Failed to obtain SP client-credentials token via roadtx", []
 
-        # Resolve application object ID from appId
+        # Resolve application object ID from appId.
+        # For AZServicePrincipal targets, `tgt_appid` is the SP objectId — look up
+        # the real appId via the servicePrincipals endpoint first.
+        real_appid = tgt_appid
+        if edge.target.label == "AZServicePrincipal":
+            sp_lookup = await roadtx.graph_request(
+                "GET", f"/servicePrincipals/{tgt_appid}?$select=appId", token
+            )
+            real_appid = (sp_lookup.get("parsed") or {}).get("appId") or tgt_appid
+
         lookup = await roadtx.graph_request(
-            "GET", f"/applications?$filter=appId eq '{tgt_appid}'", token
+            "GET", f"/applications?$filter=appId eq '{real_appid}'", token
         )
         values = (lookup.get("parsed") or {}).get("value") or []
         app_obj_id = values[0].get("id") if values else None
@@ -805,7 +814,8 @@ class AZMGAddSecretHandler(AzureBaseHandler):
             if emitting():
                 app_obj_id = "<APP_OBJECT_ID>"
             else:
-                return False, f"Could not resolve application object id for appId {tgt_appid}", []
+                return False, f"Could not resolve application object id for appId {real_appid}", []
+        tgt_appid = real_appid
 
         res = await roadtx.graph_request(
             "POST",
