@@ -76,6 +76,10 @@ async def run_pygpoabuse(
     cmd = ["pygpoabuse", *args]
     logger.debug("Executing: %s", _redact_cmd(cmd))
 
+    from pathstrike.engine.command_emitter import placeholder_result, record_command
+    if record_command("pygpoabuse", cmd, redacted=_redact_cmd(cmd)):
+        return placeholder_result("pygpoabuse", cmd)
+
     result: dict[str, Any] = {
         "success": False,
         "output": "",

@@ -902,6 +902,18 @@ class SyncLAPSPasswordHandler(BaseEdgeHandler):
             if bloody_result["success"]:
                 laps_password = self._extract_laps_password(bloody_result)
 
+        from pathstrike.engine.command_emitter import emitting
+        if emitting():
+            return True, f"[emit] Would read LAPS password for {target_computer}", [
+                Credential(
+                    cred_type=CredentialType.password,
+                    value="<LAPS_PASSWORD>",
+                    username="Administrator",
+                    domain=target_computer,
+                    obtained_from=f"laps_sync:{target_computer}",
+                )
+            ]
+
         # Fallback to netexec if bloodyAD didn't get the password
         if not laps_password and shutil.which("netexec"):
             self.logger.info(
