@@ -941,10 +941,15 @@ class AZMGAddMemberHandler(AzureBaseHandler):
         if not gid or not pid:
             return None
         url = f"{roadtx.GRAPH_BASE}/groups/{gid}/members/{pid}/$ref"
+        # NOTE: DELETE requires Group.ReadWrite.All or GroupMember.ReadWrite.All.
+        # Directory.ReadWrite.All is insufficient for member removal in practice.
         return RollbackAction(
             step_index=0,
             action_type="azure_remove_group_member",
-            description=f"Remove {pid} from group {edge.target.name}",
+            description=(
+                f"Remove {pid} from group {edge.target.name} "
+                "(SP needs Group.ReadWrite.All or GroupMember.ReadWrite.All for DELETE)"
+            ),
             command=f"roadtx graphrequest -m DELETE {url}",
             reversible=True,
         )
@@ -1033,16 +1038,39 @@ class AZMGGrantAppRolesHandler(AzureBaseHandler):
         if not token:
             return False, "Failed to obtain SP client-credentials token via roadtx", []
 
-        # First: resolve the MS Graph SP object ID in the tenant (it has a different objectId per tenant)
+        # Resolve the MS Graph SP object ID in this tenant (objectId varies per tenant).
+        # Try SP token first; fall back to user token if SP lacks SP-read permission
+        # (AppRoleAssignment.ReadWrite.All doesn't always include /servicePrincipals read).
         if resource_sp_id == self.MSGRAPH_SP_ID:
-            sp_lookup = await roadtx.graph_request(
-                "GET", f"/servicePrincipals?$filter=appId eq '{self.MSGRAPH_SP_ID}'", token
-            )
-            values = (sp_lookup.get("parsed") or {}).get("value") or []
-            if values:
-                resource_sp_id = values[0].get("id", resource_sp_id)
-            elif not emitting():
-                return False, "Could not resolve Microsoft Graph SP object ID in this tenant", []
+            resolved = False
+            async def _lookup_msgraph_sp(try_token: str) -> bool:
+                nonlocal resource_sp_id, resolved
+                sp_lookup = await roadtx.graph_request(
+                    "GET", f"/servicePrincipals?$filter=appId eq '{self.MSGRAPH_SP_ID}'", try_token
+                )
+                values = (sp_lookup.get("parsed") or {}).get("value") or []
+                if values:
+                    resource_sp_id = values[0].get("id", resource_sp_id)
+                    resolved = True
+                return resolved
+            if not await _lookup_msgraph_sp(token):
+                user_tok = await roadtx.get_graph_token(
+                    auth_mode=az.auth_mode if az else "ropc",
+                    username=getattr(az, "username", None),
+                    password=getattr(az, "password", None),
+                    tenant=getattr(az, "tenant_domain", None),
+                    client_id=getattr(az, "client_id", None),
+                    roadtx_bin=getattr(az, "roadtx_path", "roadtx"),
+                )
+                if user_tok:
+                    await _lookup_msgraph_sp(user_tok)
+            if not resolved and not emitting():
+                return (
+                    False,
+                    "Could not resolve Microsoft Graph SP objectId — pass "
+                    "-p resource_sp_id=<objectId> (from AzureHound resourceId field)",
+                    [],
+                )
 
         res = await roadtx.graph_request(
             "POST",
