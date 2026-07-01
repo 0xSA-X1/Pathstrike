@@ -16,9 +16,9 @@ PathStrike discovers and executes privilege escalation paths identified by Blood
 ## Features
 
 - **Path Discovery** — queries BloodHound CE's Cypher API for attack paths + merges with live-discovered edges
-- **Azure / Entra ID Support** — full coverage of Azure BloodHound edge types: app secret injection, role assignment, group membership, app role grants, and more — authenticated via SP client-credentials (roadtx) or delegated user tokens
+- **Azure / Entra ID Support** — broad Azure/Entra ID coverage: app secret injection, role assignment, group membership, app role grants, and more — authenticated via SP client-credentials (roadtx) or delegated user tokens. See [coverage gaps](#coverage-gaps) for unhandled BH CE edges.
 - **Live Post-Compromise Enumeration** — after each successful step, re-enumerates AD to surface writeables, ADCS ESC findings, and tombstoned privileged accounts that BH doesn't see
-- **Automated Exploitation** — 101 BloodHound edge types handled across on-prem AD and Azure/Entra ID
+- **Automated Exploitation** — extensive BloodHound CE edge coverage across on-prem AD and Azure/Entra ID; some handlers fire from PathStrike's certipy/live-enum extensions rather than BH CE queries (see edge table below)
 - **Command Emission (`learn`)** — print the exact tool commands PathStrike would run for any edge or path — an offline template, or fully resolved with real values/secrets — for manual operation and training; executes nothing
 - **Campaign Mode** — interactive step-through exploration across all reachable targets
 - **Auto Mode** — greedy opportunistic escalation from source toward any reachable exploitable node
@@ -43,19 +43,21 @@ PathStrike discovers and executes privilege escalation paths identified by Blood
 | **ACL Abuse** | `GenericAll`, `GenericWrite`, `WriteDacl`, `WriteOwner`, `Owns`, `AllExtendedRights` |
 | **Credential Access** | `ReadLAPSPassword`, `ReadGMSAPassword`, `DumpSMSAPassword`, `SyncLAPSPassword`, `ForceChangePassword` |
 | **Kerberos Delegation** | `AllowedToDelegate`, `AllowedToAct`, `AddAllowedToAct`, `WriteAccountRestrictions` |
-| **Kerberos Tickets** | `DiamondTicket`, `SapphireTicket` |
-| **AD CS (Certificates)** | `ADCSESC1`–`ADCSESC13`, `GoldenCert`, `ManageCA`, `ManageCertificates` |
+| **AD CS (Certificates)** | `ADCSESC1`, `ADCSESC3`, `ADCSESC4`, `ADCSESC6a`, `ADCSESC6b`, `ADCSESC9a`, `ADCSESC9b`, `ADCSESC10a`, `ADCSESC10b`, `ADCSESC13`, `GoldenCert`, `ManageCA`, `ManageCertificates` |
 | **Replication** | `GetChanges`, `GetChangesAll`, `GetChangesInFilteredSet`, `DCSync` |
-| **Coercion & Relay** | `CoerceAndRelayTo`, `CoerceAndRelayNTLMToSMB/LDAP/LDAPS/ADCS`, `CoerceToTGT` |
+| **Coercion & Relay** | `CoerceAndRelayNTLMToSMB`, `CoerceAndRelayNTLMToLDAP`, `CoerceAndRelayNTLMToLDAPS`, `CoerceAndRelayNTLMToADCS`, `CoerceToTGT` |
 | **Remote Execution** | `AdminTo`, `CanRDP`, `CanPSRemote`, `ExecuteDCOM`, `SQLAdmin` |
-| **Group Membership** | `MemberOf`, `AddMembers`, `AddSelf` |
+| **Group Membership** | `MemberOf`, `AddMember`, `AddSelf` |
 | **Shadow Credentials** | `AddKeyCredentialLink` |
 | **SID History** | `HasSIDHistory`, `SpoofSIDHistory` |
 | **Group Policy** | `GPLink`, `WriteGPLink` |
-| **Domain Trusts** | `TrustedBy`, `SameForestTrust`, `ExternalTrust`, `CrossForestTrust`, `TrustedForestTrust`, `AbuseTGTDelegation`, `HasTrustKeys` |
+| **Domain Trusts** | `SameForestTrust`, `CrossForestTrust`, `AbuseTGTDelegation`, `HasTrustKeys` |
 | **Extended Access** | `WriteSPN`, `HasSession` |
 | **Containment** | `Contains`, `ClaimSpecialIdentity` |
 | **Live-Enum Synthetic** | `RestorableFrom` (discovered by PathStrike's live LDAP scan of `CN=Deleted Objects` — reanimates tombstoned privileged accounts) |
+| **PathStrike-Extended (certipy-detected; not BH CE edge types)** | `ADCSESC2`, `ADCSESC5`, `ADCSESC7`, `ADCSESC8`, `ADCSESC11` — triggered when certipy `find -vulnerable` detects the condition; BloodHound CE does not emit these as relationship types |
+| **PathStrike-Extended (post-compromise chains; not BH CE edge types)** | `DiamondTicket`, `SapphireTicket` — forged-ticket attack chains triggered after DCSync/credential capture; not BloodHound graph relationships |
+| **PathStrike-Extended (legacy trust names; not current BH CE edge types)** | `TrustedBy`, `ExternalTrust`, `TrustedForestTrust` — handlers exist for compatibility; BloodHound CE uses `SameForestTrust`/`CrossForestTrust` instead |
 
 ### Azure / Entra ID
 
@@ -63,10 +65,35 @@ PathStrike discovers and executes privilege escalation paths identified by Blood
 |---|---|
 | **App Secret & Credential** | `AZAddSecret`, `AZMGAddSecret`, `AZResetPassword` |
 | **Role Assignment** | `AZMGGrantRole`, `AZPrivilegedRoleAdmin`, `AZPrivilegedAuthAdmin` |
-| **Group & Object Ownership** | `AZAddMembers`, `AZAddMember`, `AZMGAddMember`, `AZAddOwner`, `AZOwns`, `AZMGAddOwner` |
+| **Group & Object Ownership** | `AZAddMembers`, `AZMGAddMember`, `AZAddOwner`, `AZOwns`, `AZMGAddOwner` |
 | **App Role Grants** | `AZMGGrantAppRoles` |
 | **MG Permission Edges** | `AZMGRoleManagement_ReadWrite_Directory`, `AZMGApplication_ReadWrite_All`, `AZMGAppRoleAssignment_ReadWrite_All`, `AZMGDirectory_ReadWrite_All`, `AZMGGroupMember_ReadWrite_All` |
 | **Traversal** | `AZContains`, `AZMemberOf`, `AZRunsAs`, `AZGlobalAdmin`, `AZHasRole`, `AZAuthenticatesTo` |
+
+### Coverage Gaps {#coverage-gaps}
+
+The following BloodHound CE edge types are recognised in current BH CE releases but **not yet handled** by PathStrike:
+
+**Azure / Entra ID (unhandled BH CE edges):**
+
+| Edge | Abuse primitive |
+|---|---|
+| `AZOwner` | Object ownership (distinct from `AZOwns` — separate BH CE relationship) |
+| `AZContributor` | Azure subscription Contributor role |
+| `AZVMContributor` | VM Contributor — can redeploy/modify VMs |
+| `AZVMAdminLogin` | Virtual Machine Administrator Login RBAC role |
+| `AZExecuteCommand` | Run commands on a VM via the Azure agent |
+| `AZGetSecrets` / `AZGetKeys` / `AZGetCertificates` | Key Vault read access |
+| `AZUserAccessAdministrator` | Can assign Azure RBAC roles |
+| `AZManagedIdentity` | Managed identity → service principal link |
+| `AZRoleEligible` / `AZRoleApprover` | PIM eligible role / approver path |
+| `AZMGGroup_ReadWrite_All` / `AZMGServicePrincipalEndpoint_ReadWrite_All` | Additional MS Graph permissions |
+| `AZCloudAppAdmin` / `AZAppAdmin` | Entra Cloud/Application Administrator roles |
+| `AZWebsiteContributor` / `AZLogicAppContributor` / `AZAutomationContributor` / `AZAKSContributor` | Azure resource roles |
+
+**Active Directory ADCS (unhandled BH CE edges):**
+
+`Enroll`, `EnrollOnBehalfOf`, `DelegatedEnrollmentAgent`, `WritePKIEnrollmentFlag`, `WritePKINameFlag` — certificate template enrolment ACL edges added in BH CE v6+
 
 ---
 
@@ -85,7 +112,7 @@ All listed handlers are implemented. The table below summarises what has been ve
 - **SID history:** `HasSIDHistory`, `SpoofSIDHistory`
 - **Group Policy:** `GPLink`, `WriteGPLink`
 - **Domain trusts:** `SameForestTrust`, `CrossForestTrust`
-- **AD CS:** `ADCSESC1`, `ADCSESC3`, `ADCSESC4` (modify → exploit → restore), `ADCSESC6`/`ESC6a`, `ADCSESC9`/`ESC9a`, `GoldenCert`, `ManageCA` (covers ESC7), `ManageCertificates`
+- **AD CS:** `ADCSESC1`, `ADCSESC3`, `ADCSESC4` (modify → exploit → restore), `ADCSESC6a`, `ADCSESC9a`, `GoldenCert`, `ManageCA`, `ManageCertificates`; ESC7 technique validated via `ManageCA` (no separate BH CE edge type)
 - **Traversal:** `Contains`, `ClaimSpecialIdentity`
 
 ### Azure / Entra ID — ✅ Validated live
@@ -98,16 +125,18 @@ Validated against a test tenant (AzureHound CE ingest + live Graph API calls):
 - **`AZMGAddMember`** — add a principal to an Entra group using a SP with `Directory.ReadWrite.All`; rollback requires `Group.ReadWrite.All` or `GroupMember.ReadWrite.All` ✅
 - **`AZMGGrantAppRoles`** — grant MS Graph application permissions to a SP via `AppRoleAssignment.ReadWrite.All`; technique confirmed working (Global Admin delegation path); handler falls back to user-token for MS Graph SP objectId resolution when SP token lacks read scope ✅
 
-**⬜ Implemented, dry-run validated:** `AZResetPassword`, `AZAddMembers`, `AZAddMember`, `AZAddOwner`, `AZOwns`, `AZMGAddOwner`, `AZPrivilegedRoleAdmin`, `AZPrivilegedAuthAdmin`; traversal stubs for `AZContains`, `AZMemberOf`, `AZRunsAs`, `AZGlobalAdmin`, `AZHasRole`, `AZAuthenticatesTo`; MG permission edges
+**⬜ Implemented, dry-run validated:** `AZResetPassword`, `AZAddMembers`, `AZAddOwner`, `AZOwns`, `AZMGAddOwner`, `AZPrivilegedRoleAdmin`, `AZPrivilegedAuthAdmin`; traversal stubs for `AZContains`, `AZMemberOf`, `AZRunsAs`, `AZGlobalAdmin`, `AZHasRole`, `AZAuthenticatesTo`; MG permission edges
 
 ### 🚫 Environment-gated
 
 - **`CoerceToTGT`** — coercion fires (the DC calls back), but SMB→LDAP relay never completes against a hardened DC (MIC enforced / CVE-2019-1040 mitigated). Not a code bug.
-- **`ADCSESC8`** — NTLM relay to AD CS HTTP web enrollment; requires the web-enrollment endpoint to be up and reachable.
+- **ADCSESC8 technique** — NTLM relay to AD CS HTTP web enrollment (`CoerceAndRelayNTLMToADCS` + IIS endpoint); requires the web-enrollment endpoint to be up and reachable. Note: `ADCSESC8` is a PathStrike-extended handler, not a BH CE edge type — the corresponding BH CE edge is `CoerceAndRelayNTLMToADCS`.
 
 ### ⬜ Implemented, not yet validated live
 
-`AllowedToAct`, `DumpSMSAPassword`, `AdminTo`, `HasSession`, `CanRDP`, `CanPSRemote`, `ExecuteDCOM`, `SQLAdmin`, `WriteSPN`, `RestorableFrom`, `DiamondTicket`, `SapphireTicket`, the `CoerceAndRelayNTLMTo*` family, `TrustedBy`/`ExternalTrust`/`AbuseTGTDelegation`/`HasTrustKeys`, and `ADCSESC2`/`ESC5`/`ESC10`/`ESC11`/`ESC13`
+**From BloodHound CE paths:** `AllowedToAct`, `DumpSMSAPassword`, `AdminTo`, `HasSession`, `CanRDP`, `CanPSRemote`, `ExecuteDCOM`, `SQLAdmin`, `WriteSPN`, `RestorableFrom`, the `CoerceAndRelayNTLMTo*` family, `AbuseTGTDelegation`, `HasTrustKeys`, and ADCS edges `ADCSESC10a`, `ADCSESC10b`, `ADCSESC13`
+
+**PathStrike-extended (not BH CE edge types):** `ADCSESC2`, `ADCSESC5`, `ADCSESC7`, `ADCSESC11` (certipy-detected), `DiamondTicket`, `SapphireTicket` (post-compromise chains), `TrustedBy`, `ExternalTrust`, `TrustedForestTrust`, `CoerceAndRelayTo` (legacy/extended handlers)
 
 ---
 
@@ -118,7 +147,7 @@ BloodHound CE is a **static snapshot** taken at SharpHound ingest time. PathStri
 | Source | Covers | When it runs |
 |---|---|---|
 | **`bloodyAD get writable`** | Standard ACE writes (`GenericWrite`, `Owns`, `WriteOwner`, `WriteDacl`) | After every successful compromise, per newly-owned user/computer |
-| **`certipy find -vulnerable`** | AD CS templates with ESC1/3/4/6/9/10/11/13 findings | After every successful compromise, per newly-owned user/computer |
+| **`certipy find -vulnerable`** | AD CS vulnerable templates → ADCSESC1/3/4/6a/6b/9a/9b/10a/10b/13 edges (BH CE) + ADCSESC2/5/7/8/11 (PathStrike synthetic) | After every successful compromise, per newly-owned user/computer |
 | **`ldap3` Recycle Bin scan** | Tombstoned privileged accounts in `CN=Deleted Objects` (surfaced as synthetic `RestorableFrom` edges) | After every successful compromise, per newly-owned identity |
 
 ---
