@@ -64,12 +64,17 @@ class AzureBaseHandler(BaseEdgeHandler):
         return f"{az.username}@{az.tenant_domain}" if az else None
 
     async def _user_token(self, edge: EdgeInfo) -> str | None:
-        """Delegated MS Graph token for the edge's **source user** (ROPC).
+        """Delegated MS Graph token for the edge's **source user**.
 
-        Password resolution order: ``-p source_password=``, then the config
-        credential when the source matches ``azure.username``, then a captured
-        password in the cred store (campaign chaining / vault). Placeholder
-        while emitting.
+        Auth mode resolution order:
+          1. ``-p source_auth_mode=refresh`` — use a pre-cached refresh token
+             (from a prior interactive/device-code login); bypass ROPC entirely.
+             Pair with ``-p source_token_file=<path>`` when the token file is
+             not the default ``.roadtools_auth``.
+          2. Config ``auth_mode`` when the source matches ``azure.username``.
+          3. ROPC (default) — requires password via ``-p source_password=``,
+             the config credential when source == config user, or a captured
+             password in the cred store. Placeholder while emitting.
         """
         az = self._azure_cfg()
         if az is None:
@@ -82,20 +87,25 @@ class AzureBaseHandler(BaseEdgeHandler):
 
         user = (self._source_upn(edge) or az.username).split("@")[0]
         pw = edge.properties.get("source_password")
+        token_file = edge.properties.get("source_token_file", ".roadtools_auth")
         mode = "ropc"
         if pw is None and user.lower() == az.username.split("@")[0].lower():
             pw, mode = az.password, az.auth_mode
-        if pw is None:
-            cred = self.cred_store.get_best_credential(user, az.tenant_domain)
-            if cred and cred.cred_type == CredentialType.password:
-                pw = cred.value
-        if pw is None and emitting():
-            pw = "<PASSWORD>"
-        if pw is None:
-            return None
+        # Explicit override wins — allows refresh mode for MFA-gated operations
+        mode = edge.properties.get("source_auth_mode", mode)
+        if mode == "ropc":
+            if pw is None:
+                cred = self.cred_store.get_best_credential(user, az.tenant_domain)
+                if cred and cred.cred_type == CredentialType.password:
+                    pw = cred.value
+            if pw is None and emitting():
+                pw = "<PASSWORD>"
+            if pw is None:
+                return None
         return await roadtx.get_graph_token(
             auth_mode=mode, username=user, password=pw, tenant=az.tenant_domain,
             client_id=az.client_id, roadtx_bin=az.roadtx_path,
+            token_file=token_file,
         )
 
     async def _grant_role(
