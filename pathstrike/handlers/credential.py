@@ -56,6 +56,18 @@ class ReadLAPSHandler(BaseEdgeHandler):
         self.logger.info("Reading LAPS password for %s", target)
         result = await bloody.read_laps(self.config, auth_args, target)
 
+        from pathstrike.engine.command_emitter import emitting
+        if emitting():
+            return True, f"[emit] Would read LAPS password for {target}", [
+                Credential(
+                    cred_type=CredentialType.password,
+                    value="<LAPS_PASSWORD>",
+                    username="Administrator",
+                    domain=target,
+                    obtained_from=f"LAPS password read from {target}",
+                )
+            ]
+
         laps_password = (
             self._extract_laps_password(result) if result["success"] else None
         )
@@ -184,6 +196,18 @@ class ReadGMSAHandler(BaseEdgeHandler):
         self.logger.info("Reading gMSA password for %s", target)
         result = await bloody.read_gmsa(self.config, auth_args, target)
 
+        from pathstrike.engine.command_emitter import emitting
+        if emitting():
+            return True, f"[emit] Would read gMSA NT hash for {target}", [
+                Credential(
+                    cred_type=CredentialType.nt_hash,
+                    value="<NT_HASH>",
+                    username=target,
+                    domain=domain,
+                    obtained_from=f"gMSA password read from {target}",
+                )
+            ]
+
         nt_hash = self._extract_gmsa_hash(result) if result["success"] else None
 
         if not nt_hash:
@@ -287,6 +311,18 @@ class DumpSMSAPasswordHandler(BaseEdgeHandler):
 
         self.logger.info("Reading sMSA password for %s", target)
         result = await bloody.read_gmsa(self.config, auth_args, target)
+
+        from pathstrike.engine.command_emitter import emitting
+        if emitting():
+            return True, f"[emit] Would read sMSA NT hash for {target}", [
+                Credential(
+                    cred_type=CredentialType.nt_hash,
+                    value="<NT_HASH>",
+                    username=target,
+                    domain=domain,
+                    obtained_from=f"sMSA password read from {target}",
+                )
+            ]
 
         if not result["success"]:
             return (

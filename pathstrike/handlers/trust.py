@@ -436,6 +436,13 @@ class TrustedByHandler(BaseEdgeHandler):
             timeout=120,
         )
 
+        # In emit mode secretsdump returns a placeholder with no hashes dict.
+        # Return a placeholder trust key so the rest of the chain (ticketer,
+        # parent-domain DCSync) is also emitted in the playbook.
+        from pathstrike.engine.command_emitter import emitting
+        if emitting():
+            return "<TRUST_KEY_NT_HASH>"
+
         if not result["success"]:
             self.logger.error(
                 "DCSync failed for '%s': %s",
