@@ -66,15 +66,19 @@ class AzureBaseHandler(BaseEdgeHandler):
     async def _user_token(self, edge: EdgeInfo) -> str | None:
         """Delegated MS Graph token for the edge's **source user**.
 
-        Auth mode resolution order:
-          1. ``-p source_auth_mode=refresh`` — use a pre-cached refresh token
-             (from a prior interactive/device-code login); bypass ROPC entirely.
-             Pair with ``-p source_token_file=<path>`` when the token file is
-             not the default ``.roadtools_auth``.
-          2. Config ``auth_mode`` when the source matches ``azure.username``.
-          3. ROPC (default) — requires password via ``-p source_password=``,
+        Token resolution order:
+          1. ``-p source_access_token=<jwt>`` — stolen/captured access token;
+             bypasses all auth logic and goes straight to Graph. This is the
+             realistic post-phish/post-compromise path (AiTM, token extraction
+             from a compromised device, pass-the-cookie, etc.).
+          2. ``-p source_auth_mode=refresh`` — redeem a pre-captured refresh
+             token from *source_token_file* (default ``.roadtools_auth``).
+             Models stolen refresh token or PRT-derived token replay.
+          3. Config ``auth_mode`` when the source matches ``azure.username``.
+          4. ROPC (default) — requires password via ``-p source_password=``,
              the config credential when source == config user, or a captured
-             password in the cred store. Placeholder while emitting.
+             password in the cred store. Only valid when MFA is not enforced
+             for the operation by a Conditional Access policy.
         """
         az = self._azure_cfg()
         if az is None:
@@ -84,6 +88,11 @@ class AzureBaseHandler(BaseEdgeHandler):
                     tenant="<TENANT>",
                 )
             return None
+
+        # Direct token injection — stolen access token, no auth round-trip needed
+        stolen = edge.properties.get("source_access_token")
+        if stolen:
+            return stolen
 
         user = (self._source_upn(edge) or az.username).split("@")[0]
         pw = edge.properties.get("source_password")
