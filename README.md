@@ -99,7 +99,7 @@ The following BloodHound CE edge types are recognised in current BH CE releases 
 
 ## Validation Status
 
-All listed handlers are implemented. The table below summarises what has been verified end-to-end in a live lab. The authoritative per-edge matrix lives in [docs/EDGE_STATUS.md](docs/EDGE_STATUS.md).
+All listed handlers are implemented. The table below summarises what has been verified end-to-end in a live lab.
 
 ### Active Directory — ✅ Validated live
 
